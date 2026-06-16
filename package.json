@@ -1,0 +1,20 @@
+{
+  "name": "awto-playwright",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/smoke-test.mjs",
+    "test:smoke": "node scripts/smoke-test.mjs",
+    "login:debug": "node scripts/start-debug-chrome.mjs",
+    "login": "node scripts/open-shared-profile-chrome.mjs",
+    "session:attach": "node scripts/attach-session.mjs",
+    "session": "node scripts/st-persistent-session.mjs",
+    "st:session": "node scripts/st-persistent-session.mjs",
+    "st:apple": "node scripts/st-apple-session.mjs",
+    "st:apple:session": "node scripts/st-apple-session.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.54.2"
+  }
+}
