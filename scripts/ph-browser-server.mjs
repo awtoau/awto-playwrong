@@ -74,7 +74,8 @@ async function clearCfCookies() {
 
 async function goto(url) {
   return timed("goto", { url }, async () => {
-    await page.goto(url, { waitUntil: "load", timeout: 45000 });
+    // 'commit' = resolve as soon as response starts; heavy pages never fire 'load'. Then settle.
+    await page.goto(url, { waitUntil: "commit", timeout: 45000 }).catch(e => log("goto_note", { err: e.message }));
     await page.waitForTimeout(3000);
     for (let round = 1; round <= 3; round++) {
       if (!hasChallenge()) break;
@@ -83,8 +84,44 @@ async function goto(url) {
       await page.waitForTimeout(2000);
       if (hasChallenge() && round < 3) await clearCfCookies();
     }
+    await page.waitForTimeout(5000);  // let DOM + async tags settle (no 'load' wait — heavy pages hang it)
     const passed = !hasChallenge();
     return { url, passed, title: (await page.title()).slice(0, 80) };
+  });
+}
+
+// Capture HAR-ish network + vitals + render-blocking in the ALREADY-OPEN page (one window reused).
+async function capture(url) {
+  return timed("capture", { url }, async () => {
+    const cdp = await ctx.newCDPSession(page);
+    const entries = [];
+    const reqs = {};
+    await cdp.send("Network.enable");
+    cdp.on("Network.requestWillBeSent", e => { reqs[e.requestId] = { url: e.request.url, type: e.type, start: e.timestamp, initiator: e.initiator?.type, t0: Date.now() }; });
+    cdp.on("Network.responseReceived", e => { const r = reqs[e.requestId]; if (r) { r.status = e.response.status; r.mime = e.response.mimeType; r.cf = e.response.headers?.["cf-cache-status"]; r.renderBlocking = e.response.renderBlockingStatus; r.ip = e.response.remoteIPAddress; } });
+    cdp.on("Loading.loadingFinished", e => { const r = reqs[e.requestId]; if (r) { r.ms = Date.now() - r.t0; r.bytes = e.encodedDataLength; } });
+    cdp.on("Network.loadingFailed", e => { const r = reqs[e.requestId]; if (r) { r.failed = e.errorText; r.ms = Date.now() - r.t0; } });
+
+    await page.goto(url, { waitUntil: "commit", timeout: 45000 }).catch(e => log("cap_nav", { err: e.message }));
+    await page.waitForTimeout(3000);
+    for (let i = 0; i < 3 && hasChallenge(); i++) { await visionClick(); }
+    await page.waitForTimeout(7000);  // let async tags fire
+
+    const vitals = await page.evaluate(() => {
+      const out = { paint: {}, resources: [] };
+      for (const p of performance.getEntriesByType("paint")) out.paint[p.name] = Math.round(p.startTime);
+      const nav = performance.getEntriesByType("navigation")[0];
+      if (nav) out.nav = { ttfb: Math.round(nav.responseStart), dcl: Math.round(nav.domContentLoadedEventEnd), load: Math.round(nav.loadEventEnd) };
+      out.resources = performance.getEntriesByType("resource").map(r => ({ name: r.name, type: r.initiatorType, dur: Math.round(r.duration), blocking: r.renderBlockingStatus, transfer: r.transferSize }));
+      return out;
+    }).catch(() => ({ paint: {}, resources: [] }));
+
+    await cdp.detach().catch(() => {});
+    const net = Object.values(reqs);
+    return { url, title: (await page.title()).slice(0, 80), passed: !hasChallenge(),
+             network: net, vitals, n_requests: net.length,
+             n_failed: net.filter(r => r.failed).length,
+             n_render_blocking: net.filter(r => r.renderBlocking === "blocking").length };
   });
 }
 
@@ -101,6 +138,7 @@ const server = http.createServer((req, res) => {
     try {
       if (req.url === "/status") return send(res, { browser: !!page, url: page ? page.url() : null });
       if (req.url === "/goto") return send(res, await goto(body.url));
+      if (req.url === "/capture") return send(res, await capture(body.url));
       if (req.url === "/shutdown_browser") {
         await ctx.close(); page = ctx = null; log("shutdown_browser", {});
         return send(res, { msg: "browser closed; server up" });
