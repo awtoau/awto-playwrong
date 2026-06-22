@@ -14,14 +14,20 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vendor"))
 import nodriver as uc
+from nodriver import cdp
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
-LOG = os.path.join(os.path.dirname(__file__), "..", "tmp", "nd-server.log")
+TMP = os.path.join(os.path.dirname(__file__), "..", "tmp")
+os.makedirs(TMP, exist_ok=True)                 # ensure tmp/ exists on a fresh checkout
+LOG = os.path.join(TMP, "nd-server.log")
 CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
 def log(a, **k):
     ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    open(LOG, "a").write(f"{ts} {a} " + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
+    try:
+        open(LOG, "a").write(f"{ts} {a} " + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
+    except Exception:
+        pass
 
 class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
@@ -58,15 +64,50 @@ class ND:
                 "url": self.tab.url if hasattr(self.tab,'url') else ""}
     async def _frame(self):
         await self._ensure()
-        p=os.path.join(os.path.dirname(__file__),"..","tmp","nd-frame.png")
+        p=os.path.join(TMP,"nd-frame.png")
         await self.tab.save_screenshot(p); return open(p,"rb").read()
     async def _shot(self):
         return {"b64": base64.b64encode(await self._frame()).decode()}
     async def _clearcookies(self):
         await self._ensure(); await self.browser.cookies.clear(); return {"cleared":True}
+    # --- added verbs (CDP input + tab ops) so the full client surface works on the nodriver engine ---
+    async def _move(self, x, y):
+        await self._ensure()
+        await self.tab.send(cdp.input_.dispatch_mouse_event(type_="mouseMoved", x=float(x), y=float(y)))
+        return {"ok":1,"x":x,"y":y}
+    async def _click(self, x, y):
+        await self._ensure()
+        for ty in ("mousePressed","mouseReleased"):
+            await self.tab.send(cdp.input_.dispatch_mouse_event(
+                type_=ty, x=float(x), y=float(y), button=cdp.input_.MouseButton.LEFT, click_count=1))
+        return {"ok":1,"x":x,"y":y}
+    async def _key(self, key):
+        await self._ensure()
+        # named keys (Enter/Tab/...) carry a code; printable chars go as text
+        named = {"Enter":13,"Tab":9,"Escape":27,"Backspace":8,"ArrowDown":40,"ArrowUp":38}
+        if key in named:
+            for ty in ("keyDown","keyUp"):
+                await self.tab.send(cdp.input_.dispatch_key_event(
+                    type_=ty, key=key, windows_virtual_key_code=named[key]))
+        else:
+            await self.tab.send(cdp.input_.dispatch_key_event(type_="char", text=key))
+        return {"ok":1,"key":key}
+    async def _newtab(self, url="about:blank"):
+        await self._ensure()
+        self.tab = await self.browser.get(url, new_tab=True)
+        return {"ok":1,"url":url}
+    async def _js(self, expr):
+        await self._ensure(); return {"result": await self.tab.evaluate(expr)}
+    async def _cookies(self):
+        await self._ensure()
+        cks = await self.browser.cookies.get_all()
+        return {"cookies":[{"name":c.name,"value":c.value,"domain":getattr(c,"domain",None)} for c in cks]}
     def do(self, op, a):
         m={"goto":lambda:self._goto(a["url"]),"solve":lambda:self._solve(a.get("tries",20)),
-           "text":lambda:self._text(),"shot":lambda:self._shot(),"clearcookies":lambda:self._clearcookies()}
+           "text":lambda:self._text(),"shot":lambda:self._shot(),"clearcookies":lambda:self._clearcookies(),
+           "move":lambda:self._move(a["x"],a["y"]),"click":lambda:self._click(a["x"],a["y"]),
+           "key":lambda:self._key(a["key"]),"newtab":lambda:self._newtab(a.get("url","about:blank")),
+           "js":lambda:self._js(a["expr"]),"cookies":lambda:self._cookies()}
         if op not in m: return {"error":f"unknown {op}"}
         try: return self.run(m[op]())
         except Exception as e: log("op_err",op=op,e=repr(e)[:120]); return {"error":repr(e)[:160]}

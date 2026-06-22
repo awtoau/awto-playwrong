@@ -94,12 +94,27 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 - **Concurrency:** multiple agents can POST to the same server; calls are serialised on the single
   browser. For true parallelism run multiple servers on different `PH_PORT`s.
 
-## Method note (client has extra verbs)
-`engine/client.py` also exposes `move/click/key/inject/detect/newtab/rightmon` — these were built for
-the **Playwright method** (`methods/playwright-server.py`) which implements those primitives. The
-**nodriver engine/server.py** implements the core set above (`goto/solve/text/shot/clearcookies`).
-Use the core set against the nodriver engine; the extra primitives against the Playwright server.
-(Consolidating these is a TODO.)
+## Full verb set (now all on the nodriver engine — tested)
+The nodriver `engine/server.py` now implements the full surface (verified live):
+
+| Op | Body | Returns |
+|---|---|---|
+| `goto` | `{url}` | `{status,url,title}` |
+| `solve` | `{tries?}` | `{passed,iter}` |
+| `text` | — | `{html,title,url}` |
+| `shot` | — | `{b64}` |
+| `frame` (GET) | — | `image/png` |
+| `move` | `{x,y}` | `{ok,x,y}` — CDP synthetic mouse move (no real-cursor jump) |
+| `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
+| `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
+| `newtab` | `{url?}` | `{ok,url}` — fresh tab |
+| `js` | `{expr}` | `{result}` — evaluate JS in the page |
+| `cookies` | — | `{cookies:[{name,value,domain}]}` |
+| `clearcookies` | — | `{cleared}` |
+| `shutdown` | — | `{ok}` |
+
+`engine/client.py` (CLI) wraps these; some client-only helpers (`inject`, `detect`, `rightmon`,
+ollama vision) are convenience layers on top of the core ops.
 
 _Connect over HTTP:port, auto-start with ensure_server(), drive with goto/solve/text/shot. The engine
 beats Cloudflare Turnstile (nodriver) and stays capture-only so any app/agent can share it._
