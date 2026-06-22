@@ -1,4 +1,4 @@
-# auto-plywrong
+# awto-playwrong
 
 **One place to go when an app or agent needs browser automation.** A generic, shareable browser-
 capture engine — port-based, so multiple agents/apps can hit the same running infrastructure. It
