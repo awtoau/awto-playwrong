@@ -66,7 +66,8 @@ touches a database.
   is patched for it.
 
 ## Status
-Private, on the local machine. Not published. (Make public only as a deliberate, separate step.)
+Public on GitHub at https://github.com/awtoau/awto-playwrong.
+Local working checkout remains on your machine.
 
 _Multi-method browser automation: nodriver engine (Turnstile-beating) + Playwright methods, driven
 over a port, capture-only (no DB). The shared home for any app/agent that needs a browser._
