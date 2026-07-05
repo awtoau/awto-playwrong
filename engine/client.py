@@ -18,6 +18,15 @@ import os, sys, json, base64, urllib.request
 
 PORT = int(os.environ.get("PH_PORT","8731")); BASE=f"http://127.0.0.1:{PORT}"
 
+
+def rightmon_bounds():
+    raw = os.environ.get("PH_RIGHTMON_BOUNDS", "0,0,1280,720")
+    try:
+        x, y, w, h = [int(v.strip()) for v in raw.split(",", 3)]
+        return {"left": x, "top": y, "width": w, "height": h, "windowState": "normal"}
+    except Exception:
+        return {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"}
+
 def call(op, **a):
     if op=="status":
         return json.loads(urllib.request.urlopen(BASE+"/status",timeout=120).read())
@@ -121,12 +130,12 @@ def main(av):
     elif op=="detect": detect()
     elif op=="solvecf": print(call("solve", tries=int(av[1]) if len(av)>1 else 30))
     elif op=="rightmon":
-        # real Chrome -> LEFT half of a QHD-width slice on the right monitor (MONITOR @ x=0).
-        # QHD width 2560 split: real page = left 1280, viz browser goes on the right 1280.
+        # Set PH_RIGHTMON_BOUNDS=x,y,w,h if you want a specific placement.
+        bounds = rightmon_bounds()
         wid=call("cdp",method="Browser.getWindowForTarget",params={})["result"]["windowId"]
         print(call("cdp",method="Browser.setWindowBounds",
-                   params={"windowId":wid,"bounds":{"left":0,"top":0,"width":1280,"height":1440,"windowState":"normal"}}))
-        print("real page = left half. Open the viz on the RIGHT half: http://127.0.0.1:8731/viz")
+                   params={"windowId":wid,"bounds":bounds}))
+        print("real page positioned. Open viz at: http://127.0.0.1:8731/viz")
     elif op=="solve": solve(av[1], int(av[2]) if len(av)>2 else 5)
     elif op=="shutdown":
         try: print(call("shutdown"))      # clean: server closes browser + exits over the port

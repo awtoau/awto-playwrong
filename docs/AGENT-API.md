@@ -21,7 +21,7 @@ The pattern: ping `/status`; if it's not reachable, launch `engine/server.py` an
 
 ```python
 import os, sys, json, time, subprocess, urllib.request
-REPO = "$REPO_ROOT"
+REPO = os.environ.get("PLAYWRONG_REPO", os.getcwd())
 PORT = int(os.environ.get("PH_PORT", "8731"))
 BASE = f"http://127.0.0.1:{PORT}"
 
@@ -36,7 +36,8 @@ def ensure_server():
     if up(): return
     subprocess.Popen([sys.executable, f"{REPO}/engine/server.py"],
                      env={**os.environ, "PYTHONPATH": f"{REPO}/vendor", "PH_PORT": str(PORT)},
-                     stdout=open("/tmp/playwrong-server.log", "a"), stderr=subprocess.STDOUT)
+                     stdout=open(os.path.join(REPO, "tmp", "playwrong-server.log"), "a"),
+                     stderr=subprocess.STDOUT)
     for _ in range(60):                 # wait up to ~30s for it to bind
         if up(): return
         time.sleep(0.5)
@@ -59,9 +60,10 @@ shot = call("shot")["b64"]                         # base64 PNG
 
 Shell equivalent (the bundled client):
 ```
-PYTHONPATH=$REPO_ROOT/vendor \
-  python $REPO_ROOT/engine/server.py &     # start (headed real Chrome)
-python $REPO_ROOT/engine/client.py goto https://example.com
+REPO_ROOT="$(pwd)"  # set to your local checkout root if needed
+PYTHONPATH="$REPO_ROOT/vendor" \
+  python "$REPO_ROOT/engine/server.py" &     # start (headed real Chrome)
+python "$REPO_ROOT/engine/client.py" goto https://example.com
 python .../engine/client.py solvecf      # solve Turnstile
 python .../engine/client.py text         # html
 python .../engine/client.py shutdown     # clean stop (never pkill the browser)

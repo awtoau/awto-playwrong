@@ -36,8 +36,16 @@ class Browser:
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self.pw=self.browser=self.ctx=self.page=self.cdp=None
+        self.pos = self._load_pos()
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
+    @staticmethod
+    def _load_pos():
+        raw = os.environ.get("PH_WINDOW_BOUNDS", "0,0,1280,720")
+        try:
+            return tuple(int(v.strip()) for v in raw.split(",", 3))
+        except Exception:
+            return (0, 0, 1280, 720)
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
     async def _ensure(self):
         if self.page: return
@@ -73,7 +81,7 @@ class Browser:
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         self.page = await self.ctx.new_page()
         self.cdp = await self.ctx.new_cdp_session(self.page)
-        await self._position()   # auto-place on MONITOR left-half every launch
+        await self._position()   # optional placement via PH_WINDOW_BOUNDS=x,y,w,h
         # mouse recorder that SURVIVES challenge reloads: a Python binding + an init-script that
         # re-installs on every navigation and streams each event back to the server (stamped log).
         self.recording = False
@@ -151,15 +159,13 @@ class Browser:
             await asyncio.sleep(0.7)
         log("solve_exhausted")
         return {"passed": False, "iter": tries}
-    # window placement via wmctrl (Chrome under Xwayland). MONITOR = x=0 y=0 (3840x0).
-    # Full horizontal width (3840), 50% vertical (1080), at the TOP of MONITOR (y=0).
-    POS = (0, 0, 3840, 1080)   # x, y, w, h
+    # window placement via wmctrl (Chrome under Xwayland), configurable via PH_WINDOW_BOUNDS.
     async def _position(self):
         # xdotool works under GNOME/Mutter+Xwayland where wmctrl -e and CDP setWindowBounds are
         # ignored. Find the Chrome window, un-maximize, then move+size.
         import subprocess
         try:
-            x, y, w, h = self.POS
+            x, y, w, h = self.pos
             wid = subprocess.run(["xdotool","search","--name","Google Chrome"],
                                  capture_output=True, text=True).stdout.split()
             if not wid:
