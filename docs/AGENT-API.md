@@ -113,6 +113,7 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active}],count}` — enumerate every open tab |
 | `closetab` | `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by index OR url-substring; won't close tab 0 or the last tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
+| `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
 | `js` | `{expr}` | `{result}` — evaluate JS in the page |
 | `cookies` | — | `{cookies:[{name,value,domain}]}` |
 | `clearcookies` | — | `{cleared}` |
@@ -142,6 +143,25 @@ is the core operating model — treat it accordingly:
 
 Multiple agents can POST concurrently; ops are serialised on the single browser. For true parallel
 browsers, run multiple servers on different `PH_PORT`s — but within one server, shard by tab.
+
+### Parallel sharding — attach to the same browser via `/cdp`
+The HTTP ops (`goto`/`text`/…) drive ONE active tab, serialised — fine for a single agent driving one
+page at a time. For a process that needs to drive MANY tabs in parallel (e.g. a crawler), don't fight
+the HTTP serialisation: read the browser's CDP endpoint from `/cdp` and attach your own nodriver to the
+same Chrome:
+
+```python
+cdp = call("cdp")                       # {host, port, http}
+import nodriver as uc
+browser = await uc.start(host=cdp["host"], port=cdp["port"])   # host+port set => ATTACH, don't launch
+tab = await browser.get(url, new_tab=True)   # your own tab on the shared browser
+...                                          # drive N tabs in parallel via nodriver
+await tab.close()                            # CLOSE every tab you opened when done
+```
+
+You now drive the shared browser directly (parallel tabs) while still respecting the contract: you
+launched no new browser, you close your own tabs, and you never shut the server down. Two agents can
+coexist — one driving via HTTP ops, another attached via CDP for parallel work — on the one browser.
 
 _Connect over HTTP:port, auto-start with ensure_server(), drive with goto/solve/text/shot. The engine
 beats Cloudflare Turnstile (nodriver) and stays capture-only so any app/agent can share it._

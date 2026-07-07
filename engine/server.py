@@ -40,7 +40,22 @@ class ND:
         if self.tab: return
         self.browser = await uc.start(headless=False)
         self.tab = await self.browser.get("about:blank")
-        log("nd_started")
+        self._publish_cdp()
+        log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
+    def _publish_cdp(self):
+        """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
+        same browser (nodriver.start(host,port) connects to an existing browser) and shard by opening
+        their own tabs — the parallel-crawl use case. One browser, many attached drivers, tabs = shards."""
+        try:
+            host=self.browser.config.host; port=self.browser.config.port
+            self._cdp={"host":host,"port":port,"http":f"http://{host}:{port}"}
+            with open(os.path.join(TMP,"playwrong-cdp.json"),"w") as f:
+                json.dump(self._cdp,f)
+        except Exception as e:
+            self._cdp={"error":str(e)[:120]}
+    async def _cdp_info(self):
+        await self._ensure()
+        return getattr(self,"_cdp",{"error":"not published"})
     async def _goto(self, url):
         await self._ensure(); await self.tab.get(url); await self.tab.sleep(2)
         return {"title": await self.tab.evaluate("document.title"), "url": url}
@@ -165,7 +180,8 @@ class ND:
            "js":lambda:self._js(a["expr"]),"cookies":lambda:self._cookies(),
            "tabs":lambda:self._tabs(),
            "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True)),
-           "closeextra":lambda:self._closeextra()}
+           "closeextra":lambda:self._closeextra(),
+           "cdp":lambda:self._cdp_info()}
         if op not in m: return {"error":f"unknown {op}"}
         try: return self.run(m[op]())
         except Exception as e: log("op_err",op=op,e=repr(e)[:120]); return {"error":repr(e)[:160]}
