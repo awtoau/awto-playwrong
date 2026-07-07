@@ -95,7 +95,62 @@ class ND:
     async def _newtab(self, url="about:blank"):
         await self._ensure()
         self.tab = await self.browser.get(url, new_tab=True)
-        return {"ok":1,"url":url}
+        return {"ok":1,"url":url,"index":self._tab_index(self.tab)}
+    # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
+    # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
+    # single-tab crawler that opened 8 tabs/run and never closed them left 22 orphan renderers). These
+    # verbs let an agent enumerate the live tabs and close the ones it owns WITHOUT killing the server. ---
+    def _tab_index(self, tab):
+        try:
+            for i, t in enumerate(self.browser.tabs):
+                if t is tab: return i
+        except Exception: pass
+        return -1
+    async def _tabs(self):
+        """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
+        use this to track what they opened and find tabs to close."""
+        await self._ensure()
+        out=[]
+        for i, t in enumerate(self.browser.tabs):
+            try:
+                url=getattr(t,"url","") or ""
+                title=await t.evaluate("document.title") if t is self.tab else ""
+            except Exception:
+                url, title = "", ""
+            out.append({"index":i,"url":url,"title":title,"active":(t is self.tab)})
+        return {"tabs":out,"count":len(out)}
+    async def _closetab(self, index=None, url=None, keep_first=True):
+        """Close a tab by index OR by url-substring match. keep_first protects tab 0 (the server's base
+        tab). Never closes the last remaining tab. Returns how many were closed. This is how agents
+        clean up their shard — NOT by killing the server."""
+        await self._ensure()
+        tabs=list(self.browser.tabs)
+        if len(tabs)<=1: return {"closed":0,"reason":"only one tab; refusing to close the last"}
+        targets=[]
+        for i, t in enumerate(tabs):
+            if keep_first and i==0: continue
+            if index is not None and i==index: targets.append((i,t))
+            elif url is not None and url in (getattr(t,"url","") or ""): targets.append((i,t))
+        closed=0
+        for i, t in targets:
+            try:
+                await t.close()
+                closed+=1
+                if t is self.tab:   # if we closed the active tab, fall back to the base tab
+                    self.tab=self.browser.tabs[0] if self.browser.tabs else None
+            except Exception as e:
+                log("closetab_err",i=i,e=str(e)[:80])
+        return {"closed":closed,"remaining":len(self.browser.tabs)}
+    async def _closeextra(self):
+        """Close ALL tabs except the base tab (index 0) — the panic 'clean up leaked tabs' button. Use
+        after a crashed/aborted crawl left orphan tabs. Never touches the server process."""
+        await self._ensure()
+        n=0
+        for t in list(self.browser.tabs)[1:]:
+            try: await t.close(); n+=1
+            except Exception: pass
+        self.tab=self.browser.tabs[0] if self.browser.tabs else None
+        return {"closed":n,"remaining":len(self.browser.tabs)}
     async def _js(self, expr):
         await self._ensure(); return {"result": await self.tab.evaluate(expr)}
     async def _cookies(self):
@@ -107,7 +162,10 @@ class ND:
            "text":lambda:self._text(),"shot":lambda:self._shot(),"clearcookies":lambda:self._clearcookies(),
            "move":lambda:self._move(a["x"],a["y"]),"click":lambda:self._click(a["x"],a["y"]),
            "key":lambda:self._key(a["key"]),"newtab":lambda:self._newtab(a.get("url","about:blank")),
-           "js":lambda:self._js(a["expr"]),"cookies":lambda:self._cookies()}
+           "js":lambda:self._js(a["expr"]),"cookies":lambda:self._cookies(),
+           "tabs":lambda:self._tabs(),
+           "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True)),
+           "closeextra":lambda:self._closeextra()}
         if op not in m: return {"error":f"unknown {op}"}
         try: return self.run(m[op]())
         except Exception as e: log("op_err",op=op,e=repr(e)[:120]); return {"error":repr(e)[:160]}
@@ -144,6 +202,9 @@ class H(BaseHTTPRequestHandler):
             try:self._raw(B.run(B._frame()),"image/png")
             except Exception as e:self._raw(b"","text/plain",500)
         elif self.path=="/markers":self._j(MARKERS)
+        elif self.path=="/tabs":
+            try:self._j(B.run(B._tabs()))
+            except Exception as e:self._j({"error":str(e)[:120]},500)
         else:self._j({"error":"?"},404)
     def do_POST(self):
         n=int(self.headers.get("Content-Length") or 0);a=json.loads(self.rfile.read(n) or b"{}")

@@ -109,7 +109,10 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `move` | `{x,y}` | `{ok,x,y}` — CDP synthetic mouse move (no real-cursor jump) |
 | `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
 | `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
-| `newtab` | `{url?}` | `{ok,url}` — fresh tab |
+| `newtab` | `{url?}` | `{ok,url,index}` — fresh tab; **index** is its position (track it, close it later) |
+| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active}],count}` — enumerate every open tab |
+| `closetab` | `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by index OR url-substring; won't close tab 0 or the last tab |
+| `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
 | `js` | `{expr}` | `{result}` — evaluate JS in the page |
 | `cookies` | — | `{cookies:[{name,value,domain}]}` |
 | `clearcookies` | — | `{cleared}` |
@@ -117,6 +120,28 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 
 `engine/client.py` (CLI) wraps these; some client-only helpers (`inject`, `detect`, `rightmon`,
 ollama vision) are convenience layers on top of the core ops.
+
+## Sharding contract — ONE server, many agents, tabs are the unit of work
+
+**playwrong is a single long-running process that many agents SHARE by opening their own tabs.** This
+is the core operating model — treat it accordingly:
+
+- **Never launch your own browser** (`uc.start()`) or `pkill` Chrome to "get a clean slate." That
+  defeats the shared server (orphan windows, lost Turnstile session, competing browsers). Connect to
+  the running server on its port; if it isn't up, `ensure_server()` starts THE one server.
+- **Never `shutdown` the server** to end your work. Shutdown stops it for everyone. Close YOUR tabs
+  instead (`closetab`), leave the server running.
+- **A tab is your shard.** `newtab` → do your work on it → **`closetab` when done.** The returned
+  `index` is your handle. An agent that opens tabs and never closes them leaks tabs and renderer
+  processes (a crawler that opened 8 tabs/run and never closed them left ~20 orphan renderers — the bug
+  these verbs fix). Track what you open; close what you opened.
+- **Cleanup after a crash:** `closeextra` closes every tab except the base tab — the panic button when
+  an aborted run left orphan tabs. It never touches the server process.
+- **The base tab (index 0) is protected** — `closetab` won't close it and `closeextra` keeps it, so the
+  server always has a live tab (its `/status` stays alive).
+
+Multiple agents can POST concurrently; ops are serialised on the single browser. For true parallel
+browsers, run multiple servers on different `PH_PORT`s — but within one server, shard by tab.
 
 _Connect over HTTP:port, auto-start with ensure_server(), drive with goto/solve/text/shot. The engine
 beats Cloudflare Turnstile (nodriver) and stays capture-only so any app/agent can share it._
