@@ -55,6 +55,64 @@ Or POST directly: `POST http://127.0.0.1:8731/goto {"url": "..."}` → returns t
 (timing, passed-challenge flag, request counts). Wire your own storage/DB on top — this engine never
 touches a database.
 
+## crawl/ — the reusable crawl LIBRARY (on top of the server)
+
+Where `engine/` captures ONE page over a port, `crawl/` is a **library of crawl mechanics** for
+walking a whole site — still ref-free (zero project names), so any consumer reuses it. It attaches to
+the same shared browser.
+
+| module | what |
+|---|---|
+| `crawl.browser` | attach nodriver to the shared engine Chrome via `/cdp` (starts the server if down) |
+| `crawl.challenge` | Cloudflare "verify you are human" detect + `solve()`; generic soft-404 matcher |
+| `crawl.netblock` | CDP Fetch resource-type block — **one pattern per blocked type** so page load never stalls (the naive `url_pattern="*"` version froze `readyState=loading` → empty captures; see the docstring) |
+| `crawl.render` | consent-dismiss (`dismiss_overlays`) + `wait_ready` (readyState) + `wait_for_render` (client-mount) |
+| `crawl.parse` | clean words-only text, page links, image refs; entity-decoding; segment-boundary feed/infra URL filter; generic `image_kind` (consumer supplies vertical kinds via `extra_rules`) |
+| `crawl.store` | content-addressed zstd page store (sha256, sharded) — no DB |
+| `crawl.db` | **SQLAlchemy 2.0 Core** relational store: SQLite (a file) / Postgres / MySQL from one model. Atomic `claim()`, `reclaim_stuck()`, portable `scan_status` CHECK, and an `unhandled` feedback table |
+| `crawl.graph` | reports over the page→page reference graph: hubs / authorities / orphans / dead-links / `image_usage` / `improvement_report` |
+| `crawl.run` / `crawl.report` | point-and-go CLI: crawl a site → SQLite + auto site-shape report |
+| `crawl.drive` | hand-drive helpers (click / scroll / screenshot; settles without a fixed sleep) |
+| sibling `assets/` | content-addressed image/binary store (store / classify / imgmeta) |
+
+Point-and-go (one command rips a site + prints its shape):
+```
+python -m crawl.run --seed https://example.com/ --db site.sqlite --max 200 --tabs 8
+python -m crawl.report --db site.sqlite            # re-print the report later
+```
+`--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
+agent guide and `schema.sql` for the relational model.
+
+## Handoff state (for the next agent)
+
+**DONE + verified:** the `crawl/` library above; the SQLAlchemy-Core DB layer (SQLite/Postgres/MySQL,
+tested both); a 3-agent adversarial review with all findings fixed (subdomain-escape, a `<script>`
+ReDoS, HTML-entity decoding, feed/infra over-matching, stuck-frontier reclaim); a live **472-page
+parallel crawl, 0 failures, 85% rich pages**. `sniff.py` (powderhounds) consumes `crawl.challenge` +
+`crawl.netblock`.
+
+**OPEN:**
+- **Finish the #165 fold-back** — re-point powderhounds' `nd_crawl.py` at this engine (it still has its
+  own copy), and fold PH's DNS tracker-block (`tracker_resolver_rules`/`TRACKER_HOSTS`) into the engine
+  (`sniff.py` still imports those from `nd_crawl`).
+- Review follow-ups (medium): `--no-js` mode should skip the render-wait (blocking Script means no
+  client render to wait for); surface `netblock.enable()` failures instead of swallowing them.
+
+**GOTCHAS — read before running:**
+- **nodriver import landmine.** Upstream `nodriver/cdp/network.py` has a non-UTF-8 byte (line ~1345)
+  that raises `SyntaxError` under Python 3.14t. `vendor/nodriver` here is patched, but a consumer's
+  `site-packages` copy may NOT be — **put `vendor` FIRST in `PYTHONPATH`** (`PYTHONPATH=vendor:…`) so
+  the patched copy wins. This is the #1 thing that breaks a fresh run.
+- **SQLAlchemy on no-GIL.** Its `cyextension` C module silently re-enables the GIL. Install the
+  pure-Python build: `DISABLE_SQLALCHEMY_CEXT=1 pip install --no-binary SQLAlchemy "SQLAlchemy>=2.0"`.
+  Verify `not sys._is_gil_enabled()` after import. Drivers must be pure-Python too: `psycopg` (not
+  `[binary]`/`[c]`), `pymysql`, stdlib `sqlite3`.
+- **One crawl at a time on the shared browser.** Two crawls attaching to the same Chrome contend for
+  tabs and break. Finish/stop one first. Never `pkill` the browser — shut it down over the command
+  port so the cleared session is reused.
+- **Point each crawl at its OWN db/schema.** The `crawl.db` tables use plain names (`page`, `asset`,
+  `frontier`, …); a shared DB with another project's `page` table collides.
+
 ## Key lessons baked in (see docs/)
 - **Playwright is the Turnstile tell.** Cloudflare detects Playwright's CDP instrumentation and serves
   a dead challenge; **nodriver** (raw CDP, no Playwright) gets the real interactive widget and passes.
@@ -66,8 +124,9 @@ touches a database.
   is patched for it.
 
 ## Status
-Public on GitHub at https://github.com/awtoau/awto-playwrong.
-Local working checkout remains on your machine.
+Public on GitHub at https://github.com/awtoau/awto-playwrong. `main` carries the `engine/` capture
+server + the `crawl/` library + `assets/`. Local working checkout remains on your machine.
 
-_Multi-method browser automation: nodriver engine (Turnstile-beating) + Playwright methods, driven
-over a port, capture-only (no DB). The shared home for any app/agent that needs a browser._
+_Browser automation + a reusable crawl library: the nodriver engine (Turnstile-beating), a port-driven
+capture server, and `crawl/` (walk a site → content-addressed store + SQLAlchemy DB + reference-graph
+reports). Ref-free — the shared home for any app/agent that needs a browser or a crawler._
