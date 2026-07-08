@@ -174,7 +174,8 @@ async def crawl(cfg):
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
         while attempted < cfg.max_pages:
-            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted), shuffle=cfg.shuffle)
+            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
+                            shuffle=cfg.shuffle, host_diverse=cfg.host_diverse)
             if not batch:
                 break
             queue = asyncio.Queue()
@@ -200,7 +201,7 @@ async def crawl(cfg):
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
-                 rate_delay=1.5, shuffle=True):
+                 rate_delay=1.5, shuffle=True, host_diverse=True):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
@@ -214,6 +215,7 @@ class Config:
         self.block_types = netblock.TEXT_ONLY_KEEP_JS if keep_js else netblock.TEXT_ONLY
         # per-host politeness + 429 backoff (shared across all tabs). rate_delay=0 disables.
         self.shuffle = shuffle
+        self.host_diverse = host_diverse
         self.rl = ratelimit.RateLimiter(base_delay=rate_delay) if rate_delay and rate_delay > 0 else None
 
 
@@ -233,6 +235,8 @@ def _parse_args(argv):
                    help="Min seconds between fetches to the SAME host (per-host politeness + 429 backoff). 0 disables.")
     p.add_argument("--no-shuffle", action="store_true",
                    help="Crawl a depth band in url order (clusters a host) instead of randomised (spreads hosts).")
+    p.add_argument("--no-host-diverse", action="store_true",
+                   help="Disable round-robin-by-host claiming (one site per tab). On by default for multi-site crawls.")
     return p.parse_args(argv)
 
 
@@ -245,7 +249,8 @@ def main(argv=None):
     cfg = Config(seeds=a.seed, db_dsn=a.db, store_root=store_root,
                  max_pages=a.max, tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
                  port=a.port, hosts=hosts, keep_js=not a.no_js,
-                 rate_delay=a.rate_delay, shuffle=not a.no_shuffle)
+                 rate_delay=a.rate_delay, shuffle=not a.no_shuffle,
+                 host_diverse=not a.no_host_diverse)
     asyncio.run(crawl(cfg))
 
 

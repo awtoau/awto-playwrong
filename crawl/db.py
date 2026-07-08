@@ -189,26 +189,57 @@ class CrawlDB:
         for url, depth, src in rows:
             self.enqueue(url, depth, src)
 
-    def claim(self, n, lease_stale_tries=None, shuffle=False):
+    def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False):
         """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth), …].
         Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
         same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
 
-        shuffle=True picks rows in RANDOM order within the lowest-depth band instead of sorting by url.
-        Sorting by url clusters a host's pages adjacently, so a batch hammers one origin (this tripped
-        wbtools' 429). Randomising spreads a batch across hosts — width-first stays (depth still leads),
-        but within a depth the order is random so consecutive fetches hit different sites."""
+        Ordering modes (best last):
+        - default: (depth, url). Deterministic but CLUSTERS a host (its pages sort adjacently) so a
+          batch hammers one origin (this tripped wbtools' 429).
+        - shuffle=True: (depth, random). Spreads a batch across hosts within a depth band.
+        - host_diverse=True: ROUND-ROBIN across hosts — take the shallowest queued URL from EACH host in
+          turn, so a batch of n covers up to n DIFFERENT hosts. A host with only deep pages left still
+          contributes (goes deeper) rather than a shallow-heavy host dominating every tab. This is the
+          "one site per tab, even if it means going deeper" model. Overrides shuffle."""
         import sqlalchemy as _sa
-        order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
+        from urllib.parse import urlsplit
         with self.engine.begin() as c:
-            # pick queued rows; SKIP LOCKED on Postgres for multi-process safety
-            sel = (select(frontier.c.url, frontier.c.depth)
-                   .where(frontier.c.state == "queued")
-                   .order_by(*order)
-                   .limit(n))
-            if self.dialect == "postgresql":
-                sel = sel.with_for_update(skip_locked=True)
-            rows = c.execute(sel).all()
+            if host_diverse:
+                # Pull a generous candidate window (shallowest first), then greedily round-robin by host
+                # in Python so each of the n slots is a different host where possible.
+                win = (select(frontier.c.url, frontier.c.depth)
+                       .where(frontier.c.state == "queued")
+                       .order_by(frontier.c.depth, _sa.func.random())
+                       .limit(max(n * 40, 400)))
+                if self.dialect == "postgresql":
+                    win = win.with_for_update(skip_locked=True)
+                cand = c.execute(win).all()
+                by_host = {}
+                for u, dep in cand:
+                    h = (urlsplit(u).netloc or "").lower()
+                    by_host.setdefault(h, []).append((u, dep))
+                for h in by_host:                        # shallowest first within each host
+                    by_host[h].sort(key=lambda t: t[1])
+                picked, hosts = [], list(by_host.keys())
+                i = 0
+                while len(picked) < n and any(by_host.values()):
+                    h = hosts[i % len(hosts)]
+                    if by_host[h]:
+                        picked.append(by_host[h].pop(0))
+                    i += 1
+                    if i > n * len(hosts) + len(hosts):   # safety: everyone drained
+                        break
+                rows = picked
+            else:
+                order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
+                sel = (select(frontier.c.url, frontier.c.depth)
+                       .where(frontier.c.state == "queued")
+                       .order_by(*order)
+                       .limit(n))
+                if self.dialect == "postgresql":
+                    sel = sel.with_for_update(skip_locked=True)
+                rows = c.execute(sel).all()
             if rows:
                 urls = [r[0] for r in rows]
                 c.execute(update(frontier).where(frontier.c.url.in_(urls))
