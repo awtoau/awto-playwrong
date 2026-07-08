@@ -39,9 +39,33 @@ so a shared DB with another project's `page` table will collide.)
 | `--depth N` | max link depth from a seed | 3 |
 | `--host H` | extra host to allow beyond the seeds' | — |
 | `--no-js` | block Script too (leanest; static sites) | keep JS |
+| `--rate-delay S` | min seconds between fetches to the SAME host (per-host politeness + 429/503 backoff, shared across all tabs). `0` disables. | 1.5 |
+| `--no-shuffle` | crawl a depth band in url order (clusters one host) instead of randomised (spreads hosts) | shuffle on |
 
 Same-host only by default (boundary match — it won't wander onto `evilexample.com` for `example.com`).
 Add `--host` to widen.
+
+## Politeness — rate limiting, backoff, and shuffle (don't trip a site's 429)
+
+With many tabs and several seeds the engine crawls one host per tab (host-affinity). Two things keep it
+from hammering any single origin into an HTTP 429 ("Too many requests"):
+
+- **Per-host gate (`--rate-delay`, default 1.5s):** a shared minimum gap between two fetches to the
+  *same* host — enforced across all tabs, so tabs on other hosts are unaffected and throughput stays
+  high. `--rate-delay 0` turns it off (only for a site you own / are load-testing).
+- **429/503 backoff (automatic):** the worker reads the navigation's HTTP status
+  (`Network.responseReceived`). On a 429/503 it widens that host's gate exponentially (honouring
+  `Retry-After` if sent), **requeues** the URL, and does NOT store the error body as content. A clean
+  response relaxes the gate a step. The run summary prints any host that got backed off.
+- **Shuffle (default on):** within a depth band, URLs are claimed in random order instead of sorted by
+  url. Url-sort clusters a host's pages adjacently, so a batch of N slots would pull N pages of the
+  *same* host in a row and hammer it (this is what tripped wbtools). Shuffle spreads a batch across
+  hosts. Breadth-first by depth still leads (shallow/important pages first); only the intra-depth order
+  is randomised. `--no-shuffle` restores the deterministic url order.
+
+Rule of thumb: leave the defaults. Lower `--rate-delay` only for a site you own; raise it (e.g. `3`)
+for a fragile origin. If a run summary shows a host with high `strikes`, that origin is touchy —
+re-run it alone with a higher `--rate-delay`.
 
 ## What you get
 
@@ -77,19 +101,45 @@ graph.image_usage(d, img_url)           # every page that references a given ima
 graph.image_pages(d, kind="piste_map")  # pages that reference an image of a given kind
 ```
 
-## Fetching the image bytes (optional second pass)
+## Fetching the image bytes
 
-`crawl.run` records image *references*; it does not download the bytes (a text crawl stays cheap).
-To mirror the images, iterate `page_asset` and use the `assets` package:
+`crawl.run` records image *references* (fast text crawl). Getting the actual bytes, three ways
+(cheapest first):
+
+**1. Harvest Chrome's cache — ZERO re-fetch (`assets.cache`).** While the browser renders pages (images
+aren't fully network-blocked — the block is best-effort and leaks), Chrome keeps every rendered image
+in its Simple Cache. `assets.cache` reads those bytes straight off disk — no network at all.
+
+```bash
+# recover every cached image for your hosts into an asset store (dry-run first to count)
+python -m assets.cache --root /path/assets --host mysite.com --dry-run
+python -m assets.cache --root /path/assets --host mysite.com
+```
+```python
+from assets import cache, store, imgmeta
+def sink(url, data, mime):
+    m = imgmeta.probe(data)
+    sa = store.store_asset(data, ASSET_ROOT, mime=mime, src_url=url, meta=m)
+    d.upsert_asset(sa); d.link_page_asset(page_sha_for(url), url, asset_sha=sa.sha256)
+cache.harvest(sink, url_filter=lambda u: "mysite.com" in u)   # walks /tmp/uc_*/…/Cache_Data
+```
+Best right after a crawl (the cache is warm). The shared browser's profile is `/tmp/uc_*` — one 1GB+
+cache can hold thousands of images across all recent browsing.
+
+**2. Second-pass re-download (`assets.store`).** Iterate `page_asset` and fetch each `img_url` (browser
+or urllib), then store — for images that weren't cached, or a clean deduped mirror:
 
 ```python
 from assets import store, classify, imgmeta      # sibling package
-# for each page_asset.img_url: fetch bytes (via the browser or urllib), then:
 meta = imgmeta.probe(data)
 sa = store.store_asset(data, asset_root, mime=content_type, src_url=img_url, meta=meta)
 d.upsert_asset(sa)
 d.link_page_asset(page_sha, img_url, asset_sha=sa.sha256)   # closes the page→asset link
 ```
+
+**3. Capture during the crawl (`Network.getResponseBody`)** — hook image responses as they load. Most
+code; use only if you need bytes inline in one pass. (`docs/lessons.md` notes in-memory capture is less
+reliable than 1 or 2 — prefer the cache harvest.)
 
 ## Notes / gotchas
 
