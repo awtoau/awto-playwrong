@@ -27,8 +27,11 @@ data layer on top (the project keeps its DB code; this stays generic).
 - `engine/client.py` — the port client (`goto/solve/shot/text/...`).
 - `engine/solve.py` — standalone Turnstile solve (find "verify you are human" inside the cross-origin
   iframe + click).
-- `vendor/nodriver` — patched nodriver (fixes a non-UTF-8 byte that breaks import under Python 3.14t
-  free-threaded; upstream issue ultrafunkamsterdam/nodriver#35).
+- `vendor/nodriver` — patched nodriver 0.50.3 (fixes a non-UTF-8 byte in `cdp/network.py` line ~1345
+  that raises `SyntaxError` on import under CPython 3.14). Upstream: issue
+  [ultrafunkamsterdam/nodriver#35](https://github.com/ultrafunkamsterdam/nodriver/issues/35) + fix PR
+  [#36](https://github.com/ultrafunkamsterdam/nodriver/pull/36) (both open/unmerged). **Drop the vendor
+  pin once #36 merges and a fixed release ships.**
 
 ### methods/ — alternative / historical
 - `playwright-server.py` + `playwright-ctl.py` — the earlier Playwright-based server/client. **Note:
@@ -82,6 +85,36 @@ python -m crawl.report --db site.sqlite            # re-print the report later
 ```
 `--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
 agent guide and `schema.sql` for the relational model.
+
+## Install (system-wide tool — no venv to activate)
+
+Install the crawl library as an isolated tool so `crawl` / `crawl-report` are on your PATH from
+anywhere, with the deps kept out of system Python:
+
+```
+DISABLE_SQLALCHEMY_CEXT=1 uv tool install \
+  --python /usr/bin/python3.14t \
+  --no-binary-package sqlalchemy \
+  git+https://github.com/awtoau/awto-playwrong     # or a local checkout path
+
+crawl --seed https://example.com/ --db site.sqlite --max 200 --tabs 8
+```
+
+Every flag is load-bearing on a free-threaded (no-GIL) machine — omit one and the GIL comes back on:
+- `--python /usr/bin/python3.14t` — build the tool env on the **free-threaded** interpreter (plain
+  `python3.14` has the GIL; `uv` would otherwise pick it and no-GIL is silently lost).
+- `--no-binary-package sqlalchemy` + `DISABLE_SQLALCHEMY_CEXT=1` — build SQLAlchemy from source with
+  its C extension off; the prebuilt wheel's `cyextension` re-enables the GIL on import.
+- The patched **nodriver is bundled** in the wheel (`crawl/_vendor/nodriver`) and `import crawl`
+  prepends it to `sys.path`, so no `PYTHONPATH` juggling — `import crawl` then `import nodriver` gets
+  the fixed copy. (A bare `import nodriver` without importing `crawl` first still finds the broken
+  PyPI copy; always go through `crawl`.)
+
+Verify after install: `python -c "import sys, crawl; import sqlalchemy.util as u; assert not
+sys._is_gil_enabled() and not u.has_compiled_ext()"` on the tool's interpreter.
+
+For development, an editable install in a free-threaded venv works too:
+`uv pip install -e .` after `DISABLE_SQLALCHEMY_CEXT=1 uv pip install --no-binary sqlalchemy "sqlalchemy>=2.0"`.
 
 ## Handoff state (for the next agent)
 

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "awto-playwrong"
+version = "0.1.0"
+description = "Turnstile-beating browser-capture engine + a reusable, ref-free crawl library (content-addressed store, SQLAlchemy DB, reference-graph reports)."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+keywords = ["crawler", "browser-automation", "cloudflare", "turnstile", "nodriver", "scraping"]
+
+# Runtime deps. All PURE-PYTHON so the package runs on free-threaded (no-GIL) CPython 3.14t without
+# re-enabling the GIL — SQLAlchemy's C extension (cyextension) and psycopg's C/binary impl both do,
+# so they are pinned to the pure-Python forms. See "Install" in README.md.
+dependencies = [
+    "sqlalchemy>=2.0",     # DB layer — MUST be the pure-Python build (see [tool.uv] + README)
+    "psycopg>=3.1",        # Postgres driver, pure-Python impl (NOT psycopg[binary]/[c])
+    "pymysql>=1.1",        # MySQL/MariaDB driver, pure-Python
+    "zstandard>=0.22",     # page-store compression
+    "nodriver>=0.50",      # raw-CDP Chrome (patched copy vendored — see [tool.hatch] below)
+]
+
+[project.scripts]
+crawl = "crawl.run:main"
+crawl-report = "crawl.report:main"
+
+[project.urls]
+Homepage = "https://github.com/awtoau/awto-playwrong"
+
+# ── build: ship crawl/ + assets/ + the PATCHED vendored nodriver ────────────────────────────────
+# Upstream nodriver 0.50.3 has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on import
+# under CPython 3.14t. vendor/nodriver is that release with the one byte fixed. We ship it INSIDE the
+# package (crawl/_vendor/nodriver) and prepend it to sys.path at import time (see crawl/__init__.py),
+# so a tool install carries the fix and no consumer PYTHONPATH juggling is needed.
+[tool.hatch.build.targets.wheel]
+packages = ["crawl", "assets"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"vendor/nodriver" = "crawl/_vendor/nodriver"
+
+# ── uv tool install: force the pure-Python, no-GIL-safe builds ──────────────────────────────────
+# SQLAlchemy's cyextension silently re-enables the GIL; installing it from an sdist with the C ext
+# disabled keeps no-GIL alive. uv reads these env vars during the build of that package.
+[tool.uv]
+# Build SQLAlchemy from source with its C extension disabled (pure-Python) so it doesn't re-enable
+# the GIL on free-threaded CPython. (Also pass DISABLE_SQLALCHEMY_CEXT=1 in the environment.)
+no-binary-package = ["sqlalchemy"]
