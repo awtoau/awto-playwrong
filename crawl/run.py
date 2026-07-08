@@ -189,37 +189,49 @@ async def _recycle(b, cfg, tab, blk):
 
 
 async def _worker(slot, b, queue, cfg, d, stats):
-    """Pull URLs from the shared queue until a None sentinel. `slot` is a 1-element list holding this
-    worker's (tab, blocker) so it can be swapped in place. RECYCLING POOL: on a render crash — or after
-    RECYCLE_EVERY clean pages, or CONSEC_FAIL consecutive fails — the tab is REPLACED with a fresh one
-    (process isolation: a bad page can't poison later pages) without leaking tabs (count stays fixed)."""
-    RECYCLE_EVERY = 50    # proactively refresh a tab every N pages (bound renderer memory/leak creep)
-    CONSEC_FAIL = 3       # a tab that fails this many pages in a row is probably wedged -> replace
-    since_fresh = 0
-    consec_fail = 0
+    """Pull URLs from the shared queue until a None sentinel. FRESH TAB PER URL: every URL gets its own
+    brand-new tab (with its own resource blocker), and the tab is CLOSED as soon as the page is done —
+    no tab is ever reused across URLs. This is the strongest process isolation (a page can't leak state,
+    cookies, or a wedged renderer into the next one) at the cost of a tab open/close per page. `slot` is
+    kept for signature/pool compatibility but no persistent tab lives in it."""
     while True:
         item = await queue.get()
         try:
             if item is None:
                 return
             url, depth, link_code = item
-            tab, blk = slot[0]
-            before_ok = stats["ok"]
+            tab = blk = None
             try:
-                await _fetch_one(tab, url, depth, cfg, d, stats, link_code)
-                progressed = stats["ok"] > before_ok
-            except Exception:
-                progressed = False   # _fetch_one shouldn't raise, but never let a crash kill the worker
-            since_fresh += 1
-            consec_fail = 0 if progressed else consec_fail + 1
-            # recycle the tab if it looks wedged, or proactively every RECYCLE_EVERY pages.
-            if consec_fail >= CONSEC_FAIL or since_fresh >= RECYCLE_EVERY:
+                tab, blk = await _new_tab(b, cfg)          # a fresh tab for THIS url only
+                # HARD STALL GUARD: one ceiling over the WHOLE fetch (nav + render + capture). A page
+                # that wedges the tab (e.g. a 'Leave site?' beforeunload the auto-dismiss missed, an
+                # infinite redirect, a hung renderer) can't stall the crawl — we abandon it and the tab
+                # is closed below. Ceiling = generous multiple of the nav budget so a slow-but-fine page
+                # still finishes.
+                stall_ceiling = max(45.0, cfg.nav_timeout * 4)
                 try:
-                    slot[0] = await _recycle(b, cfg, tab, blk)
-                except Exception:
-                    pass   # if recycle itself fails, keep the old tab; end-of-run sweep still cleans up
-                since_fresh = 0
-                consec_fail = 0
+                    await asyncio.wait_for(
+                        _fetch_one(tab, url, depth, cfg, d, stats, link_code), timeout=stall_ceiling)
+                except asyncio.TimeoutError:
+                    try:
+                        d.scan(url, status="render_error", note=f"stall>{stall_ceiling:.0f}s (tab abandoned)")
+                    except Exception:
+                        pass
+                    stats["fail"] += 1
+                    print(f"  STALL >{stall_ceiling:.0f}s abandoned {url[:60]}", flush=True)
+            except Exception:
+                pass   # _fetch_one records its own terminal state; never let a crash kill the worker
+            finally:
+                if blk is not None:
+                    try:
+                        await blk.disable()
+                    except Exception:
+                        pass
+                if tab is not None:
+                    try:
+                        await tab.close()                  # close after every URL — never reuse
+                    except Exception:
+                        pass
         finally:
             queue.task_done()
 
@@ -230,12 +242,12 @@ async def crawl(cfg):
     `cfg.max_pages` is a cap on pages ATTEMPTED this run (each claimed URL counts whether it succeeds,
     times out, or errors) — so a broken site can't loop forever. `stats['ok']` is the real page count.
 
-    Tab discipline: creates EXACTLY cfg.tabs tabs ONCE (a persistent pool, reused across every batch),
-    and closes them once at the end + a server-side sweep of any strays. Never a tab-per-batch (that
-    leaked blank about:blank tabs onto the shared browser)."""
+    Tab discipline: FRESH TAB PER URL. cfg.tabs is the CONCURRENCY (that many workers run at once); each
+    worker opens a brand-new tab for every URL and closes it right after — no tab is ever reused. So the
+    only tabs alive at any moment are the ≤cfg.tabs in-flight ones; each closes itself when its page is
+    done, so there is nothing to sweep at the end."""
     os.makedirs(cfg.store_root, exist_ok=True)
     d = db.open_db(cfg.db_dsn)
-    pool = []          # [(tab, blocker)] — created once, reused, closed once
     b = None
     try:
         d.init_schema()
@@ -245,11 +257,8 @@ async def crawl(cfg):
         for s in cfg.seeds:
             d.enqueue(s, 0)
         print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
-              f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth}", flush=True)
+              f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth} (fresh tab per URL)", flush=True)
         b = await browser.attach(cfg.port)
-        # ── build the tab pool ONCE — each slot is a 1-elem list so a worker can recycle in place ──
-        for _ in range(cfg.tabs):
-            pool.append([await _new_tab(b, cfg)])   # slot = [(tab, blk)]
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
         while attempted < cfg.max_pages:
@@ -262,8 +271,9 @@ async def crawl(cfg):
                 queue.put_nowait(item)
             for _ in range(cfg.tabs):
                 queue.put_nowait(None)     # one sentinel per worker
-            # reuse the SAME pool every batch; workers may recycle a bad tab in place (count stays fixed).
-            workers = [asyncio.create_task(_worker(slot, b, queue, cfg, d, stats)) for slot in pool]
+            # cfg.tabs concurrent workers; each makes + closes its OWN tab per URL (slot arg unused now).
+            workers = [asyncio.create_task(_worker([None], b, queue, cfg, d, stats))
+                       for _ in range(cfg.tabs)]
             await asyncio.gather(*workers)
             attempted += len(batch)
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
@@ -275,23 +285,8 @@ async def crawl(cfg):
         print(graph.summary_text(d))
         return stats
     finally:
-        # Close ONLY OUR tabs (disable blocker first). Do NOT global-sweep here: another crawl may be
-        # running concurrently on the same shared browser (Dan runs several), and /closeextra would
-        # kill its tabs too. Since we now REUSE a fixed pool (no tab-per-batch churn), closing our own
-        # pool is sufficient — we don't leak. Stray-reaping is a separate, explicit maintenance call.
-        for slot in pool:
-            try:
-                tab, blk = slot[0]
-            except Exception:
-                continue
-            try:
-                await blk.disable()
-            except Exception:
-                pass
-            try:
-                await tab.close()
-            except Exception:
-                pass
+        # Fresh-tab-per-URL means every tab already closed itself after its page — nothing to sweep here
+        # (and NO global sweep: other crawls may share this browser). Just release the DB.
         d.close()
 
 
