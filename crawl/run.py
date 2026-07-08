@@ -27,7 +27,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from . import browser, netblock, render, parse, store, db, graph
+from . import browser, netblock, render, parse, store, db, graph, ratelimit
 
 
 def _same_site(url, hosts):
@@ -41,17 +41,57 @@ def _same_site(url, hosts):
         return False
 
 
+def _host_of(url):
+    try:
+        return urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
+    except Exception:
+        return ""
+
+
 async def _fetch_one(tab, url, depth, cfg, d, stats):
     """Nav → render → capture → parse → record. Guarantees a terminal frontier state for `url` even on
-    crash (finally-scan) so no row is left stuck in 'fetching'."""
+    crash (finally-scan) so no row is left stuck in 'fetching'. Honours the shared per-host rate limit
+    (cfg.rl): waits for a polite slot before nav, and on a 429/503 backs the host off + requeues."""
     t0 = time.monotonic()
     terminal = False   # did we record a terminal scan for this url?
+    host = _host_of(url)
+    rl = getattr(cfg, "rl", None)
+    # capture the main document's HTTP status via a one-shot CDP response hook (so we can SEE a 429).
+    doc_status = {"code": None, "retry_after": None}
+    def _on_resp(ev):
+        try:
+            r = ev.response
+            # first same-URL (or same-host document) response wins — that's the navigation response.
+            if doc_status["code"] is None and getattr(r, "status", None):
+                doc_status["code"] = int(r.status)
+                hdrs = {k.lower(): v for k, v in (getattr(r, "headers", {}) or {}).items()}
+                ra = hdrs.get("retry-after")
+                if ra:
+                    try: doc_status["retry_after"] = float(ra)
+                    except ValueError: doc_status["retry_after"] = None
+        except Exception:
+            pass
     try:
+        if rl is not None:
+            await rl.acquire(host)          # block until it's polite to hit this host
+        try:
+            from nodriver import cdp as _cdp
+            tab.add_handler(_cdp.network.ResponseReceived, _on_resp)
+        except Exception:
+            pass
         nav_timed_out = False
         try:
             await asyncio.wait_for(tab.get(url), timeout=cfg.nav_timeout)
         except asyncio.TimeoutError:
             nav_timed_out = True
+        # rate-limited? back the host off and requeue this URL — don't store the 429 body as content.
+        if rl is not None and rl.on_response(host, doc_status["code"], doc_status["retry_after"]):
+            d.scan(url, status="rate_limited", http_status=doc_status["code"],
+                   note=f"429/503 backoff -> {rl._h(host).delay:.1f}s"); terminal = True
+            d.enqueue(url, depth)           # requeue for a later, slower attempt
+            stats["fail"] += 1
+            print(f"  429 backoff {rl._h(host).delay:.0f}s (requeued) {url[:60]}", flush=True)
+            return
         # nav can return while the doc is still 'loading' -> a stub with an empty body. Wait for the
         # DOM to be ready, dismiss any consent wall, then let client-rendered content mount.
         await render.wait_ready(tab, max_wait=cfg.nav_timeout)
@@ -74,7 +114,7 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
         for lu in links:
             if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth:
                 d.enqueue(lu, depth + 1, discovered_from=url)
-        d.scan(url, status="ok", sha256=sp.sha256); terminal = True
+        d.scan(url, status="ok", http_status=doc_status["code"], sha256=sp.sha256); terminal = True
         ms = int((time.monotonic() - t0) * 1000)
         stats["ok"] += 1
         stats["chars"] += sp.text_chars
@@ -134,7 +174,7 @@ async def crawl(cfg):
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
         while attempted < cfg.max_pages:
-            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted))
+            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted), shuffle=cfg.shuffle)
             if not batch:
                 break
             queue = asyncio.Queue()
@@ -147,6 +187,10 @@ async def crawl(cfg):
             attempted += len(batch)
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
               f"{stats['chars']} text chars\n", flush=True)
+        if cfg.rl is not None:
+            backed = cfg.rl.snapshot()
+            if backed:
+                print(f"rate-limit backoff (host -> delay/strikes): {backed}", flush=True)
         print(graph.summary_text(d))
         return stats
     finally:
@@ -155,7 +199,8 @@ async def crawl(cfg):
 
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
-                 depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True):
+                 depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
+                 rate_delay=1.5, shuffle=True):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
@@ -167,6 +212,9 @@ class Config:
         # default: stay on the seeds' own hosts (boundary match, see _same_site)
         self.hosts = hosts or sorted({urlsplit(s).netloc.lower().split(":")[0] for s in seeds})
         self.block_types = netblock.TEXT_ONLY_KEEP_JS if keep_js else netblock.TEXT_ONLY
+        # per-host politeness + 429 backoff (shared across all tabs). rate_delay=0 disables.
+        self.shuffle = shuffle
+        self.rl = ratelimit.RateLimiter(base_delay=rate_delay) if rate_delay and rate_delay > 0 else None
 
 
 def _parse_args(argv):
@@ -181,6 +229,10 @@ def _parse_args(argv):
     p.add_argument("--port", type=int, default=int(os.environ.get("PH_PORT", "8731")))
     p.add_argument("--host", action="append", help="Extra host to allow (repeatable)")
     p.add_argument("--no-js", action="store_true", help="Block Script too (leanest; static sites)")
+    p.add_argument("--rate-delay", type=float, default=1.5,
+                   help="Min seconds between fetches to the SAME host (per-host politeness + 429 backoff). 0 disables.")
+    p.add_argument("--no-shuffle", action="store_true",
+                   help="Crawl a depth band in url order (clusters a host) instead of randomised (spreads hosts).")
     return p.parse_args(argv)
 
 
@@ -192,7 +244,8 @@ def main(argv=None):
     hosts = sorted({urlsplit(s).netloc.lower().split(":")[0] for s in a.seed} | set(a.host or []))
     cfg = Config(seeds=a.seed, db_dsn=a.db, store_root=store_root,
                  max_pages=a.max, tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
-                 port=a.port, hosts=hosts, keep_js=not a.no_js)
+                 port=a.port, hosts=hosts, keep_js=not a.no_js,
+                 rate_delay=a.rate_delay, shuffle=not a.no_shuffle)
     asyncio.run(crawl(cfg))
 
 

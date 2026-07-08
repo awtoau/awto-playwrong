@@ -189,15 +189,22 @@ class CrawlDB:
         for url, depth, src in rows:
             self.enqueue(url, depth, src)
 
-    def claim(self, n, lease_stale_tries=None):
+    def claim(self, n, lease_stale_tries=None, shuffle=False):
         """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth), …].
         Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
-        same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable."""
+        same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
+
+        shuffle=True picks rows in RANDOM order within the lowest-depth band instead of sorting by url.
+        Sorting by url clusters a host's pages adjacently, so a batch hammers one origin (this tripped
+        wbtools' 429). Randomising spreads a batch across hosts — width-first stays (depth still leads),
+        but within a depth the order is random so consecutive fetches hit different sites."""
+        import sqlalchemy as _sa
+        order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
         with self.engine.begin() as c:
-            # pick queued rows deterministically; SKIP LOCKED on Postgres for multi-process safety
+            # pick queued rows; SKIP LOCKED on Postgres for multi-process safety
             sel = (select(frontier.c.url, frontier.c.depth)
                    .where(frontier.c.state == "queued")
-                   .order_by(frontier.c.depth, frontier.c.url)
+                   .order_by(*order)
                    .limit(n))
             if self.dialect == "postgresql":
                 sel = sel.with_for_update(skip_locked=True)
