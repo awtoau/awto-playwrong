@@ -38,6 +38,35 @@ def is_up(port):
         return False
 
 
+def close_extra_tabs(port=8731):
+    """MAINTENANCE ONLY — reap strays when the browser is IDLE. Asks the server to close every tab
+    except its protected base tab. DANGER: this closes ALL extra tabs, so do NOT call it while a crawl
+    (yours or another agent's) is running on the shared browser — it would kill their live tabs too.
+    The crawl no longer calls this automatically (it reuses a fixed pool, so it doesn't leak). Run it by
+    hand — `python -m crawl.browser --sweep` — only when nothing is crawling. Best-effort; never raises."""
+    try:
+        _call("closeextra", port, timeout=15)
+    except Exception:
+        pass
+
+
+def _main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Shared-browser maintenance (run only when idle).")
+    ap.add_argument("--sweep", action="store_true", help="Close all stray tabs (keep the base tab). IDLE ONLY.")
+    ap.add_argument("--port", type=int, default=8731)
+    a = ap.parse_args(argv)
+    if a.sweep:
+        close_extra_tabs(a.port)
+        print("swept stray tabs (kept base). Only safe when no crawl is running.")
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    _main()
+
+
 def browser_ok(port):
     """True only if the server is up AND its Chrome is actually reachable (a valid /cdp host:port).
     This is the check that matters — a bare status=alive can lie when the browser was closed."""

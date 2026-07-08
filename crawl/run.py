@@ -134,33 +134,78 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
                 pass
 
 
-async def _worker(browser_obj, queue, cfg, d, stats):
-    tab = await browser_obj.get("about:blank", new_tab=True)
+async def _new_tab(b, cfg):
+    """Open one crawl tab (with its resource blocker enabled). Returns (tab, blocker)."""
+    tab = await b.get("about:blank", new_tab=True)
     blk = netblock.ResourceBlocker(tab, block_types=cfg.block_types)
     await blk.enable()
+    return tab, blk
+
+
+async def _recycle(b, cfg, tab, blk):
+    """Replace a tab that has gone bad — close the old one, open a fresh one. Isolation without a leak:
+    a wedged/leaked renderer is discarded so it can't poison the next page, but we never grow the tab
+    count. Best-effort close (a crashed tab may already be gone)."""
     try:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            url, depth = item
-            await _fetch_one(tab, url, depth, cfg, d, stats)
-            queue.task_done()
-    finally:
         await blk.disable()
+    except Exception:
+        pass
+    try:
+        await tab.close()
+    except Exception:
+        pass
+    return await _new_tab(b, cfg)
+
+
+async def _worker(slot, b, queue, cfg, d, stats):
+    """Pull URLs from the shared queue until a None sentinel. `slot` is a 1-element list holding this
+    worker's (tab, blocker) so it can be swapped in place. RECYCLING POOL: on a render crash — or after
+    RECYCLE_EVERY clean pages, or CONSEC_FAIL consecutive fails — the tab is REPLACED with a fresh one
+    (process isolation: a bad page can't poison later pages) without leaking tabs (count stays fixed)."""
+    RECYCLE_EVERY = 50    # proactively refresh a tab every N pages (bound renderer memory/leak creep)
+    CONSEC_FAIL = 3       # a tab that fails this many pages in a row is probably wedged -> replace
+    since_fresh = 0
+    consec_fail = 0
+    while True:
+        item = await queue.get()
         try:
-            await tab.close()
-        except Exception:
-            pass
+            if item is None:
+                return
+            url, depth = item
+            tab, blk = slot[0]
+            before_ok = stats["ok"]
+            try:
+                await _fetch_one(tab, url, depth, cfg, d, stats)
+                progressed = stats["ok"] > before_ok
+            except Exception:
+                progressed = False   # _fetch_one shouldn't raise, but never let a crash kill the worker
+            since_fresh += 1
+            consec_fail = 0 if progressed else consec_fail + 1
+            # recycle the tab if it looks wedged, or proactively every RECYCLE_EVERY pages.
+            if consec_fail >= CONSEC_FAIL or since_fresh >= RECYCLE_EVERY:
+                try:
+                    slot[0] = await _recycle(b, cfg, tab, blk)
+                except Exception:
+                    pass   # if recycle itself fails, keep the old tab; end-of-run sweep still cleans up
+                since_fresh = 0
+                consec_fail = 0
+        finally:
+            queue.task_done()
 
 
 async def crawl(cfg):
     """Run the crawl described by cfg (a Config). Returns the stats dict.
 
     `cfg.max_pages` is a cap on pages ATTEMPTED this run (each claimed URL counts whether it succeeds,
-    times out, or errors) — so a broken site can't loop forever. `stats['ok']` is the real page count."""
+    times out, or errors) — so a broken site can't loop forever. `stats['ok']` is the real page count.
+
+    Tab discipline: creates EXACTLY cfg.tabs tabs ONCE (a persistent pool, reused across every batch),
+    and closes them once at the end + a server-side sweep of any strays. Never a tab-per-batch (that
+    leaked blank about:blank tabs onto the shared browser)."""
     os.makedirs(cfg.store_root, exist_ok=True)
     d = db.open_db(cfg.db_dsn)
+    pool = []          # [(tab, blocker)] — created once, reused, closed once
+    b = None
     try:
         d.init_schema()
         reclaimed = d.reclaim_stuck()          # recover any rows a previous crashed run left 'fetching'
@@ -171,6 +216,9 @@ async def crawl(cfg):
         print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
               f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth}", flush=True)
         b = await browser.attach(cfg.port)
+        # ── build the tab pool ONCE — each slot is a 1-elem list so a worker can recycle in place ──
+        for _ in range(cfg.tabs):
+            pool.append([await _new_tab(b, cfg)])   # slot = [(tab, blk)]
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
         while attempted < cfg.max_pages:
@@ -182,8 +230,9 @@ async def crawl(cfg):
             for u, dep in batch:
                 queue.put_nowait((u, dep))
             for _ in range(cfg.tabs):
-                queue.put_nowait(None)
-            workers = [asyncio.create_task(_worker(b, queue, cfg, d, stats)) for _ in range(cfg.tabs)]
+                queue.put_nowait(None)     # one sentinel per worker
+            # reuse the SAME pool every batch; workers may recycle a bad tab in place (count stays fixed).
+            workers = [asyncio.create_task(_worker(slot, b, queue, cfg, d, stats)) for slot in pool]
             await asyncio.gather(*workers)
             attempted += len(batch)
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
@@ -195,6 +244,23 @@ async def crawl(cfg):
         print(graph.summary_text(d))
         return stats
     finally:
+        # Close ONLY OUR tabs (disable blocker first). Do NOT global-sweep here: another crawl may be
+        # running concurrently on the same shared browser (Dan runs several), and /closeextra would
+        # kill its tabs too. Since we now REUSE a fixed pool (no tab-per-batch churn), closing our own
+        # pool is sufficient — we don't leak. Stray-reaping is a separate, explicit maintenance call.
+        for slot in pool:
+            try:
+                tab, blk = slot[0]
+            except Exception:
+                continue
+            try:
+                await blk.disable()
+            except Exception:
+                pass
+            try:
+                await tab.close()
+            except Exception:
+                pass
         d.close()
 
 
