@@ -41,6 +41,7 @@ so a shared DB with another project's `page` table will collide.)
 | `--no-js` | block Script too (leanest; static sites) | keep JS |
 | `--rate-delay S` | min seconds between fetches to the SAME host (per-host politeness + 429/503 backoff, shared across all tabs). `0` disables. | 1.5 |
 | `--no-shuffle` | crawl a depth band in url order (clusters one host) instead of randomised (spreads hosts) | shuffle on |
+| `--no-host-diverse` | disable round-robin-by-host claiming (one site per tab) | host-diverse on |
 
 Same-host only by default (boundary match — it won't wander onto `evilexample.com` for `example.com`).
 Add `--host` to widen.
@@ -62,6 +63,13 @@ from hammering any single origin into an HTTP 429 ("Too many requests"):
   *same* host in a row and hammer it (this is what tripped wbtools). Shuffle spreads a batch across
   hosts. Breadth-first by depth still leads (shallow/important pages first); only the intra-depth order
   is randomised. `--no-shuffle` restores the deterministic url order.
+- **Host-diverse claim (default on):** the strongest form — a batch is built by ROUND-ROBIN across
+  hosts, so each of the N tabs gets a *different* site. When one host dominates the shallowest depth
+  band (e.g. it was barely crawled so all its pages are shallow), plain breadth-first would put every
+  tab on that one host; host-diverse instead takes the shallowest URL from each host in turn, and a
+  host with only deep pages left still contributes (goes deeper) rather than a shallow-heavy host
+  monopolising the tabs. This is the "one site per tab, even if it means going deeper" model.
+  `--no-host-diverse` falls back to shuffle/url order.
 
 Rule of thumb: leave the defaults. Lower `--rate-delay` only for a site you own; raise it (e.g. `3`)
 for a fragile origin. If a run summary shows a host with high `strikes`, that origin is touchy —
