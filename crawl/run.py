@@ -48,7 +48,7 @@ def _host_of(url):
         return ""
 
 
-async def _fetch_one(tab, url, depth, cfg, d, stats):
+async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
     """Nav → render → capture → parse → record. Guarantees a terminal frontier state for `url` even on
     crash (finally-scan) so no row is left stuck in 'fetching'. Honours the shared per-host rate limit
     (cfg.rl): waits for a polite slot before nav, and on a 429/503 backs the host off + requeues."""
@@ -86,9 +86,11 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
             nav_timed_out = True
         # rate-limited? back the host off and requeue this URL — don't store the 429 body as content.
         if rl is not None and rl.on_response(host, doc_status["code"], doc_status["retry_after"]):
-            d.scan(url, status="rate_limited", http_status=doc_status["code"],
+            # 'blocked' is the valid SCAN_STATUSES member for a rate-limit (429/503); 'rate_limited'
+            # is NOT in the CHECK vocabulary and would violate the constraint.
+            d.scan(url, status="blocked", http_status=doc_status["code"],
                    note=f"429/503 backoff -> {rl._h(host).delay:.1f}s"); terminal = True
-            d.enqueue(url, depth)           # requeue for a later, slower attempt
+            d.enqueue(url, depth, link_code=link_code)   # requeue (keep the tag) for a slower attempt
             stats["fail"] += 1
             print(f"  429 backoff {rl._h(host).delay:.0f}s (requeued) {url[:60]}", flush=True)
             return
@@ -107,13 +109,15 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
         links = parse.extract_links(html, url)
         images = list(parse.extract_images(html, url))
         # record: page row + reference graph + image refs, then enqueue same-site links.
-        d.upsert_page(sp, url, title=sp.title, text_chars=sp.text_chars, status="ok")
+        # link_code (the consumer tag) rides from this URL onto its page, its image refs, AND every
+        # same-site link discovered under it — so a whole subtree stays tagged with the seed's code.
+        d.upsert_page(sp, url, title=sp.title, text_chars=sp.text_chars, status="ok", link_code=link_code)
         d.add_links(sp.sha256, links)
         for iu, alt, kind in images:
-            d.link_page_asset(sp.sha256, iu[:2000], (alt or "")[:500], kind)
+            d.link_page_asset(sp.sha256, iu[:2000], alt=(alt or "")[:500], kind=kind, link_code=link_code)
         for lu in links:
             if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth:
-                d.enqueue(lu, depth + 1, discovered_from=url)
+                d.enqueue(lu, depth + 1, discovered_from=url, link_code=link_code)
         d.scan(url, status="ok", http_status=doc_status["code"], sha256=sp.sha256); terminal = True
         ms = int((time.monotonic() - t0) * 1000)
         stats["ok"] += 1
@@ -198,11 +202,11 @@ async def _worker(slot, b, queue, cfg, d, stats):
         try:
             if item is None:
                 return
-            url, depth = item
+            url, depth, link_code = item
             tab, blk = slot[0]
             before_ok = stats["ok"]
             try:
-                await _fetch_one(tab, url, depth, cfg, d, stats)
+                await _fetch_one(tab, url, depth, cfg, d, stats, link_code)
                 progressed = stats["ok"] > before_ok
             except Exception:
                 progressed = False   # _fetch_one shouldn't raise, but never let a crash kill the worker
@@ -254,8 +258,8 @@ async def crawl(cfg):
             if not batch:
                 break
             queue = asyncio.Queue()
-            for u, dep in batch:
-                queue.put_nowait((u, dep))
+            for item in batch:                 # (url, depth, link_code)
+                queue.put_nowait(item)
             for _ in range(cfg.tabs):
                 queue.put_nowait(None)     # one sentinel per worker
             # reuse the SAME pool every batch; workers may recycle a bad tab in place (count stays fixed).

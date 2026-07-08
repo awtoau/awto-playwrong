@@ -221,7 +221,7 @@ class CrawlDB:
             self.enqueue(*r[:4]) if len(r) >= 4 else self.enqueue(*r[:3])
 
     def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False):
-        """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth), …].
+        """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth, link_code), …].
         Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
         same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
 
@@ -239,7 +239,7 @@ class CrawlDB:
             if host_diverse:
                 # Pull a generous candidate window (shallowest first), then greedily round-robin by host
                 # in Python so each of the n slots is a different host where possible.
-                win = (select(frontier.c.url, frontier.c.depth)
+                win = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code)
                        .where(frontier.c.state == "queued")
                        .order_by(frontier.c.depth, _sa.func.random())
                        .limit(max(n * 40, 400)))
@@ -247,9 +247,9 @@ class CrawlDB:
                     win = win.with_for_update(skip_locked=True)
                 cand = c.execute(win).all()
                 by_host = {}
-                for u, dep in cand:
+                for u, dep, lc in cand:
                     h = (urlsplit(u).netloc or "").lower()
-                    by_host.setdefault(h, []).append((u, dep))
+                    by_host.setdefault(h, []).append((u, dep, lc))
                 for h in by_host:                        # shallowest first within each host
                     by_host[h].sort(key=lambda t: t[1])
                 picked, hosts = [], list(by_host.keys())
@@ -264,7 +264,7 @@ class CrawlDB:
                 rows = picked
             else:
                 order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
-                sel = (select(frontier.c.url, frontier.c.depth)
+                sel = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code)
                        .where(frontier.c.state == "queued")
                        .order_by(*order)
                        .limit(n))
@@ -275,7 +275,7 @@ class CrawlDB:
                 urls = [r[0] for r in rows]
                 c.execute(update(frontier).where(frontier.c.url.in_(urls))
                           .values(state="fetching", n_tries=frontier.c.n_tries + 1))
-            return [(r[0], r[1]) for r in rows]
+            return [(r[0], r[1], r[2]) for r in rows]
 
     def reclaim_stuck(self):
         """Return rows stuck in 'fetching' (from a crashed run) back to 'queued'. Call at startup —
