@@ -42,6 +42,11 @@ SCAN_STATUSES = ("ok", "empty", "nav_timeout", "http_error", "blocked", "render_
 
 _META = MetaData()
 
+# `link_code` is the ONE generic hook back to the consumer's own domain: an opaque, free-text tag the
+# consumer attaches to a URL so it can later join crawled pages/images to whatever entity it cares
+# about — a resort, a product SKU, a customer, a site id. The engine never interprets it (stays
+# ref-free); it just carries it through frontier -> page -> page_asset. Set it via enqueue(link_code=…).
+
 # ── the standard model (one definition, correct DDL on every backend) ───────────────────────────
 frontier = Table(
     "frontier", _META,
@@ -49,6 +54,7 @@ frontier = Table(
     Column("state", Text, nullable=False, server_default="queued"),   # queued|fetching|done
     Column("depth", Integer, nullable=False, server_default="0"),
     Column("discovered_from", Text),
+    Column("link_code", Text),                                        # opaque consumer tag (see above)
     Column("scan_status", Text),
     Column("scan_http_status", Integer),
     Column("scan_note", Text),
@@ -64,7 +70,9 @@ page = Table(
     Column("raw_bytes", Integer),
     Column("stored_bytes", Integer),
     Column("text_chars", Integer),
+    Column("text_sha", String(64)),                                   # sha of extracted text (loose-dup key)
     Column("lang", Text),
+    Column("link_code", Text),                                        # opaque consumer tag (see above)
     Column("scan_status", Text, nullable=False, server_default="ok"),
     Column("scan_note", Text),
 )
@@ -95,8 +103,10 @@ page_asset = Table(
     Column("page_sha", String(64), nullable=False),
     Column("img_url", Text, nullable=False),
     Column("alt", Text),
+    Column("caption", Text),
     Column("kind", Text),
     Column("asset_sha", String(64)),
+    Column("link_code", Text),                                        # opaque consumer tag (see above)
 )
 # Feedback loop: whenever the engine falls through to a default (unknown consent platform, an image it
 # couldn't classify, a non-EN/DE page it can't translate, a blocked capture), the consumer records it
@@ -178,16 +188,17 @@ class CrawlDB:
         self.close()
 
     # -- frontier --------------------------------------------------------------------------------
-    def enqueue(self, url, depth=0, discovered_from=None):
+    def enqueue(self, url, depth=0, discovered_from=None, link_code=None):
         stmt, name = _upsert_stmt(self.engine, frontier, ["url"])
-        stmt = stmt.values(url=url, depth=depth, discovered_from=discovered_from)
+        stmt = stmt.values(url=url, depth=depth, discovered_from=discovered_from, link_code=link_code)
         stmt = _do_nothing(stmt, name, ["url"])
         with self.engine.begin() as c:
             c.execute(stmt)
 
     def enqueue_many(self, rows):
-        for url, depth, src in rows:
-            self.enqueue(url, depth, src)
+        # rows: (url, depth, discovered_from[, link_code])
+        for r in rows:
+            self.enqueue(*r[:4]) if len(r) >= 4 else self.enqueue(*r[:3])
 
     def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False):
         """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth), …].
@@ -261,10 +272,12 @@ class CrawlDB:
                 scan_http_status=http_status, scan_note=note, sha256=sha256))
 
     # -- pages -----------------------------------------------------------------------------------
-    def upsert_page(self, sp, url, title=None, text_chars=None, lang=None, status="ok", note=None):
+    def upsert_page(self, sp, url, title=None, text_chars=None, lang=None, status="ok", note=None,
+                    link_code=None):
         vals = dict(sha256=sp.sha256, url=url, title=title, rel_path=sp.rel_path,
                     raw_bytes=getattr(sp, "raw_bytes", None), stored_bytes=getattr(sp, "stored_bytes", None),
-                    text_chars=text_chars, lang=lang, scan_status=status, scan_note=note)
+                    text_chars=text_chars, text_sha=getattr(sp, "text_sha", None), lang=lang,
+                    link_code=link_code, scan_status=status, scan_note=note)
         stmt, name = _upsert_stmt(self.engine, page, ["sha256"])
         stmt = stmt.values(**vals)
         stmt = _do_update(stmt, name, ["sha256"],
@@ -295,9 +308,11 @@ class CrawlDB:
             c.execute(stmt)
         return sa.sha256
 
-    def link_page_asset(self, page_sha, img_url, alt=None, kind=None, asset_sha=None):
+    def link_page_asset(self, page_sha, img_url, alt=None, caption=None, kind=None, asset_sha=None,
+                        link_code=None):
         stmt, name = _upsert_stmt(self.engine, page_asset, ["page_sha", "img_url"])
-        stmt = stmt.values(page_sha=page_sha, img_url=img_url, alt=alt, kind=kind, asset_sha=asset_sha)
+        stmt = stmt.values(page_sha=page_sha, img_url=img_url, alt=alt, caption=caption, kind=kind,
+                           asset_sha=asset_sha, link_code=link_code)
         stmt = _do_nothing(stmt, name, ["page_sha", "img_url"])
         with self.engine.begin() as c:
             c.execute(stmt)
