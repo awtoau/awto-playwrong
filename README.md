@@ -133,7 +133,9 @@ parallel crawl, 0 failures, 85% rich pages**. `sniff.py` (powderhounds) consumes
 
 **GOTCHAS — read before running:**
 - **nodriver import landmine.** Upstream `nodriver/cdp/network.py` has a non-UTF-8 byte (line ~1345)
-  that raises `SyntaxError` under Python 3.14t. `vendor/nodriver` here is patched, but a consumer's
+  that raises `SyntaxError` under **Python 3.14** (both the GIL and free-threaded builds — 3.14 tightened
+  the source tokenizer to reject non-UTF-8 bytes with no encoding declaration; 3.13 and earlier were
+  lenient). `vendor/nodriver` here is patched, but a consumer's
   `site-packages` copy may NOT be — **put `vendor` FIRST in `PYTHONPATH`** (`PYTHONPATH=vendor:…`) so
   the patched copy wins. This is the #1 thing that breaks a fresh run.
 - **SQLAlchemy on no-GIL.** Its `cyextension` C module silently re-enables the GIL. Install the
