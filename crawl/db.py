@@ -176,7 +176,27 @@ class CrawlDB:
         self.dialect = engine.dialect.name
 
     def init_schema(self):
-        _META.create_all(self.engine)
+        _META.create_all(self.engine)     # creates missing TABLES only
+        self._ensure_columns()            # add any columns missing from pre-existing tables
+
+    def _ensure_columns(self):
+        """Additively add columns the model defines but an OLDER database is missing (create_all only
+        creates missing tables, not missing columns). Idempotent, safe on every backend — this is what
+        lets existing crawl DBs keep working after the schema gains a field (e.g. link_code/text_sha/
+        caption). Never drops or alters existing columns."""
+        import sqlalchemy as _sa
+        insp = _sa.inspect(self.engine)
+        existing_tables = set(insp.get_table_names())
+        with self.engine.begin() as c:
+            for tbl in _META.sorted_tables:
+                if tbl.name not in existing_tables:
+                    continue              # create_all just made it, fully-formed
+                have = {col["name"] for col in insp.get_columns(tbl.name)}
+                for col in tbl.columns:
+                    if col.name in have:
+                        continue
+                    coltype = col.type.compile(self.engine.dialect)
+                    c.execute(_sa.text(f'ALTER TABLE {tbl.name} ADD COLUMN {col.name} {coltype}'))
 
     def close(self):
         self.engine.dispose()
@@ -308,8 +328,10 @@ class CrawlDB:
             c.execute(stmt)
         return sa.sha256
 
-    def link_page_asset(self, page_sha, img_url, alt=None, caption=None, kind=None, asset_sha=None,
-                        link_code=None):
+    def link_page_asset(self, page_sha, img_url, alt=None, kind=None, asset_sha=None,
+                        caption=None, link_code=None):
+        # NB: keep alt, kind, asset_sha in their original positions — caption/link_code are appended so
+        # existing positional callers (e.g. run.py's link_page_asset(sha, url, alt, kind)) stay correct.
         stmt, name = _upsert_stmt(self.engine, page_asset, ["page_sha", "img_url"])
         stmt = stmt.values(page_sha=page_sha, img_url=img_url, alt=alt, caption=caption, kind=kind,
                            asset_sha=asset_sha, link_code=link_code)
