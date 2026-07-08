@@ -29,6 +29,8 @@ def _call(op, port, body=None, method="POST", timeout=60):
 
 
 def is_up(port):
+    """True if the engine SERVER responds. Note: the server can be up while its Chrome is DEAD —
+    use browser_ok() for the stronger check."""
     try:
         _call("status", port, method="GET", timeout=3)
         return True
@@ -36,23 +38,72 @@ def is_up(port):
         return False
 
 
+def browser_ok(port):
+    """True only if the server is up AND its Chrome is actually reachable (a valid /cdp host:port).
+    This is the check that matters — a bare status=alive can lie when the browser was closed."""
+    try:
+        info = _call("cdp", port, timeout=8)
+        return bool(info.get("host") and info.get("port"))
+    except Exception:
+        return False
+
+
+def _start_server(port):
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    subprocess.Popen(
+        [sys.executable, _SERVER],
+        env={**os.environ, "PYTHONPATH": _VENDOR, "PH_PORT": str(port)},
+        stdout=open(os.path.join(_LOG_DIR, "playwrong-server.log"), "a"),
+        stderr=subprocess.STDOUT)
+
+
+async def _wait_up(port, tries=60):
+    for _ in range(tries):
+        if is_up(port):
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
 async def attach(port=8731):
-    """Attach nodriver to the shared browser via /cdp; start the engine server first if needed.
-    Returns the nodriver Browser bound to that same Chrome. Open your own tabs, close them when done."""
-    if not is_up(port):
-        os.makedirs(_LOG_DIR, exist_ok=True)
-        subprocess.Popen(
-            [sys.executable, _SERVER],
-            env={**os.environ, "PYTHONPATH": _VENDOR, "PH_PORT": str(port)},
-            stdout=open(os.path.join(_LOG_DIR, "playwrong-server.log"), "a"),
-            stderr=subprocess.STDOUT)
-        for _ in range(60):
-            if is_up(port):
-                break
-            await asyncio.sleep(0.5)
-    # ensure Chrome is launched, then read its CDP endpoint and attach.
-    _call("goto", port, {"url": "about:blank"}, timeout=60)
-    info = _call("cdp", port, timeout=10)
-    host, cport = info["host"], info["port"]
-    browser = await uc.start(host=host, port=cport)   # host+port => attach, don't launch
-    return browser
+    """Attach nodriver to the shared browser via /cdp — self-healing.
+
+    Robust to the browser being CLOSED (Dan's case): a bare server status=alive can lie when its Chrome
+    was stopped, so we (1) ensure the server is up, (2) ask it to launch/relaunch Chrome via /goto,
+    (3) verify a real /cdp endpoint, and only then attach. If the server itself is wedged (goto errors
+    but status lies), we shut it down cleanly (/shutdown — never pkill) and start a fresh one. Retries
+    the whole sequence a few times before giving up. Open your own tabs, close them when done."""
+    last_err = None
+    for attempt in range(4):
+        # 1) server up?
+        if not is_up(port):
+            _start_server(port)
+            await _wait_up(port)
+        # 2) ensure Chrome is (re)launched. /goto auto-launches Chrome if it isn't running.
+        try:
+            _call("goto", port, {"url": "about:blank"}, timeout=60)
+        except Exception as e:
+            last_err = e
+            # server is up but wedged (its Chrome connection is dead) -> recycle the server cleanly.
+            try:
+                _call("shutdown", port, timeout=15)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+            _start_server(port)
+            await _wait_up(port)
+            continue
+        # 3) verify a real CDP endpoint before attaching.
+        if not browser_ok(port):
+            last_err = "no /cdp endpoint (browser not ready)"
+            await asyncio.sleep(1.5)
+            continue
+        info = _call("cdp", port, timeout=10)
+        try:
+            return await uc.start(host=info["host"], port=info["port"])  # host+port => attach
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(1.5)
+            continue
+    raise RuntimeError(f"crawl.browser.attach: could not obtain a live browser on port {port} "
+                       f"after retries — last error: {last_err}")
