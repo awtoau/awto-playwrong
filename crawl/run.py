@@ -134,11 +134,38 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
                 pass
 
 
+async def _auto_dismiss_dialogs(tab):
+    """Auto-accept every JS dialog so a page can NEVER hang the tab. beforeunload ("Leave page? /
+    Changes may not be saved") blocks navigation until answered; permission prompts (notifications,
+    geolocation), alert()/confirm()/prompt() do the same. Chrome pauses the tab waiting for a human —
+    the crawler has none, so it would stall. We handle every Page.javascriptDialogOpening by accepting
+    it (beforeunload accept = 'leave', which is what we want since we're navigating away). Best-effort."""
+    try:
+        from nodriver import cdp as _cdp
+        await tab.send(_cdp.page.enable())
+
+        def _on_dialog(ev):
+            async def _accept():
+                try:
+                    await tab.send(_cdp.page.handle_java_script_dialog(accept=True))
+                except Exception:
+                    pass
+            try:
+                import asyncio as _a
+                _a.ensure_future(_accept())
+            except Exception:
+                pass
+        tab.add_handler(_cdp.page.JavascriptDialogOpening, _on_dialog)
+    except Exception:
+        pass
+
+
 async def _new_tab(b, cfg):
-    """Open one crawl tab (with its resource blocker enabled). Returns (tab, blocker)."""
+    """Open one crawl tab (resource blocker + JS-dialog auto-dismiss enabled). Returns (tab, blocker)."""
     tab = await b.get("about:blank", new_tab=True)
     blk = netblock.ResourceBlocker(tab, block_types=cfg.block_types)
     await blk.enable()
+    await _auto_dismiss_dialogs(tab)   # never hang on a "Leave page?" / permission dialog
     return tab, blk
 
 
