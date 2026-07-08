@@ -31,15 +31,21 @@ from . import browser, netblock, render, parse, store, db, graph
 
 
 def _same_site(url, hosts):
+    """True only if url's host EQUALS one of `hosts` or is a dot-boundary subdomain of it. A raw
+    suffix match (endswith) would let `evilsnowtravelbooker.com` pass for `snowtravelbooker.com` —
+    a scope-escape / SSRF-adjacent bug — so we match on a host boundary and strip the port."""
     try:
-        return any(urlsplit(url).netloc.lower().endswith(h) for h in hosts)
+        netloc = urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
+        return any(netloc == h or netloc.endswith("." + h) for h in hosts)
     except Exception:
         return False
 
 
 async def _fetch_one(tab, url, depth, cfg, d, stats):
-    """Nav → render → capture → parse → record. Returns nothing; updates the DB + stats."""
+    """Nav → render → capture → parse → record. Guarantees a terminal frontier state for `url` even on
+    crash (finally-scan) so no row is left stuck in 'fetching'."""
     t0 = time.monotonic()
+    terminal = False   # did we record a terminal scan for this url?
     try:
         nav_timed_out = False
         try:
@@ -52,37 +58,40 @@ async def _fetch_one(tab, url, depth, cfg, d, stats):
         await render.dismiss_overlays(tab)
         await render.wait_for_render(tab, min_chars=200, max_wait=max(8.0, cfg.nav_timeout))
         if nav_timed_out and await render.body_text_len(tab) < 20:
-            d.scan(url, status="nav_timeout", note=f">{cfg.nav_timeout}s")
+            d.scan(url, status="nav_timeout", note=f">{cfg.nav_timeout}s"); terminal = True
             stats["fail"] += 1
             print(f"  TIMEOUT(empty) {url}", flush=True)
             return
         html = await tab.get_content()
-        sp = store.store_page(html, cfg.store_root)
-        title, text = parse.extract_text(html)
+        sp = store.store_page(html, cfg.store_root)          # store_page already extracted title+text
         links = parse.extract_links(html, url)
         images = list(parse.extract_images(html, url))
         # record: page row + reference graph + image refs, then enqueue same-site links.
-        d.upsert_page(sp, url, title=title, text_chars=len(text), status="ok")
+        d.upsert_page(sp, url, title=sp.title, text_chars=sp.text_chars, status="ok")
         d.add_links(sp.sha256, links)
         for iu, alt, kind in images:
             d.link_page_asset(sp.sha256, iu[:2000], (alt or "")[:500], kind)
         for lu in links:
             if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth:
                 d.enqueue(lu, depth + 1, discovered_from=url)
-        d.scan(url, status="ok", sha256=sp.sha256)
-        d.commit()
+        d.scan(url, status="ok", sha256=sp.sha256); terminal = True
         ms = int((time.monotonic() - t0) * 1000)
         stats["ok"] += 1
-        stats["chars"] += len(text)
-        print(f"  OK {len(text):>6}ch +{len(links)}links +{len(images)}img {ms}ms {url[:56]}", flush=True)
+        stats["chars"] += sp.text_chars
+        print(f"  OK {sp.text_chars:>6}ch +{len(links)}links +{len(images)}img {ms}ms {url[:56]}", flush=True)
     except Exception as e:
         try:
-            d.scan(url, status="render_error", note=str(e)[:200])
-            d.commit()
+            d.scan(url, status="render_error", note=str(e)[:200]); terminal = True
         except Exception:
             pass
         stats["fail"] += 1
-        print(f"  ERR {url} :: {e}", flush=True)
+        print(f"  ERR {url} :: {str(e)[:120]}", flush=True)
+    finally:
+        if not terminal:   # crash/cancel before any scan -> don't leave the row stuck in 'fetching'
+            try:
+                d.scan(url, status="error", note="no terminal state (crash/cancel)")
+            except Exception:
+                pass
 
 
 async def _worker(browser_obj, queue, cfg, d, stats):
@@ -106,60 +115,66 @@ async def _worker(browser_obj, queue, cfg, d, stats):
 
 
 async def crawl(cfg):
-    """Run the crawl described by cfg (a Config). Returns the stats dict."""
+    """Run the crawl described by cfg (a Config). Returns the stats dict.
+
+    `cfg.max_pages` is a cap on pages ATTEMPTED this run (each claimed URL counts whether it succeeds,
+    times out, or errors) — so a broken site can't loop forever. `stats['ok']` is the real page count."""
     os.makedirs(cfg.store_root, exist_ok=True)
-    d = db.open_db(cfg.db_dsn, schema=cfg.schema)
-    d.init_schema()
-    for s in cfg.seeds:
-        d.enqueue(s, 0)
-    d.commit()
-    print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
-          f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth}", flush=True)
-    b = await browser.attach(cfg.port)
-    stats = {"ok": 0, "fail": 0, "chars": 0}
-    done = 0
-    while done < cfg.max_pages:
-        batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - done))
-        if not batch:
-            break
-        queue = asyncio.Queue()
-        for u, dep in batch:
-            queue.put_nowait((u, dep))
-        for _ in range(cfg.tabs):
-            queue.put_nowait(None)
-        workers = [asyncio.create_task(_worker(b, queue, cfg, d, stats)) for _ in range(cfg.tabs)]
-        await asyncio.gather(*workers)
-        done += len(batch)
-    print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail, {stats['chars']} text chars\n", flush=True)
-    print(graph.summary_text(d))
-    d.close()
-    return stats
+    d = db.open_db(cfg.db_dsn)
+    try:
+        d.init_schema()
+        reclaimed = d.reclaim_stuck()          # recover any rows a previous crashed run left 'fetching'
+        if reclaimed:
+            print(f"reclaimed {reclaimed} stuck 'fetching' rows -> 'queued'", flush=True)
+        for s in cfg.seeds:
+            d.enqueue(s, 0)
+        print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
+              f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth}", flush=True)
+        b = await browser.attach(cfg.port)
+        stats = {"ok": 0, "fail": 0, "chars": 0}
+        attempted = 0
+        while attempted < cfg.max_pages:
+            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted))
+            if not batch:
+                break
+            queue = asyncio.Queue()
+            for u, dep in batch:
+                queue.put_nowait((u, dep))
+            for _ in range(cfg.tabs):
+                queue.put_nowait(None)
+            workers = [asyncio.create_task(_worker(b, queue, cfg, d, stats)) for _ in range(cfg.tabs)]
+            await asyncio.gather(*workers)
+            attempted += len(batch)
+        print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
+              f"{stats['chars']} text chars\n", flush=True)
+        print(graph.summary_text(d))
+        return stats
+    finally:
+        d.close()
 
 
 class Config:
-    def __init__(self, seeds, db_dsn, store_root, schema="crawl", max_pages=200, tabs=8,
+    def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
-        self.schema = schema
         self.max_pages = max_pages
         self.tabs = tabs
         self.depth = depth
         self.nav_timeout = nav_timeout
         self.port = port
-        # default: stay on the seeds' own hosts (registrable suffix match)
-        self.hosts = hosts or sorted({urlsplit(s).netloc.lower() for s in seeds})
+        # default: stay on the seeds' own hosts (boundary match, see _same_site)
+        self.hosts = hosts or sorted({urlsplit(s).netloc.lower().split(":")[0] for s in seeds})
         self.block_types = netblock.TEXT_ONLY_KEEP_JS if keep_js else netblock.TEXT_ONLY
 
 
 def _parse_args(argv):
     p = argparse.ArgumentParser(prog="crawl.run", description="Point-and-go site crawler.")
     p.add_argument("--seed", action="append", required=True, help="Seed URL (repeatable)")
-    p.add_argument("--db", required=True, help="SQLite path or postgres:// URL")
-    p.add_argument("--schema", default="crawl", help="Postgres schema (ignored for SQLite)")
+    p.add_argument("--db", required=True, help="SQLite path or a SQLAlchemy URL (postgresql+psycopg://…, mysql+pymysql://…)")
     p.add_argument("--store", default=None, help="On-disk page store dir (default: <db>.pages)")
-    p.add_argument("--max", type=int, default=200, help="Max pages this run")
+    p.add_argument("--max", type=int, default=200, help="Max pages ATTEMPTED this run")
     p.add_argument("--tabs", type=int, default=8, help="Parallel browser tabs")
     p.add_argument("--depth", type=int, default=3, help="Max link depth from a seed")
     p.add_argument("--nav-timeout", type=float, default=12.0, help="Per-page nav budget (s)")
@@ -171,11 +186,11 @@ def _parse_args(argv):
 
 def main(argv=None):
     a = _parse_args(argv if argv is not None else sys.argv[1:])
-    store_root = a.store or (a.db.rsplit("/", 1)[-1].split("?")[0] + ".pages"
-                             if not a.db.lower().startswith(("postgres://", "postgresql://"))
-                             else "crawl_pages")
-    hosts = sorted({urlsplit(s).netloc.lower() for s in a.seed} | set(a.host or []))
-    cfg = Config(seeds=a.seed, db_dsn=a.db, store_root=store_root, schema=a.schema,
+    is_url = "://" in a.db
+    store_root = a.store or ("crawl_pages" if is_url
+                             else a.db.rsplit("/", 1)[-1].split("?")[0] + ".pages")
+    hosts = sorted({urlsplit(s).netloc.lower().split(":")[0] for s in a.seed} | set(a.host or []))
+    cfg = Config(seeds=a.seed, db_dsn=a.db, store_root=store_root,
                  max_pages=a.max, tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
                  port=a.port, hosts=hosts, keep_js=not a.no_js)
     asyncio.run(crawl(cfg))

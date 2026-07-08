@@ -15,43 +15,49 @@ python -m crawl.run --seed https://competitor.com/ --db competitor.sqlite --max 
 python -m crawl.report --db competitor.sqlite --top 25
 ```
 
-Postgres instead of SQLite — same command, a URL for `--db`:
+Postgres or MySQL instead of SQLite — same command, a SQLAlchemy URL for `--db`:
 
 ```bash
-python -m crawl.run --seed https://competitor.com/ --db postgresql://user@host/mydb --schema crawl
+python -m crawl.run --seed https://competitor.com/ --db "postgresql+psycopg://user@host/mydb"
+python -m crawl.run --seed https://competitor.com/ --db "mysql+pymysql://user@host/mydb"
 ```
 
-Rule of thumb: **SQLite for a one-off rip** (a file, nothing to set up), **Postgres for the shared
-pipeline**. Same code, same schema, same reports either way.
+Rule of thumb: **SQLite for a one-off rip** (a file, nothing to set up), **Postgres/MySQL for the
+shared pipeline**. The relational store is SQLAlchemy 2.0 Core, so it's one model and the same reports
+on any backend. (Point each crawl at its OWN database/schema — the tables use plain names like `page`,
+so a shared DB with another project's `page` table will collide.)
 
 ## Flags
 
 | flag | meaning | default |
 |------|---------|---------|
 | `--seed URL` | seed URL (repeat for several) | required |
-| `--db PATH_or_URL` | SQLite path or `postgres://…` | required |
-| `--schema NAME` | Postgres schema (ignored by SQLite) | `crawl` |
+| `--db PATH_or_URL` | SQLite path, or a SQLAlchemy URL (`postgresql+psycopg://…`, `mysql+pymysql://…`) | required |
 | `--store DIR` | on-disk page store (compressed HTML) | `<db>.pages` |
-| `--max N` | max pages this run | 200 |
+| `--max N` | max pages **attempted** this run | 200 |
 | `--tabs N` | parallel browser tabs | 8 |
 | `--depth N` | max link depth from a seed | 3 |
 | `--host H` | extra host to allow beyond the seeds' | — |
 | `--no-js` | block Script too (leanest; static sites) | keep JS |
 
-Same-host only by default (it won't wander off into linked third parties). Add `--host` to widen.
+Same-host only by default (boundary match — it won't wander onto `evilexample.com` for `example.com`).
+Add `--host` to widen.
 
 ## What you get
 
 On disk: every distinct page's HTML, content-addressed + zstd-compressed, sharded under `--store`.
 
-In the DB (see `../schema.sql`):
+In the DB (the model lives in `db.py`; `../schema.sql` documents it):
 - **page** — one row per distinct page: url, title, text length, on-disk path, last-scan status.
 - **page_link** — the page→page reference graph: *what links to what*.
-- **page_asset** — every `<img>` a page references: url, alt, kind (piste_map / lift_map / map /
-  panorama / logo / photo), and — once the bytes are fetched — the asset sha. **This answers
-  "where is an image used on the site."**
+- **page_asset** — every `<img>` a page references: url, alt, kind (generic: map / panorama / logo /
+  photo / junk; a consumer can add vertical kinds), and — once the bytes are fetched — the asset sha.
+  **This answers "where is an image used on the site."**
 - **asset** — one row per distinct image/binary actually fetched (via the `assets` package).
 - **frontier** — the work list + per-URL last-scan status/error code (what to retry/skip/trust).
+- **unhandled** — where the engine fell through to a default (unknown consent, unclassified image,
+  untranslatable page). `graph.improvement_report(d)` ranks these so the crawl tells you what generic
+  handling to improve next — instead of silently baking one site/country/vertical's rules in.
 
 ## Reports (fast, no re-crawl)
 

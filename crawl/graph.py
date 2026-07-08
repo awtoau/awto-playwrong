@@ -1,130 +1,137 @@
-"""crawl.graph — generic reports over the page->page reference graph (works on SQLite or Postgres).
+"""crawl.graph — reports over the page->page reference graph + image usage + improvement feedback.
 
-"What references what" is captured in the page_link table (source page's sha -> href it links to).
-That single edge list answers most site-structure questions fast — no re-crawl, no page bytes needed.
-These helpers run identical SQL on either backend (via a CrawlDB from crawl.db) and return plain rows,
-so a consumer (or an agent) can turn them straight into a competitor-analysis / site-shape report.
+Runs on any backend a CrawlDB opened (SQLite/Postgres/MySQL) via SQLAlchemy Core — no raw SQL, no
+per-dialect strings. "What references what" is captured in page_link (source page's sha -> href); most
+site-structure questions answer fast from that edge list with no re-crawl and no page bytes.
 
     from crawl import db, graph
     d = db.open_db("competitor.sqlite")
-    print(graph.summary(d))          # counts + top hubs + orphans + dead links
-    for url, n in graph.hubs(d, 20): ...        # most-referenced pages (the site's spine)
-    for url in graph.orphans(d): ...            # captured pages nothing links to
-    for href, n in graph.dead_links(d, 20): ... # linked-to URLs never captured (gaps / off-site)
+    print(graph.summary_text(d))          # counts + hubs + authorities + orphans + dead links
+    graph.image_usage(d, img_url)          # every page that references a given image
+    print(graph.improvement_report(d))     # where the engine fell through -> what to improve next
 
-Definitions:
-  • inbound(url)  — pages that link TO url
-  • outbound(url) — hrefs url links to
-  • hubs          — pages with the most INBOUND links (the site's important pages)
-  • authorities   — pages that link OUT the most (index/hub/menu pages)
-  • orphans       — captured pages with ZERO inbound links (unreachable except by seed/menu)
-  • dead_links    — hrefs that were linked but never became a captured page (gaps, off-host, 404s)
+Definitions: inbound/outbound = who links to / what this links to; hubs = most INBOUND (the spine);
+authorities = most OUTBOUND (menus/indexes); orphans = captured pages with zero inbound; dead_links =
+hrefs linked but never captured (gaps/off-site/404).
 """
+from sqlalchemy import func, select
+
+from .db import asset, frontier, page, page_asset, page_link, unhandled  # noqa: F401
 
 
-def _p(dbobj):
-    return dbobj._p            # table prefix ('' for sqlite, 'crawl.' for pg)
+def _rows(dbobj, stmt):
+    with dbobj.engine.connect() as c:
+        return [tuple(r) for r in c.execute(stmt).all()]
 
 
 def inbound(dbobj, url):
     """Pages (sha, url) that link to `url`."""
-    p = _p(dbobj)
-    return dbobj._q(f"SELECT l.page_sha, pg.url FROM {p}page_link l "
-                    f"JOIN {p}page pg ON pg.sha256=l.page_sha WHERE l.href=?", (url,))
+    stmt = (select(page_link.c.page_sha, page.c.url)
+            .select_from(page_link.join(page, page.c.sha256 == page_link.c.page_sha))
+            .where(page_link.c.href == url))
+    return _rows(dbobj, stmt)
 
 
 def outbound(dbobj, page_url):
     """hrefs that the page at `page_url` links to."""
-    p = _p(dbobj)
-    return [r[0] for r in dbobj._q(
-        f"SELECT l.href FROM {p}page_link l JOIN {p}page pg ON pg.sha256=l.page_sha "
-        f"WHERE pg.url=? ORDER BY l.href", (page_url,))]
+    stmt = (select(page_link.c.href)
+            .select_from(page_link.join(page, page.c.sha256 == page_link.c.page_sha))
+            .where(page.c.url == page_url).order_by(page_link.c.href))
+    return [r[0] for r in _rows(dbobj, stmt)]
 
 
 def hubs(dbobj, n=20):
     """(url, inbound_count) for the most-referenced captured pages — the site's spine."""
-    p = _p(dbobj)
-    return dbobj._q(
-        f"SELECT pg.url, count(*) AS n FROM {p}page_link l "
-        f"JOIN {p}page pg ON pg.url=l.href "          # href resolves to a captured page
-        f"GROUP BY pg.url ORDER BY n DESC, pg.url LIMIT ?", (n,))
+    stmt = (select(page.c.url, func.count().label("n"))
+            .select_from(page_link.join(page, page.c.url == page_link.c.href))
+            .group_by(page.c.url).order_by(func.count().desc(), page.c.url).limit(n))
+    return _rows(dbobj, stmt)
 
 
 def authorities(dbobj, n=20):
     """(url, outbound_count) for pages linking OUT the most — menus / index / hub pages."""
-    p = _p(dbobj)
-    return dbobj._q(
-        f"SELECT pg.url, count(*) AS n FROM {p}page_link l "
-        f"JOIN {p}page pg ON pg.sha256=l.page_sha "
-        f"GROUP BY pg.url ORDER BY n DESC, pg.url LIMIT ?", (n,))
+    stmt = (select(page.c.url, func.count().label("n"))
+            .select_from(page_link.join(page, page.c.sha256 == page_link.c.page_sha))
+            .group_by(page.c.url).order_by(func.count().desc(), page.c.url).limit(n))
+    return _rows(dbobj, stmt)
 
 
 def orphans(dbobj):
     """Captured page URLs with NO inbound links (reachable only via seed/menu — often stale/hidden)."""
-    p = _p(dbobj)
-    return [r[0] for r in dbobj._q(
-        f"SELECT pg.url FROM {p}page pg WHERE NOT EXISTS "
-        f"(SELECT 1 FROM {p}page_link l WHERE l.href=pg.url) ORDER BY pg.url")]
+    sub = select(page_link.c.href).where(page_link.c.href == page.c.url).exists()
+    stmt = select(page.c.url).where(~sub).order_by(page.c.url)
+    return [r[0] for r in _rows(dbobj, stmt)]
 
 
 def dead_links(dbobj, n=50):
-    """(href, times_linked) for hrefs that were referenced but never captured as a page — the gaps:
-    off-host links, un-crawled pages, or 404s. High counts = prominent links worth checking."""
-    p = _p(dbobj)
-    return dbobj._q(
-        f"SELECT l.href, count(*) AS n FROM {p}page_link l "
-        f"LEFT JOIN {p}page pg ON pg.url=l.href WHERE pg.url IS NULL "
-        f"GROUP BY l.href ORDER BY n DESC, l.href LIMIT ?", (n,))
+    """(href, times_linked) for hrefs linked but never captured — gaps / off-site / 404. High = prominent."""
+    j = page_link.outerjoin(page, page.c.url == page_link.c.href)
+    stmt = (select(page_link.c.href, func.count().label("n")).select_from(j)
+            .where(page.c.url.is_(None))
+            .group_by(page_link.c.href).order_by(func.count().desc(), page_link.c.href).limit(n))
+    return _rows(dbobj, stmt)
 
 
 def image_usage(dbobj, img_url):
-    """Every page that references a given image URL — (page_url, alt, kind). "Where is this image
-    used on the site?" A crawl records image REFS per page in page_asset, so this is a direct lookup."""
-    p = _p(dbobj)
-    return dbobj._q(
-        f"SELECT pg.url, pa.alt, pa.kind FROM {p}page_asset pa "
-        f"JOIN {p}page pg ON pg.sha256=pa.page_sha WHERE pa.img_url=? ORDER BY pg.url", (img_url,))
+    """Every page that references a given image URL — (page_url, alt, kind). "Where is this image used?" """
+    stmt = (select(page.c.url, page_asset.c.alt, page_asset.c.kind)
+            .select_from(page_asset.join(page, page.c.sha256 == page_asset.c.page_sha))
+            .where(page_asset.c.img_url == img_url).order_by(page.c.url))
+    return _rows(dbobj, stmt)
 
 
 def image_pages(dbobj, kind=None, n=200):
-    """(img_url, kind, n_pages) for images referenced across the site, most-used first. Filter by
-    kind (piste_map | lift_map | map | panorama | logo | photo) to find e.g. every piste map."""
-    p = _p(dbobj)
-    where = "WHERE kind=?" if kind else ""
-    args = (kind, n) if kind else (n,)
-    return dbobj._q(
-        f"SELECT img_url, kind, count(*) AS n FROM {p}page_asset {where} "
-        f"GROUP BY img_url, kind ORDER BY n DESC, img_url LIMIT ?", args)
+    """(img_url, kind, n_pages) for images referenced across the site, most-used first. Filter by kind."""
+    stmt = select(page_asset.c.img_url, page_asset.c.kind, func.count().label("n"))
+    if kind:
+        stmt = stmt.where(page_asset.c.kind == kind)
+    stmt = stmt.group_by(page_asset.c.img_url, page_asset.c.kind).order_by(
+        func.count().desc(), page_asset.c.img_url).limit(n)
+    return _rows(dbobj, stmt)
+
+
+def improvement_report(dbobj, top=20):
+    """The feedback loop: rank the categories where the engine fell through to a default (unknown
+    consent platform, unclassified image, untranslatable language, blocked capture), with a sample.
+    This is how the CODE tells you what generic handling to improve next — per-country/vertical cases
+    surface here instead of being silently baked in. Returns [(category, n, sample_url, sample), …]."""
+    stmt = (select(unhandled.c.category, func.count().label("n"),
+                   func.min(unhandled.c.url), func.min(unhandled.c.sample))
+            .group_by(unhandled.c.category).order_by(func.count().desc()).limit(top))
+    return _rows(dbobj, stmt)
 
 
 def summary(dbobj, top=10):
-    """A compact, printable site-shape report as a dict — counts + top hubs/authorities + orphan and
-    dead-link samples. An agent can render this straight into a competitor-analysis report."""
-    c = dbobj.counts()
+    """A compact, printable site-shape report as a dict."""
     orph = orphans(dbobj)
     return {
-        "counts": c,
+        "counts": dbobj.counts(),
         "top_hubs": hubs(dbobj, top),
         "top_authorities": authorities(dbobj, top),
         "orphan_count": len(orph),
         "orphans_sample": orph[:top],
         "dead_links": dead_links(dbobj, top),
+        "improvements": improvement_report(dbobj, top),
     }
 
 
 def summary_text(dbobj, top=10):
-    """summary() rendered as a plain-text block for a log or a quick report."""
+    """summary() as a plain-text block for a log or quick report."""
     s = summary(dbobj, top)
     c = s["counts"]
     L = [f"pages={c['pages']}  links={c['links']}  assets={c['assets']}  "
-         f"frontier: {c['frontier_done']} done / {c['frontier_queued']} queued",
-         "",
-         f"top {top} hubs (most linked-TO):"]
+         f"frontier: {c['frontier_done']} done / {c['frontier_queued']} queued  "
+         f"unhandled={c['unhandled']}",
+         "", f"top {top} hubs (most linked-TO):"]
     L += [f"  {n:>5}  {u}" for u, n in s["top_hubs"]]
     L += ["", f"top {top} authorities (link OUT the most):"]
     L += [f"  {n:>5}  {u}" for u, n in s["top_authorities"]]
     L += ["", f"orphan pages (no inbound): {s['orphan_count']}"]
     L += [f"  {u}" for u in s["orphans_sample"]]
-    L += ["", f"top dead links (linked, never captured):"]
+    L += ["", "top dead links (linked, never captured):"]
     L += [f"  {n:>5}  {h}" for h, n in s["dead_links"]]
+    if s["improvements"]:
+        L += ["", "improvement feedback (engine fell through — fix these to raise coverage):"]
+        L += [f"  {n:>5}  {cat:22} e.g. {samp or url or ''}"[:100]
+              for cat, n, url, samp in s["improvements"]]
     return "\n".join(L)
