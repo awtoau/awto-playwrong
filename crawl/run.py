@@ -208,7 +208,10 @@ async def _worker(slot, b, queue, cfg, d, stats):
                 # infinite redirect, a hung renderer) can't stall the crawl — we abandon it and the tab
                 # is closed below. Ceiling = generous multiple of the nav budget so a slow-but-fine page
                 # still finishes.
-                stall_ceiling = max(45.0, cfg.nav_timeout * 4)
+                # Ceiling over the WHOLE fetch. Explicit --stall-ceiling wins; else a generous multiple
+                # of the nav budget. Lower it to abandon slow pages sooner (fresh-tab-per-URL means a
+                # faster abandon = the next tab starts sooner — the aggressive "cut losses" mode).
+                stall_ceiling = cfg.stall_ceiling if cfg.stall_ceiling else max(45.0, cfg.nav_timeout * 4)
                 try:
                     await asyncio.wait_for(
                         _fetch_one(tab, url, depth, cfg, d, stats, link_code), timeout=stall_ceiling)
@@ -293,7 +296,7 @@ async def crawl(cfg):
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
-                 rate_delay=1.5, shuffle=True, host_diverse=True):
+                 rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
@@ -301,6 +304,7 @@ class Config:
         self.tabs = tabs
         self.depth = depth
         self.nav_timeout = nav_timeout
+        self.stall_ceiling = stall_ceiling   # hard whole-fetch cap; 0 => auto (max(45, nav*4))
         self.port = port
         # default: stay on the seeds' own hosts (boundary match, see _same_site)
         self.hosts = hosts or sorted({urlsplit(s).netloc.lower().split(":")[0] for s in seeds})
@@ -320,6 +324,10 @@ def _parse_args(argv):
     p.add_argument("--tabs", type=int, default=8, help="Parallel browser tabs")
     p.add_argument("--depth", type=int, default=3, help="Max link depth from a seed")
     p.add_argument("--nav-timeout", type=float, default=12.0, help="Per-page nav budget (s)")
+    p.add_argument("--stall-ceiling", type=float, default=0.0,
+                   help="Hard cap (s) on the WHOLE fetch (nav+render+capture) before abandoning the page + tab. "
+                        "0 = auto (max(45, nav*4)). LOWER it to cut losses on slow pages sooner — a faster "
+                        "abandon means the next fresh tab starts sooner (aggressive mode; e.g. 25).")
     p.add_argument("--port", type=int, default=int(os.environ.get("PH_PORT", "8731")))
     p.add_argument("--host", action="append", help="Extra host to allow (repeatable)")
     p.add_argument("--no-js", action="store_true", help="Block Script too (leanest; static sites)")
@@ -342,7 +350,7 @@ def main(argv=None):
                  max_pages=a.max, tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
                  port=a.port, hosts=hosts, keep_js=not a.no_js,
                  rate_delay=a.rate_delay, shuffle=not a.no_shuffle,
-                 host_diverse=not a.no_host_diverse)
+                 host_diverse=not a.no_host_diverse, stall_ceiling=a.stall_ceiling)
     asyncio.run(crawl(cfg))
 
 
