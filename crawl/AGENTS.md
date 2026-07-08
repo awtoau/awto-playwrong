@@ -91,6 +91,31 @@ In the DB (the model lives in `db.py`; `../schema.sql` documents it):
   untranslatable page). `graph.improvement_report(d)` ranks these so the crawl tells you what generic
   handling to improve next — instead of silently baking one site/country/vertical's rules in.
 
+### `link_code` — tie crawled data back to YOUR entities
+
+Every URL you seed can carry an opaque **`link_code`** — a free-text tag the engine stores on
+`frontier`, `page`, and `page_asset` but never interprets. Use it to join crawled pages/images back to
+whatever your app cares about (a resort id, a product SKU, a customer, a site id):
+
+```python
+d.enqueue("https://resort.example/", link_code="resort-442")     # tag a seed
+# … the crawl carries link_code onto every page + image ref discovered under it …
+# later, join by it:
+rows = d.engine.connect().execute(
+    text("SELECT url, title FROM page WHERE link_code = :lc"), {"lc": "resort-442"})
+```
+
+`upsert_page(..., link_code=…)` and `link_page_asset(..., link_code=…)` set it explicitly too. It
+keeps the engine domain-agnostic: the same schema serves a ski crawl (`link_code`=resort id) and an
+e-commerce crawl (`link_code`=SKU) with no schema change. `page` also persists `text_sha` (loose-dup
+key) and `page_asset` a `caption` field.
+
+### Schema upgrades are additive
+
+`init_schema()` creates missing tables **and** additively `ALTER`s any column a pre-existing table is
+missing (e.g. when the model gains a field). It never drops or alters existing columns, so pointing a
+newer engine at an older crawl DB just adds the new columns — existing data + rows are preserved.
+
 ## Reports (fast, no re-crawl)
 
 `crawl.graph` runs against either backend:

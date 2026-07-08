@@ -28,4 +28,13 @@
 --
 --  Standardised scan-status vocabulary (a portable CHECK on all backends), from crawl/db.py:
 --    ok · empty · nav_timeout · http_error · blocked · render_error · skipped · error
+--
+--  link_code (on frontier/page/page_asset): an opaque, free-text tag the CONSUMER attaches to a URL
+--  (via enqueue(link_code=…)) to join crawled pages/images back to its own domain entity — a resort
+--  id, a product SKU, a customer, a site id. The engine never interprets it, so the schema stays
+--  domain-agnostic. page also carries text_sha (loose-dup key); page_asset carries caption.
+--
+--  init_schema() is additive: it creates missing tables AND ALTERs in any column a pre-existing table
+--  is missing (never drops/alters existing columns), so a newer engine upgrades an older crawl DB in
+--  place with data preserved.
 -- ─────────────────────────────────────────────────────────────────────────────────────────────

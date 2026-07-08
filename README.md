@@ -8,6 +8,24 @@ Cloudflare Turnstile), so you pick the right one for the job.
 Extracted from the powderhounds project, where it was built + battle-tested (it beats Cloudflare
 Turnstile on a real site and recovered thousands of bot-blocked pages).
 
+## I just want to view / fetch one web page
+
+Start the browser server once, then grab a page — even one behind Cloudflare:
+
+```sh
+PYTHONPATH=vendor python engine/server.py &          # starts a real headed Chrome (default port 8731)
+
+python engine/client.py goto https://example.com     # navigate
+python engine/client.py text                          # print the page HTML
+python engine/client.py shot page.png                 # save a screenshot
+python engine/client.py solvecf                        # if it hit a Cloudflare "verify you're human" wall
+```
+
+Or one HTTP call from anything: `curl -s localhost:8731/goto -d '{"url":"https://example.com"}'` →
+returns `{html, title, status, cookies, screenshot, …}`. The browser stays alive between calls, so the
+next `goto` reuses the same (Turnstile-cleared) session. That's the whole "view a page" story — the
+rest of this README is for crawling many pages.
+
 ## Why this exists
 Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**
 you drive over **IP:port** — `goto a page → get back {html, cookies, status, screenshot, metadata}` —
