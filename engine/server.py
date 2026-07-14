@@ -17,6 +17,7 @@ import nodriver as uc
 from nodriver import cdp
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
+PROFILE_DIR = os.environ.get("PH_PROFILE_DIR")  # optional persistent user-data-dir; unset = ephemeral (default)
 TMP = os.path.join(os.path.dirname(__file__), "..", "tmp")
 os.makedirs(TMP, exist_ok=True)                 # ensure tmp/ exists on a fresh checkout
 LOG = os.path.join(TMP, "nd-server.log")
@@ -38,10 +39,19 @@ class ND:
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
     async def _ensure(self):
         if self.tab: return
-        self.browser = await uc.start(headless=False)
+        self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
         self.tab = await self.browser.get("about:blank")
         self._publish_cdp()
         log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
+    async def _start(self):
+        """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
+        primitive /status can't give you on its own. Chrome only launches on the FIRST real op
+        (goto/newtab/etc via _ensure()); /status's "alive" reports whether that's happened yet, but
+        polling /status alone never makes it happen - a caller that only checks status in a loop
+        waits forever. Call this once after confirming the HTTP server itself is reachable, then
+        /status will read alive:true."""
+        await self._ensure()
+        return {"started": True}
     def _publish_cdp(self):
         """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
         same browser (nodriver.start(host,port) connects to an existing browser) and shard by opening
@@ -99,7 +109,9 @@ class ND:
     async def _key(self, key):
         await self._ensure()
         # named keys (Enter/Tab/...) carry a code; printable chars go as text
-        named = {"Enter":13,"Tab":9,"Escape":27,"Backspace":8,"ArrowDown":40,"ArrowUp":38}
+        named = {"Enter":13,"Tab":9,"Escape":27,"Backspace":8,"ArrowDown":40,"ArrowUp":38,
+                  "ArrowLeft":37,"ArrowRight":39,"PageUp":33,"PageDown":34,"Home":36,"End":35,
+                  "Space":32,"Delete":46}
         if key in named:
             for ty in ("keyDown","keyUp"):
                 await self.tab.send(cdp.input_.dispatch_key_event(
@@ -173,7 +185,8 @@ class ND:
         cks = await self.browser.cookies.get_all()
         return {"cookies":[{"name":c.name,"value":c.value,"domain":getattr(c,"domain",None)} for c in cks]}
     def do(self, op, a):
-        m={"goto":lambda:self._goto(a["url"]),"solve":lambda:self._solve(a.get("tries",20)),
+        m={"start":lambda:self._start(),
+           "goto":lambda:self._goto(a["url"]),"solve":lambda:self._solve(a.get("tries",20)),
            "text":lambda:self._text(),"shot":lambda:self._shot(),"clearcookies":lambda:self._clearcookies(),
            "move":lambda:self._move(a["x"],a["y"]),"click":lambda:self._click(a["x"],a["y"]),
            "key":lambda:self._key(a["key"]),"newtab":lambda:self._newtab(a.get("url","about:blank")),
@@ -212,7 +225,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def log_message(self,*a):pass
     def do_GET(self):
-        if self.path=="/status":self._j({"alive":B.tab is not None})
+        if self.path=="/status":self._j({"server":True,"alive":B.tab is not None})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")

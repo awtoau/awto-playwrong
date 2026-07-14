@@ -6,7 +6,8 @@ and get JSON back. If the server isn't running, start it first. No SDK needed �
 ## TL;DR
 ```
 Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
-Check up:  GET  /status              -> {"alive": true|false}
+Check up:  GET  /status              -> {"server": true, "alive": true|false}
+Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
 Drive:     POST /goto   {"url": "..."}     -> {status, url, title}
            POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
            POST /text   {}                 -> {html, title, url}
@@ -15,6 +16,17 @@ Drive:     POST /goto   {"url": "..."}     -> {status, url, title}
            GET  /frame                     -> image/png          (latest screenshot bytes)
            POST /shutdown {}               -> {ok}
 ```
+
+**`server` vs `alive` — two different things, don't confuse them.** `server: true` means the HTTP
+process is up and answering requests (true the instant it responds at all — if you got JSON back,
+this is true). `alive` means Chrome has actually been launched, which happens **lazily**: nothing
+spawns a browser until the first real op (`start`/`goto`/`newtab`/etc.) asks for one. Polling
+`/status` in a loop **waiting for `alive` to turn true on its own will hang forever** if nothing
+else ever calls a real op - this is not a bug to work around, it's the intended lazy-launch design
+(no wasted Chrome startup if a caller never ends up driving the browser), but it has caught agents
+off guard before. If you just want the browser up and ready before doing anything else, call `POST
+/start` and wait for its response - it blocks until Chrome is launched, so there's no ambiguity
+about what to poll for.
 
 ## Connect, auto-starting the server if needed
 The pattern: ping `/status`; if it's not reachable, launch `engine/server.py` and wait for the port.
@@ -32,13 +44,15 @@ def up():
         return False
 
 def ensure_server():
-    """Start the capture server if it isn't already running, then wait for the port."""
+    """Start the capture server if it isn't already running, then wait for the port. This only
+    waits for the HTTP PROCESS to answer - it does NOT wait for Chrome (that's /start, see below),
+    and does not need to: up() checks reachability only, never the "alive" field."""
     if up(): return
     subprocess.Popen([sys.executable, f"{REPO}/engine/server.py"],
                      env={**os.environ, "PYTHONPATH": f"{REPO}/vendor", "PH_PORT": str(PORT)},
                      stdout=open(os.path.join(REPO, "tmp", "playwrong-server.log"), "a"),
                      stderr=subprocess.STDOUT)
-    for _ in range(60):                 # wait up to ~30s for it to bind
+    for _ in range(60):                 # wait up to ~30s for the HTTP server to bind
         if up(): return
         time.sleep(0.5)
     raise RuntimeError("playwrong server did not start")
@@ -49,7 +63,10 @@ def call(op, **body):
     return json.loads(urllib.request.urlopen(req, timeout=120).read())
 
 # --- usage ---
-ensure_server()                                  # start if needed
+ensure_server()                                  # start the HTTP process if needed
+call("start")                                     # explicitly launch Chrome and wait for it (optional
+                                                   # but recommended - see the alive/server note above;
+                                                   # skippable since goto/etc. below trigger it anyway)
 call("goto", url="https://example.com")           # navigate
 # behind Cloudflare? clear the challenge once; the cleared session is reused:
 if "just a moment" in call("text")["title"].lower():
@@ -72,7 +89,8 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ## Endpoints (the real contract — nodriver engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/status` | — | `{alive: bool}` |
+| GET | `/status` | — | `{server: true, alive: bool}` — `server` is always true if this responds at all; `alive` is false until the first real op launches Chrome (see the note above the TL;DR) |
+| POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
 | POST | `/goto` | `{url}` | `{status, url, title}` — navigates (2s settle) |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
 | POST | `/text` | — | `{html, title, url}` — current page |
@@ -84,6 +102,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 | POST | `/shutdown` | — | `{ok}` — clean stop |
 
 ## Notes for agents
+- **PDFs: download directly, don't open in the browser.** The browser's built-in PDF viewer (PDFViewerApplication) cannot be reliably controlled via JS — page navigation, scrolling, and thumbnail clicks all fail. For any PDF URL: `curl -sL <url> -o file.pdf`, then `pdftotext -layout file.pdf -` to extract text. Use playwrong only for HTML pages, not document files.
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).
@@ -95,12 +114,27 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   session.
 - **Concurrency:** multiple agents can POST to the same server; calls are serialised on the single
   browser. For true parallelism run multiple servers on different `PH_PORT`s.
+- **Stale `SingletonLock` on a persistent `PH_PROFILE_DIR`.** If the server process for a
+  persistent-profile instance died without a clean `/shutdown` (crash, `kill -9`, host reboot),
+  Chrome's `SingletonLock`/`SingletonCookie`/`SingletonSocket` symlinks in that profile dir can be
+  left pointing at a long-dead PID. A relaunch against that profile then hangs indefinitely with
+  `/status` never reporting `alive` and nothing in `tmp/nd-server.log` past `server_start` - it's
+  not a crash, the browser launch itself is stuck on the stale lock. Fix: `rm` the three
+  `Singleton*` files/symlinks in the profile dir, then relaunch - the real session data (cookies,
+  login) is untouched, only the lock is stale.
+- **Diagnosing a launch that "hangs":** check `tmp/nd-server.log` (structured, one line per
+  `server_start`/`nd_started`/`op_err` event - NOT the same as the HTTP process's own redirected
+  stdout, which stays empty during a normal lazy-launch wait since nothing calls `print()`). A
+  `server_start` line with no matching `nd_started` after it, and no `op_err`, most often just
+  means `/start` (or a real op) was never actually called yet - see the `server` vs `alive` note
+  above - not that anything is broken.
 
 ## Full verb set (now all on the nodriver engine — tested)
 The nodriver `engine/server.py` now implements the full surface (verified live):
 
 | Op | Body | Returns |
 |---|---|---|
+| `start` | — | `{started:true}` — explicitly launch Chrome (otherwise lazy - see `/status` note above) and block until ready |
 | `goto` | `{url}` | `{status,url,title}` |
 | `solve` | `{tries?}` | `{passed,iter}` |
 | `text` | — | `{html,title,url}` |
