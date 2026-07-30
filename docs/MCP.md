@@ -1,0 +1,142 @@
+# playwrong as an MCP server
+
+**The point: an agent should not have to read anything to use this.** Register the MCP server once
+and the browser ops show up in the agent's tool list, already described, already auto-starting. No
+API doc, no `ensure_server()` script, no `PYTHONPATH` juggling, no tab bookkeeping.
+
+The one-call version of everything this project does:
+
+```
+fetch("https://example.com")  ->  "# Example Domain\nURL: https://example.com/\n\nThis domain is …"
+```
+
+That single call starts the HTTP engine if it isn't up, launches Chrome if it isn't up, opens its own
+tab, navigates, detects and clears a Cloudflare Turnstile wall, converts the HTML to readable text,
+**closes its tab**, and returns. Behind it is the same unchanged `engine/server.py` — `mcp/server.py`
+is a thin JSON-RPC-over-stdio proxy, stdlib only.
+
+## Install on a fresh machine
+
+Four commands, starting from nothing:
+
+```sh
+git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
+python3 -m venv .venv                                  # optional but recommended
+.venv/bin/python scripts/install.py --deps --register   # deps + register with Claude Code
+.venv/bin/python scripts/mcp_selftest.py               # prove it (28 assertions, ~40s)
+```
+
+Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
+
+**What you actually need on the box:** Python 3.11+, Google Chrome or Chromium, and a display
+(the browser runs **headed** on purpose — headless is the Turnstile tell). Everything else is either
+stdlib or vendored: the only two PyPI packages are `websockets` and `Deprecated`, both pulled in by
+the in-tree `vendor/nodriver`. The crawl/ library's heavier deps (SQLAlchemy, psycopg, zstandard) are
+**not** needed for browser driving.
+
+If anything is missing, `scripts/doctor.py` tells you which one and prints the literal command that
+fixes it:
+
+```sh
+python scripts/doctor.py
+```
+
+It checks: Python version, the two deps, the vendored nodriver import, a Chrome binary (per-platform
+paths), `DISPLAY`/`WAYLAND_DISPLAY`, a writable `tmp/`, the MCP server compiling, and whether the
+engine port is free or already serving. Exit code 0 = ready.
+
+### Registering by hand
+
+`install.py --register` shells out to `claude mcp add` (scope `user`, so it works in every project),
+because that writes whatever config file your version of Claude Code actually reads. For any other
+MCP client, get the block and paste it in:
+
+```sh
+python scripts/install.py --print-config
+```
+
+```json
+{
+  "mcpServers": {
+    "playwrong": {
+      "command": "/abs/path/to/.venv/bin/python",
+      "args": ["/abs/path/to/awto-playwrong/mcp/server.py"]
+    }
+  }
+}
+```
+
+`--write-config <path>` merges that into an arbitrary client config, keeping a timestamped backup.
+
+**The interpreter path must be absolute and must be the one with the deps.** MCP clients start the
+server with no shell and no PATH of yours — a bare `python` is a coin flip. `install.py` uses the
+interpreter that ran it, which is why you invoke it with the venv's python.
+
+Options worth knowing: `--scope local|user|project`, `--name <other>` (if you want two registrations),
+`--port N` (pins `PH_PORT` for this registration, e.g. a second isolated browser).
+
+## The tools
+
+| Tool | What it's for |
+|---|---|
+| **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
+| `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
+| `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
+| `read` | Re-read the current page after something changed it. |
+| `js` | Evaluate an expression in the page. The precise tool: pull one field instead of the whole document. |
+| `click` / `key` | Synthetic CDP input at viewport coordinates / a single key. |
+| `solve` | Manual Turnstile clear (`fetch` and `goto` already do it automatically). |
+| `cookies` | The shared browser's cookies, including a cleared `cf_clearance`. |
+| `tabs` / `close_tab` | Enumerate tabs; close one, or `close_extra` to clean up after an aborted run. |
+| `status` | Engine up? Chrome up? How many tabs? Diagnostic only — nothing needs it first. |
+
+`mode` on the text-returning tools: `text` (default), `text+links` (keeps hrefs as `anchor <url>` so
+you can navigate without a second round-trip), or `html` (raw source, when you need markup).
+
+### Why text and not HTML
+
+`/text` on the raw engine hands back the full document — commonly 300–500KB. Converting server-side
+puts ~5KB of readable content in the agent's context instead, which is the difference between "one
+page" and "one page and no room to think about it". Ask for `html` when you actually need markup.
+
+## Design notes
+
+- **Thin proxy, not a rewrite.** Every tool is one or a few HTTP POSTs to `engine/server.py`. The
+  engine, its verbs, and `engine/client.py` are unchanged and still work; see
+  [AGENT-API.md](AGENT-API.md) for the HTTP contract if you're building something that isn't an agent.
+- **Stdlib only.** `mcp/server.py` imports nothing outside the standard library, so it starts
+  instantly and can report a broken *engine* install as a tool error rather than failing to load.
+- **stdout is the wire.** MCP stdio is newline-delimited JSON-RPC on stdin/stdout. Diagnostics go to
+  stderr; the spawned engine's output is redirected to `tmp/logs/playwrong-engine.log`. Nothing else
+  may print.
+- **Tabs cannot leak from `fetch`.** Open and close happen inside one call, and the close is
+  *verified* against a refreshed tab list rather than assumed.
+- **`shutdown` is deliberately not exposed as a tool.** The engine is shared; stopping it kills every
+  other agent's cleared Turnstile session. It stays available on the HTTP port for you.
+- **Concurrency.** The engine has one globally-active tab, so a capture is serialised by a lock
+  inside this process. Two *separate* MCP server processes (two agents) driving one engine can still
+  interleave. If you need genuine parallelism: run a second engine on another `PH_PORT` (register a
+  second MCP entry with `--port`), or attach your own nodriver to the shared browser via the engine's
+  `/cdp` endpoint — see the sharding section of [AGENT-API.md](AGENT-API.md).
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |
+| Every tool errors with "engine did not bind" | Run `python scripts/doctor.py` — nearly always a missing dep or no Chrome. Full engine output is in `tmp/logs/playwrong-engine.log`. |
+| Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
+| Port 8731 taken by something else | Register with `--port 8732`, or export `PH_PORT`. |
+| Turnstile not clearing | Raise `tries`; confirm the browser is headed (it must be) and that you're not running a second competing Chrome. |
+| A PDF url returns junk | Don't fetch PDFs here. `curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -`. The browser's PDF viewer can't be driven reliably. |
+
+## Testing changes to this layer
+
+```sh
+python scripts/mcp_selftest.py --offline                    # protocol only, no browser
+python scripts/mcp_selftest.py                              # + live page, tab-leak assertion
+python scripts/mcp_selftest.py --cloudflare                 # + a real Turnstile wall
+python scripts/mcp_selftest.py --port 8739 --shutdown       # isolated engine, stopped after
+```
+
+Only pass `--shutdown` with an isolated `--port`: the default engine is shared.

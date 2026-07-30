@@ -239,16 +239,28 @@ def _open_tab():
 
 
 def _close_tab(index, url=None):
-    """Close the tab we opened. Indices are positional and shift when a LOWER-indexed tab closes, so
-    prefer an exact url match and fall back to the index we were given. Never touches tab 0."""
+    """Close the tab we opened, and VERIFY it went. Indices are positional and shift when a
+    LOWER-indexed tab closes, so an exact url match is preferred and the index is the fallback. Tab 0
+    is protected by the engine. A leak here is the failure mode that leaves orphan renderers behind,
+    so it is checked rather than assumed."""
     try:
-        tabs = call_raw("tabs", method="GET").get("tabs", [])
+        before = call_raw("tabs", method="GET")
+        target = None
         if url:
-            for t in tabs:
+            for t in before.get("tabs", []):
                 if t["index"] != 0 and t.get("url") == url:
-                    return call("closetab", index=t["index"])
-        if index and index > 0:
-            return call("closetab", index=index)
+                    target = t["index"]
+                    break
+        if target is None and index and index > 0:
+            target = index
+        if target is None:
+            elog(f"[{NAME}] no tab to close (index={index} url={url!r})")
+            return {"closed": 0}
+        r = call("closetab", index=target)
+        if r.get("remaining", 0) >= before.get("count", 0):
+            elog(f"[{NAME}] LEAKED tab {target}: count still {r.get('remaining')} "
+                 f"(was {before.get('count')})")
+        return r
     except EngineError as e:
         elog(f"[{NAME}] tab cleanup failed (leaked tab {index}): {e}")
     return {"closed": 0}

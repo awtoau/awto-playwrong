@@ -1,5 +1,11 @@
 # Agent API — connect to awto-playwrong (and start it if needed)
 
+> **If you are an agent, you probably want [MCP.md](MCP.md) instead.** Registering the MCP server
+> once puts these ops in your tool list already described and auto-starting, and collapses the whole
+> goto → detect → solve → text → close-tab sequence below into one `fetch` call. This page is the raw
+> HTTP contract — read it when you're building something that isn't an MCP client, or when you need a
+> verb the MCP layer doesn't expose.
+
 How an app or agent uses the shared capture engine: it's an **HTTP server on a port**; you POST ops
 and get JSON back. If the server isn't running, start it first. No SDK needed — plain HTTP.
 
@@ -8,7 +14,7 @@ and get JSON back. If the server isn't running, start it first. No SDK needed �
 Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
 Check up:  GET  /status              -> {"server": true, "alive": true|false}
 Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
-Drive:     POST /goto   {"url": "..."}     -> {status, url, title}
+Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = where you LANDED)
            POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
            POST /text   {}                 -> {html, title, url}
            POST /shot   {}                 -> {b64}              (PNG screenshot, base64)
@@ -91,7 +97,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 |---|---|---|---|
 | GET | `/status` | — | `{server: true, alive: bool}` — `server` is always true if this responds at all; `alive` is false until the first real op launches Chrome (see the note above the TL;DR) |
 | POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
-| POST | `/goto` | `{url}` | `{status, url, title}` — navigates (2s settle) |
+| POST | `/goto` | `{url}` | `{title, url, requested}` — navigates (2s settle). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Storing the requested url records a page you may never have got. |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
 | POST | `/text` | — | `{html, title, url}` — current page |
 | POST | `/shot` | — | `{b64}` — PNG screenshot base64 |
@@ -135,7 +141,7 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | Op | Body | Returns |
 |---|---|---|
 | `start` | — | `{started:true}` — explicitly launch Chrome (otherwise lazy - see `/status` note above) and block until ready |
-| `goto` | `{url}` | `{status,url,title}` |
+| `goto` | `{url}` | `{title,url,requested}` — `url` = landed, `requested` = asked |
 | `solve` | `{tries?}` | `{passed,iter}` |
 | `text` | — | `{html,title,url}` |
 | `shot` | — | `{b64}` |
@@ -144,7 +150,7 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
 | `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
 | `newtab` | `{url?}` | `{ok,url,index}` — fresh tab; **index** is its position (track it, close it later) |
-| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active}],count}` — enumerate every open tab |
+| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active}],count}` — enumerate every open tab. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
 | `closetab` | `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by index OR url-substring; won't close tab 0 or the last tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
 | `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
@@ -172,6 +178,12 @@ is the core operating model — treat it accordingly:
   these verbs fix). Track what you open; close what you opened.
 - **Cleanup after a crash:** `closeextra` closes every tab except the base tab — the panic button when
   an aborted run left orphan tabs. It never touches the server process.
+- **`closed`/`remaining` are now trustworthy — they weren't always.** nodriver's `browser.tabs` is a
+  *cached* target list that `tab.close()` does not refresh, so the server used to answer
+  `{"closed":1,"remaining":2}` after closing one of two tabs, and `tabs` reported blank urls for
+  every tab. Cleanup was unverifiable and an MCP-layer `fetch` leaked a tab per call. The server now
+  refreshes the target list before reading it and after closing; if you write a new verb that touches
+  `browser.tabs`, call `_refresh()` first or you will reintroduce this.
 - **The base tab (index 0) is protected** — `closetab` won't close it and `closeextra` keeps it, so the
   server always has a live tab (its `/status` stays alive).
 

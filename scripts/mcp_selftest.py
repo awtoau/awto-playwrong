@@ -25,6 +25,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
 LOG = os.path.join(LOGDIR, "mcp-selftest.log")
 TEST_URL = "https://example.com"
+# Opt-in (--cloudflare) because it hits a third party and depends on their wall still being up.
+# nowsecure.nl is the community's standard bot-detection target — it exists to be probed.
+CF_URL = "https://nowsecure.nl"
 
 PASS, FAIL = [], []
 _log_fh = None
@@ -147,11 +150,18 @@ def live_tests(c):
     r = c.call("fetch", url=TEST_URL, mode="html")
     ok("mode=html returns markup", "<html" in text_of(r).lower())
 
-    r = c.call("fetch", url=TEST_URL, max_chars=200)
-    ok("max_chars truncates + says so", "[truncated:" in text_of(r))
+    # 60, not 200: example.com renders to ~150 chars of text, so a 200-char cap never trips and the
+    # assertion passes for the wrong reason (it did, on the first run of this file).
+    r = c.call("fetch", url=TEST_URL, max_chars=60)
+    ok("max_chars truncates + says so", "[truncated:" in text_of(r), f"{len(text_of(r))} chars")
 
     r = c.call("goto", url=TEST_URL)
     ok("goto navigates", "Example Domain" in text_of(r))
+    # Regression guard: browser.tabs is a cache the engine must refresh, else every tab reports a
+    # blank url and closing one is unverifiable. That bug made `fetch` leak a tab per call.
+    tabs = json.loads(text_of(c.call("tabs"))).get("tabs", [])
+    ok("tabs report real urls", any("example.com" in (t.get("url") or "") for t in tabs),
+       json.dumps(tabs))
     r = c.call("js", expr="document.title")
     ok("js evaluates in the page", "Example Domain" in text_of(r), text_of(r)[:80])
     r = c.call("read", mode="text+links")
@@ -171,11 +181,31 @@ def live_tests(c):
     ok("close_extra leaves only the base tab", json.loads(text_of(r)).get("count") == 1)
 
 
+def cloudflare_test(c):
+    """The whole reason playwrong exists: one call gets a page that plain HTTP cannot."""
+    say(f"    fetching {CF_URL} — a real Turnstile wall (slow: the solve loop clicks and waits)")
+    t0 = time.monotonic()
+    r = c.call("fetch", url=CF_URL, tries=25)
+    body = text_of(r)
+    dt = time.monotonic() - t0
+    walled = any(k in body.lower() for k in ("just a moment", "verify you are human",
+                                             "not cleared"))
+    # Assert on CONTENT, not length: the cleared page is only ~90 chars of text, so a length
+    # threshold fails a run that actually worked (it did, the first time this ran).
+    ok("fetch clears a live Cloudflare challenge",
+       not walled and "nowsecure" in body.lower(),
+       f"{len(body)} chars in {dt:.1f}s — {body[:120]!r}")
+    ok("cf_clearance cookie present", "cf_clearance" in text_of(c.call("cookies")))
+    c.call("close_tab", close_extra=True)
+
+
 def main():
     global _log_fh
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=int(os.environ.get("PH_PORT", "8731")))
     ap.add_argument("--offline", action="store_true", help="protocol tests only; no browser")
+    ap.add_argument("--cloudflare", action="store_true",
+                    help=f"also fetch {CF_URL} to prove the Turnstile path end to end")
     ap.add_argument("--shutdown", action="store_true",
                     help="stop the engine afterwards (ONLY for an isolated --port)")
     a = ap.parse_args()
@@ -191,6 +221,8 @@ def main():
             say("\n(--offline: skipped the live browser tests)")
         else:
             live_tests(c)
+            if a.cloudflare:
+                cloudflare_test(c)
     finally:
         c.close()
         if a.shutdown:

@@ -40,7 +40,10 @@ def mcp_entry(name="playwrong", port=None):
     env = {}
     if port:
         env["PH_PORT"] = str(port)
-    entry = {"command": sys.executable, "args": [SERVER]}
+    # normpath, not realpath: it cleans a "../venv/bin/python" invocation into an absolute path,
+    # while realpath would resolve the venv symlink back to the BASE interpreter — which does not
+    # have the venv's packages, so the server would start and then fail to launch a browser.
+    entry = {"command": os.path.normpath(os.path.abspath(sys.executable)), "args": [SERVER]}
     if env:
         entry["env"] = env
     return name, entry
@@ -56,27 +59,51 @@ def run_doctor():
     return r.returncode == 0
 
 
+def _dep_commands():
+    """Ways to install into THIS interpreter, best first.
+
+    pip is tried first and uv second, deliberately. `uv pip install` resolves its target from the
+    ACTIVE environment, not from the python running this script — so when install.py runs as
+    <venv>/bin/python without VIRTUAL_ENV exported (exactly how you'd invoke it from another
+    directory), plain `uv pip install` aborts with "No virtual environment found" and, worse, a
+    `--system` retry would install into the wrong interpreter. `--python <sys.executable>` pins uv to
+    the right one. pip needs no such care, so it leads; uv is the fallback for interpreters that
+    ship without pip.
+    """
+    uv = shutil.which("uv")
+    cmds = [[sys.executable, "-m", "pip", "install", "-r", REQS]]
+    if uv:
+        cmds.append([uv, "pip", "install", "--python", sys.executable, "-r", REQS])
+    return cmds
+
+
 def install_deps():
     say("\n── dependencies ────────────────────────────────────────────")
     if not os.path.exists(REQS):
         say(f"missing {REQS} — re-clone the repo")
         return False
-    cmd = ([shutil.which("uv"), "pip", "install", "-r", REQS] if shutil.which("uv")
-           else [sys.executable, "-m", "pip", "install", "-r", REQS])
-    say("running:", " ".join(cmd))
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    say((r.stdout or "").rstrip()[-2000:])
-    if r.returncode != 0:
-        say((r.stderr or "").rstrip()[-2000:])
-        say("dependency install FAILED")
-        # uv pip outside a venv refuses by design; say so instead of leaving them guessing.
-        if "virtual environment" in (r.stderr or ""):
-            say("hint: uv wants a venv. Either create one "
-                f"({sys.executable} -m venv .venv && . .venv/bin/activate) "
-                "or force the system env with: uv pip install --system -r requirements-engine.txt")
-        return False
-    say("dependencies installed")
-    return True
+    cmds, last = _dep_commands(), ""
+    for i, cmd in enumerate(cmds):
+        say("running:", " ".join(cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        last = ((r.stdout or "") + (r.stderr or "")).rstrip()
+        if r.returncode == 0:
+            say(last[-1500:])
+            say("dependencies installed")
+            return True
+        if i + 1 < len(cmds):
+            say(f"  -> failed (exit {r.returncode}); trying the next method")
+    say(last[-2000:])
+    say("dependency install FAILED")
+    if "externally-managed-environment" in last:
+        # Debian/Fedora system pythons refuse writes by policy (PEP 668). A venv is the right answer.
+        say(f"hint: this is a distro-managed Python. Make a venv and use that interpreter:\n"
+            f"  {sys.executable} -m venv .venv\n"
+            f"  .venv/bin/python scripts/install.py --deps --register")
+    else:
+        say(f"hint: install them yourself, then re-run doctor:\n"
+            f"  {sys.executable} -m pip install -r {REQS}")
+    return False
 
 
 def register_via_cli(name, entry, scope):

@@ -68,7 +68,15 @@ class ND:
         return getattr(self,"_cdp",{"error":"not published"})
     async def _goto(self, url):
         await self._ensure(); await self.tab.get(url); await self.tab.sleep(2)
-        return {"title": await self.tab.evaluate("document.title"), "url": url}
+        # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
+        # two differ, and a caller that stores the requested url records a page it never got.
+        return {"title": await self.tab.evaluate("document.title"),
+                "url": await self._href(), "requested": url}
+    async def _href(self):
+        """Authoritative current url. nodriver's Tab has no .url attribute (only .target.url, which
+        lags), so ask the page."""
+        try: return await self.tab.evaluate("location.href")
+        except Exception: return ""
     def _is_chal(self, t, h):
         t=(t or "").lower(); h=(h or "").lower()
         return any(k in t for k in CHALLENGE) or "verify you are human" in h
@@ -86,7 +94,7 @@ class ND:
     async def _text(self):
         await self._ensure()
         return {"title":await self.tab.evaluate("document.title"),"html":await self.tab.get_content(),
-                "url": self.tab.url if hasattr(self.tab,'url') else ""}
+                "url": await self._href()}
     async def _frame(self):
         await self._ensure()
         p=os.path.join(TMP,"nd-frame.png")
@@ -122,6 +130,7 @@ class ND:
     async def _newtab(self, url="about:blank"):
         await self._ensure()
         self.tab = await self.browser.get(url, new_tab=True)
+        await self._refresh()          # the cache may not list the tab we just opened yet
         return {"ok":1,"url":url,"index":self._tab_index(self.tab)}
     # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
     # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
@@ -133,24 +142,30 @@ class ND:
                 if t is tab: return i
         except Exception: pass
         return -1
+    async def _refresh(self):
+        """browser.tabs is a CACHED list (Browser._targets); nothing refreshes it on its own within a
+        request. Without this, a closed tab keeps appearing and urls come back blank — which made tab
+        hygiene silently unverifiable (closetab said closed:1, remaining:2, and the caller couldn't
+        tell whether cleanup worked). Call before reading, and after closing."""
+        try: await self.browser.update_targets()
+        except Exception as e: log("refresh_err", e=str(e)[:60])
     async def _tabs(self):
         """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
         use this to track what they opened and find tabs to close."""
-        await self._ensure()
+        await self._ensure(); await self._refresh()
         out=[]
         for i, t in enumerate(self.browser.tabs):
-            try:
-                url=getattr(t,"url","") or ""
-                title=await t.evaluate("document.title") if t is self.tab else ""
-            except Exception:
-                url, title = "", ""
-            out.append({"index":i,"url":url,"title":title,"active":(t is self.tab)})
+            # url/title come off the TargetInfo, not an evaluate(): it works for BACKGROUND tabs too
+            # (evaluate only ever worked on the active one) and costs no round-trip per tab.
+            ti = getattr(t, "target", None)
+            out.append({"index":i,"url":getattr(ti,"url","") or "",
+                        "title":getattr(ti,"title","") or "","active":(t is self.tab)})
         return {"tabs":out,"count":len(out)}
     async def _closetab(self, index=None, url=None, keep_first=True):
         """Close a tab by index OR by url-substring match. keep_first protects tab 0 (the server's base
         tab). Never closes the last remaining tab. Returns how many were closed. This is how agents
         clean up their shard — NOT by killing the server."""
-        await self._ensure()
+        await self._ensure(); await self._refresh()
         tabs=list(self.browser.tabs)
         if len(tabs)<=1: return {"closed":0,"reason":"only one tab; refusing to close the last"}
         targets=[]
@@ -167,15 +182,19 @@ class ND:
                     self.tab=self.browser.tabs[0] if self.browser.tabs else None
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
+        await self._refresh()          # so "remaining" is the truth, not the pre-close cache
+        if self.tab not in self.browser.tabs:
+            self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":closed,"remaining":len(self.browser.tabs)}
     async def _closeextra(self):
         """Close ALL tabs except the base tab (index 0) — the panic 'clean up leaked tabs' button. Use
         after a crashed/aborted crawl left orphan tabs. Never touches the server process."""
-        await self._ensure()
+        await self._ensure(); await self._refresh()
         n=0
         for t in list(self.browser.tabs)[1:]:
             try: await t.close(); n+=1
             except Exception: pass
+        await self._refresh()
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":n,"remaining":len(self.browser.tabs)}
     async def _js(self, expr):

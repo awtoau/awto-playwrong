@@ -62,23 +62,27 @@ def check_python():
 
 
 def check_deps():
-    missing = []
-    for mod, pkg, why in DEPS:
-        if importlib.util.find_spec(mod) is None:
-            missing.append(pkg)
-            check(f"dep {pkg}", "FAIL", f"not importable ({why})")
-        else:
-            check(f"dep {pkg}", "PASS", f"importable ({why})")
+    """One check, not one per package: three FAIL lines for a single `pip install` is noise, and the
+    whole point of this script is that each failure maps to exactly one command you can run."""
+    missing = [pkg for mod, pkg, _ in DEPS if importlib.util.find_spec(mod) is None]
     if missing:
-        cmd = f"{sys.executable} -m pip install " + " ".join(missing)
-        check("dependencies", "FAIL", f"{len(missing)} missing", cmd)
+        check("dependencies", "FAIL", f"missing: {', '.join(missing)}",
+              f"{sys.executable} -m pip install -r {os.path.join(REPO, 'requirements-engine.txt')}")
+    else:
+        check("dependencies", "PASS", ", ".join(pkg for _, pkg, _ in DEPS) + " importable")
+    return not missing
 
 
-def check_nodriver():
+def check_nodriver(deps_ok):
     vend = os.path.join(REPO, "vendor", "nodriver")
     if not os.path.isdir(vend):
         check("vendored nodriver", "FAIL", f"{vend} missing",
               "re-clone the repo — vendor/nodriver is committed, not downloaded")
+        return
+    if not deps_ok:
+        # It cannot import without those packages; reporting it as its own failure would send you
+        # chasing a second problem that does not exist.
+        check("vendored nodriver", "WARN", "not checked — install the dependencies above first")
         return
     sys.path.insert(0, os.path.join(REPO, "vendor"))
     try:
@@ -86,7 +90,7 @@ def check_nodriver():
         check("vendored nodriver", "PASS", f"imports from {vend}")
     except Exception as e:
         check("vendored nodriver", "FAIL", f"import failed: {e!r}",
-              "usually a missing dependency above; fix those first")
+              f"the checkout may be damaged; try: git -C {REPO} status")
 
 
 def check_chrome():
@@ -164,8 +168,7 @@ def main():
     os.makedirs(LOGDIR, exist_ok=True)
     print(f"playwrong doctor — repo {REPO}\n")
     check_python()
-    check_deps()
-    check_nodriver()
+    check_nodriver(check_deps())
     check_chrome()
     check_display()
     check_tmp()

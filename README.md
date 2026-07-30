@@ -8,6 +8,37 @@ Cloudflare Turnstile), so you pick the right one for the job.
 Extracted from the powderhounds project, where it was built + battle-tested (it beats Cloudflare
 Turnstile on a real site and recovered thousands of bot-blocked pages).
 
+## Install (fresh machine)
+
+```sh
+git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
+python3 -m venv .venv                                   # optional but recommended
+.venv/bin/python scripts/install.py --deps --register    # deps + register the MCP server
+.venv/bin/python scripts/mcp_selftest.py                # prove it works (28 assertions)
+```
+
+You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
+(headless is the Turnstile tell). The only two PyPI packages are `websockets` and `Deprecated`;
+nodriver is vendored in-tree and everything else is stdlib. `python scripts/doctor.py` checks all of
+it and prints the exact command for anything missing.
+
+> The `crawl/` library needs more (SQLAlchemy, psycopg, zstandard — see `pyproject.toml`). You don't
+> need any of that just to drive a browser.
+
+## I'm an agent / I want this in Claude Code
+
+Use the **MCP server** — [docs/MCP.md](docs/MCP.md). After `--register`, browser ops appear directly
+in the tool list and one call does the whole job:
+
+```
+fetch("https://example.com")   # auto-starts the engine + Chrome, clears Cloudflare,
+                               # returns readable text, closes its own tab
+```
+
+Also: `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
+No script to write, no API doc to read, no tab bookkeeping. `mcp/server.py` is a stdlib-only proxy in
+front of the same engine described below — driving it over HTTP still works exactly as before.
+
 ## I just want to view / fetch one web page
 
 Start the browser server once, then grab a page — even one behind Cloudflare:
