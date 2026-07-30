@@ -1,0 +1,11 @@
+# Runtime deps for the CAPTURE ENGINE + MCP server only (engine/server.py, mcp/server.py).
+#
+# This is the whole dependency surface for "drive a browser": nodriver itself is vendored in-tree
+# (vendor/nodriver, a patched 0.50.3 — see README), and everything else those two files touch is
+# stdlib. The crawl/ LIBRARY needs more (SQLAlchemy, psycopg, zstandard) — that's pyproject.toml,
+# and you do not need it to use the MCP tools.
+#
+#   pip install -r requirements-engine.txt
+#
+websockets>=12          # nodriver's CDP websocket transport
+Deprecated>=1.2         # imported by nodriver's generated cdp/*.py modules
