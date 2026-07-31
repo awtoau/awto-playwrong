@@ -282,6 +282,31 @@ def solve_timeout(tries):
 _lock = threading.Lock()
 
 
+def _assert_our_tab(port, idx, url):
+    """Confirm the tab we opened is still the engine's ACTIVE tab before we read from it.
+
+    The engine drives one globally-active tab, and _lock only serialises captures inside THIS
+    process. When a second process (another agent, or a human using the same shared browser) drives
+    the engine at the same time, it moves the active tab — and the read below then returns THAT
+    page's text as the answer to our url. Silently. This was observed for real: a verification run
+    asked for example.com and got the unrelated page the user was browsing at that moment.
+
+    Failing loudly is the point. A wrong page returned as if it were right is far worse than an
+    error, and the fix is concrete: give the caller its own engine.
+    """
+    try:
+        tabs = call("tabs", port=port, method="GET").get("tabs", [])
+    except EngineError:
+        return                       # tab listing is a nicety; never fail a capture over it
+    active = next((t for t in tabs if t.get("active")), None)
+    if active is not None and idx >= 0 and active.get("index") != idx:
+        raise EngineError(
+            f"another process moved the shared browser's active tab while fetching {url} "
+            f"(expected tab {idx}, active is {active.get('index')}: {active.get('url','')!r}). "
+            f"Refusing to return the wrong page. Use an isolated engine for concurrent work: "
+            f"--port <n>, or --profile <name>.")
+
+
 def _settled_text(port, page=None):
     """Read the page, waiting for it to have actually rendered.
 
@@ -323,6 +348,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
             # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
             if str(landed.get("url", "")).startswith(("chrome://", "about:")):
                 call("goto", port=port, url=url, timeout=90.0)
+            _assert_our_tab(port, idx, url)
             page = _settled_text(port)
             challenge = None
             if solve and is_challenge(page):
