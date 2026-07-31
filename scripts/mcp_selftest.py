@@ -176,6 +176,11 @@ def live_tests(c):
     r = c.call("cookies")
     ok("cookies returns a list", text_of(r).lstrip().startswith("["))
 
+    r = c.call("search", query="nodriver cloudflare", max_results=5)
+    body = text_of(r)
+    ok("search returns unwrapped result urls",
+       "http" in body and "duckduckgo.com/l/" not in body, body.splitlines()[0] if body else "")
+
     c.call("close_tab", close_extra=True)
     r = c.call("tabs")
     ok("close_extra leaves only the base tab", json.loads(text_of(r)).get("count") == 1)

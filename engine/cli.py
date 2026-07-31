@@ -46,6 +46,10 @@ def main(argv=None):
         epilog="Interactive driving (click/key/js/tabs) lives in engine/client.py; the MCP server "
                "for agents is in mcp/server.py (see docs/MCP.md).")
     p.add_argument("urls", nargs="*", help="one or more urls to fetch, in order")
+    p.add_argument("-s", "--search", metavar="QUERY",
+                   help="DuckDuckGo search -> title + url per result (curl gets a CAPTCHA now; a "
+                        "real browser is not challenged)")
+    p.add_argument("-n", type=int, default=10, metavar="N", help="max search results (default 10)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--html", action="store_true", help="raw markup instead of text")
     mode.add_argument("--links", action="store_true", help="text, keeping hrefs as `anchor <url>`")
@@ -69,6 +73,18 @@ def main(argv=None):
             print("engine stopped")
         except connect.EngineError:
             print("engine was not running")           # already-stopped is the desired state, not an error
+        return 0
+
+    if a.search:
+        hits = connect.search(a.search, max_results=a.n, port=a.port, on_start=note)
+        if a.json:
+            print(json.dumps(hits, indent=2))
+        else:
+            for i, h in enumerate(hits, 1):
+                print(f"{i:2}. {h['title']}\n    {h['url']}")
+        if not hits:
+            print("no results parsed — DuckDuckGo may have changed its markup", file=sys.stderr)
+            return 1
         return 0
 
     if a.status or not a.urls:

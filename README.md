@@ -50,6 +50,7 @@ pick. The first command starts the engine and a real headed Chrome; the page com
 text.
 
 ```sh
+./playwrong --search "nodriver turnstile"  # DuckDuckGo results (curl gets a CAPTCHA now)
 ./playwrong https://a.com https://b.com   # several urls, reusing the same warm browser
 ./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
 ./playwrong https://awto.au --html        # raw markup instead of text

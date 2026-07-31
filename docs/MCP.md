@@ -80,6 +80,7 @@ Options worth knowing: `--scope local|user|project`, `--name <other>` (if you wa
 | Tool | What it's for |
 |---|---|
 | **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
+| **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
 | `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
 | `read` | Re-read the current page after something changed it. |
@@ -92,6 +93,18 @@ Options worth knowing: `--scope local|user|project`, `--name <other>` (if you wa
 
 `mode` on the text-returning tools: `text` (default), `text+links` (keeps hrefs as `anchor <url>` so
 you can navigate without a second round-trip), or `html` (raw source, when you need markup).
+
+### Why `search` exists
+
+The standard keyword-search recipe — `curl 'https://lite.duckduckgo.com/lite/?q=…'` — no longer
+returns results. As of 2026-07-31 DDG answers curl-like clients with **HTTP 202 and an image CAPTCHA**
+("Please complete the following challenge… Select all squares containing a duck") on both the `lite`
+and `html` endpoints. It is not an error status, so a script that only checks for HTTP 200 silently
+treats the challenge page as results.
+
+A real headed Chrome is **not challenged at all** — nothing is solved or bypassed, the browser simply
+looks like a browser. `search` runs the same query through it and unwraps DDG's `/l/?uddg=` redirector
+so you get real destination urls. Then `fetch` whichever one you want.
 
 ### Why text and not HTML
 

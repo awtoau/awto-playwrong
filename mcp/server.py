@@ -61,6 +61,13 @@ def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20):
     return body
 
 
+def t_search(query, max_results=10):
+    hits = connect.search(query, max_results=max_results)
+    if not hits:
+        return "no results parsed — DuckDuckGo may have changed its markup"
+    return "\n".join(f"{i:2}. {h['title']}\n    {h['url']}" for i, h in enumerate(hits, 1))
+
+
 def t_screenshot(url=None, solve=True):
     if url is None:
         return [{"type": "image", "data": op("shot", timeout=90.0)["b64"], "mimeType": "image/png"}]
@@ -157,6 +164,17 @@ TOOLS = [
                            "description": "Truncate the body at this many characters."},
              "tries": {"type": "integer", "default": 20,
                        "description": "Max challenge-solve iterations."}}}),
+
+    dict(name="search", fn=t_search,
+         description=(
+             "Web search via DuckDuckGo, through the real browser — returns numbered title + url "
+             "results. Use this when a plain HTTP search request gets blocked: DuckDuckGo now "
+             "answers curl-like clients with an image CAPTCHA (HTTP 202 and a 'select all squares "
+             "containing a duck' page) instead of results, on both the lite and html endpoints. A "
+             "real browser is not challenged. Follow up with `fetch` on whichever result you want."),
+         schema={"type": "object", "required": ["query"], "properties": {
+             "query": {"type": "string", "description": "Search terms."},
+             "max_results": {"type": "integer", "default": 10}}}),
 
     dict(name="screenshot", fn=t_screenshot,
          description=(

@@ -15,13 +15,16 @@ Stdlib only, so importing it costs nothing and it can report a broken engine as 
 an ImportError.
 """
 import base64
+import html as htmlmod
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
@@ -242,6 +245,25 @@ def solve_timeout(tries):
 _lock = threading.Lock()
 
 
+def _settled_text(port, page=None):
+    """Read the page, waiting for it to have actually rendered.
+
+    /goto settles for a fixed 2s, which is a guess, and on a JS-rendered page it is sometimes short:
+    an MCP fetch of a heavy reviews page returned an EMPTY body once and 44k chars on the immediate
+    retry. So rather than trusting a constant, re-read until the document has visible text. Poll at
+    250ms for up to 5s beyond goto's own wait; past that, empty is the honest answer (a genuinely
+    blank page, or a hard block) and not something more waiting fixes.
+    """
+    page = page if page is not None else call("text", port=port)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if html_to_text(page.get("html")).strip():
+            return page
+        time.sleep(0.25)
+        page = call("text", port=port)
+    return page
+
+
 def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, shot=False,
             on_start=None):
     """Everything needed to get one page, in one call: start the engine and Chrome if they are down,
@@ -258,7 +280,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
         final_url, out = None, {}
         try:
             call("goto", port=port, url=url, timeout=90.0)
-            page = call("text", port=port)
+            page = _settled_text(port)
             challenge = None
             if solve and is_challenge(page):
                 if on_start:
@@ -266,6 +288,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
                 r = call("solve", port=port, tries=tries, timeout=solve_timeout(tries))
                 challenge = "cleared" if r.get("passed") else "NOT cleared"
                 page = call("text", port=port)
+            page = _settled_text(port, page)      # a solve navigates again; re-settle after it
             final_url = page.get("url")
             out = {"text": render(page, mode, max_chars), "title": page.get("title"),
                    "url": final_url, "challenge": challenge}
@@ -299,6 +322,43 @@ def _close_tab(index, url=None, port=None):
     except EngineError as e:
         print(f"warning: tab cleanup failed, leaked tab {index}: {e}", file=sys.stderr)
         return {"closed": 0}
+
+
+# ── search ──────────────────────────────────────────────────────────────────────────────────────
+
+DDG_LITE = "https://lite.duckduckgo.com/lite/?q={}"
+# DDG wraps every result in a redirector: //duckduckgo.com/l/?uddg=<urlencoded real url>&rut=...
+_RESULT = re.compile(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', re.S | re.I)
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def parse_ddg(html):
+    """Pull {title, url} out of a DuckDuckGo lite results page, unwrapping the redirector so callers
+    get the real destination rather than a duckduckgo.com/l/ link."""
+    out, seen = [], set()
+    for href, title in _RESULT.findall(html or ""):
+        href = htmlmod.unescape(href)
+        real = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [None])[0]
+        real = real or ("https:" + href if href.startswith("//") else href)
+        title = " ".join(htmlmod.unescape(_TAGS.sub(" ", title)).split())
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append({"title": title, "url": real})
+    return out
+
+
+def search(query, max_results=20, port=None, on_start=None):
+    """DuckDuckGo results, through the real browser.
+
+    DDG now answers curl with an image CAPTCHA ("select all squares containing a duck") on both the
+    lite and html endpoints — HTTP 202 and a challenge page instead of results, which silently breaks
+    the usual `curl lite.duckduckgo.com/lite/?q=` recipe. A real headed Chrome is not challenged at
+    all: nothing is being solved or bypassed here, the browser simply looks like a browser.
+    """
+    page = capture(DDG_LITE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
+                   port=port, on_start=on_start)
+    return parse_ddg(page["text"])[:max_results]
 
 
 def save_shot(path, port=None, on_start=None):
