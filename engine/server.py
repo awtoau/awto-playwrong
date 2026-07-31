@@ -1,34 +1,134 @@
-"""nd_server.py — single-browser server backed by NODRIVER (not Playwright).
+"""server.py — the capture engine: ONE headed Chrome, driven over HTTP, shared by every caller.
 
-Playwright is the Turnstile tell (CF serves it a dead challenge). nodriver drives Chrome via raw
-CDP and passes. This server gives our harness's control port + viz, but ONE nodriver browser does
-everything: solve Turnstile, crawl, and feed the viz screenshots. No second browser, no orphans.
+Backed by nodriver, not Playwright: Playwright is the Turnstile tell (Cloudflare serves it a dead
+challenge that never resolves), while nodriver drives Chrome over raw CDP and passes. One browser
+does everything — clear Turnstile, capture pages, feed the viz screenshots — so there is no second
+browser and no orphan windows.
 
-Control port (POST JSON): goto{url} solve newtab clearcookies text shot frame
-GET /status /viz /frame /markers ; POST /setmarkers /shutdown
+Control port (POST JSON): goto{url} solve{tries} text shot js{expr} cookies clearcookies
+                          newtab closetab closeextra tabs cdp move click key shutdown
+GET: /status /tabs /viz /frame /markers ; POST /setmarkers
 
-Run: PYTHONPATH=vendor .venv/bin/python scripts/nd_server.py   (tmp/nd-server.log)
+You do not need to run this by hand — engine/connect.py starts it on demand, and it puts vendor/ on
+sys.path itself, so no PYTHONPATH is required. To run it in the foreground anyway:
+
+    python engine/server.py            # PH_PORT (default 8731); log in tmp/nd-server.log
 """
-import sys, os, json, asyncio, threading, base64
-from datetime import datetime, timezone
+import asyncio
+import base64
+import json
+import os
+import sys
+import threading
+import traceback
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vendor"))
 import nodriver as uc
 from nodriver import cdp
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
-PROFILE_DIR = os.environ.get("PH_PROFILE_DIR")  # optional persistent user-data-dir; unset = ephemeral (default)
+
+
+def profile_dir():
+    """Where Chrome keeps its user-data-dir, if anywhere.
+
+    PH_PROFILE_DIR — an explicit path, for full control.
+    PH_PROFILE     — just a NAME ("work", "logged-in"), resolved to an XDG data dir and created for
+                     you. Persistent profiles are what you want for a site you log into: the session
+                     survives an engine restart. Naming one beats inventing a path, which is why
+                     this exists.
+    neither        — ephemeral: a throwaway profile per launch. The default, because a persistent
+                     profile silently accumulates real browsing state on disk and that should be an
+                     opt-in.
+    """
+    d = os.environ.get("PH_PROFILE_DIR")
+    if d:
+        return os.path.expanduser(d)
+    name = os.environ.get("PH_PROFILE")
+    if not name:
+        return None
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    d = os.path.join(base, "playwrong", "profiles", name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+PROFILE_DIR = profile_dir()
 TMP = os.path.join(os.path.dirname(__file__), "..", "tmp")
 os.makedirs(TMP, exist_ok=True)                 # ensure tmp/ exists on a fresh checkout
 LOG = os.path.join(TMP, "nd-server.log")
 CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
+# Serialise the caller's expression IN THE PAGE and hand back a JSON string.
+#
+# Reading nodriver's return value directly does not work: it yields a RemoteObject for anything that
+# isn't a primitive (so `({a:1})` came back as "RemoteObject(type_='object', ...)"), a raw
+# ExceptionDetails for a thrown error, and a tuple in other cases — none of them JSON-serialisable,
+# which killed the HTTP response mid-flight. Stringifying in the page sidesteps every one of those
+# shapes: objects, arrays, promises, undefined and exceptions all arrive as one plain string.
+#
+# `await (…)` wraps both sync and async expressions, so no special case is needed for either.
+JS_WRAP = ("(async () => { try { const v = await (%s);"
+           " return JSON.stringify(v === undefined ? null : v); }"
+           " catch (e) { return JSON.stringify("
+           "{__playwrong_error: String((e && e.stack) || e)}); } })()")
+
 def log(a, **k):
-    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    ts = datetime.now(UTC).isoformat(timespec="milliseconds")
     try:
         open(LOG, "a").write(f"{ts} {a} " + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
     except Exception:
         pass
+
+def heal_profile(profile_dir):
+    """Clear a stale SingletonLock so a persistent profile can be relaunched.
+
+    Chrome writes SingletonLock/SingletonCookie/SingletonSocket into a user-data-dir and removes them
+    on a CLEAN exit. After a crash, kill -9 or a host reboot they survive, pointing at a long-dead
+    PID — and the next launch against that profile then HANGS INDEFINITELY: /status never reports
+    alive, and nothing appears in the log past server_start. It is not a crash, the launch is stuck
+    on the lock, which makes it look like the browser is simply broken.
+
+    The documented fix was "rm the three Singleton* files yourself". Doing it here instead: the lock
+    is only meaningful if its owning process is alive, so we check, and remove it only when it is
+    not. A live lock (a second engine genuinely using this profile) is left alone.
+    """
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return
+    lock = os.path.join(profile_dir, "SingletonLock")
+    if not os.path.lexists(lock):
+        return
+    # ONLY SingletonLock encodes a pid, as a "<hostname>-<pid>" symlink target. SingletonCookie's
+    # target is a large random number and SingletonSocket's is a socket path — parsing either as a
+    # pid yields a value os.kill() rejects outright (OverflowError: Python int too large to convert
+    # to C int), which is why liveness is decided from the lock alone.
+    pid = None
+    try:
+        pid = int(os.readlink(lock).rsplit("-", 1)[-1])
+    except (OSError, ValueError):
+        pass
+    if pid and pid > 0:
+        try:
+            os.kill(pid, 0)              # signal 0 = existence check only, never touches the process
+            log("profile_lock_live", pid=pid)
+            return                        # a real browser is using this profile; leave it alone
+        except PermissionError:
+            log("profile_lock_live", pid=pid)      # exists, just owned by another user
+            return
+        except (ProcessLookupError, OverflowError, OSError):
+            pass                          # owner gone (or an unparseable pid) -> treat as stale
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        p = os.path.join(profile_dir, name)
+        if not os.path.lexists(p):
+            continue
+        try:
+            os.unlink(p)
+            log("profile_lock_cleared", file=name, pid=pid)
+        except OSError as e:
+            log("profile_lock_err", file=name, e=str(e)[:60])
+
 
 class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
@@ -39,6 +139,7 @@ class ND:
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
     async def _ensure(self):
         if self.tab: return
+        heal_profile(PROFILE_DIR)       # a stale lock would hang the launch below forever
         self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
         self.tab = await self.browser.get("about:blank")
         self._publish_cdp()
@@ -218,7 +319,26 @@ class ND:
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":n,"remaining":len(self.browser.tabs)}
     async def _js(self, expr):
-        await self._ensure(); return {"result": await self.tab.evaluate(expr)}
+        """Evaluate in the page, RESOLVING promises.
+
+        Without await_promise an async expression handed back a bare Promise, which serialised to
+        null — so `js` looked like it silently returned nothing for anything async. Top-level `await`
+        is also not valid inside a CDP evaluate, so an expression starting with it is wrapped in an
+        async IIFE rather than being rejected."""
+        await self._ensure()
+        raw = await self.tab.evaluate(JS_WRAP % expr.strip().rstrip(";"),
+                                      await_promise=True, return_by_value=True)
+        if not isinstance(raw, str):
+            # The wrapper always resolves to a string, so anything else means the driver could not
+            # evaluate it at all (usually a syntax error in the expression).
+            return {"error": f"js could not be evaluated: {str(raw)[:300]}"}
+        try:
+            val = json.loads(raw)
+        except ValueError:
+            return {"result": raw}
+        if isinstance(val, dict) and "__playwrong_error" in val:
+            return {"error": f"js exception: {val['__playwrong_error']}"}
+        return {"result": val}
     async def _cookies(self):
         await self._ensure()
         cks = await self.browser.cookies.get_all()
@@ -236,7 +356,12 @@ class ND:
            "cdp":lambda:self._cdp_info()}
         if op not in m: return {"error":f"unknown {op}"}
         try: return self.run(m[op]())
-        except Exception as e: log("op_err",op=op,e=repr(e)[:120]); return {"error":repr(e)[:160]}
+        except Exception as e:
+            # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or line
+            # is nearly useless when the cause is three frames down in a helper.
+            log("op_err",op=op,e=repr(e)[:120],
+                where="|".join(traceback.format_exc().strip().splitlines()[-3:])[:300])
+            return {"error":repr(e)[:160]}
 
 B = ND()
 MARKERS={"aim":None,"cursor":None,"path":[],"box":None,"ollama":None}
@@ -256,7 +381,10 @@ setInterval(t,100);t();</script>"""
 
 class H(BaseHTTPRequestHandler):
     def _j(self,o,c=200):
-        b=json.dumps(o).encode();self.send_response(c)
+        # default=str so ONE unserialisable value can never kill the response. Without it the
+        # encoder raises after send_response, the client sees "Remote end closed connection without
+        # response", and the real cause is buried in the server's stdout log.
+        b=json.dumps(o,default=str).encode();self.send_response(c)
         self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(b)))
         self.end_headers();self.wfile.write(b)
     def _raw(self,b,ct,c=200):
@@ -268,7 +396,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")
-            except Exception as e:self._raw(b"","text/plain",500)
+            except Exception:self._raw(b"","text/plain",500)
         elif self.path=="/markers":self._j(MARKERS)
         elif self.path=="/tabs":
             try:self._j(B.run(B._tabs()))

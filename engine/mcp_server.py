@@ -28,8 +28,8 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from engine import connect                                                    # noqa: E402
-from engine.connect import EngineError, call, capture, render, is_challenge   # noqa: E402
+from engine import connect  # noqa: E402
+from engine.connect import EngineError, call, capture, is_challenge, render  # noqa: E402
 
 PORT = connect.default_port()
 NAME, VERSION = "playwrong", "0.1.0"
@@ -59,6 +59,20 @@ def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20):
     if r.get("challenge"):
         body += f"\n\n[cloudflare challenge: {r['challenge']}]"
     return body
+
+
+def t_pdf(url, max_chars=40000):
+    r = connect.pdf(url)
+    if r.get("warning"):
+        return f"{r['warning']}\n[saved {r['bytes']} bytes to {r['path']}]"
+    if r.get("text") is None:
+        return (f"Downloaded {r['bytes']} bytes to {r['path']}, but `pdftotext` is not installed so "
+                f"the text can't be extracted here. Install poppler-utils, or read the file "
+                f"yourself — it is a valid PDF and the bot wall has already been cleared.")
+    text, total = r["text"], len(r["text"])
+    if max_chars and total > max_chars:
+        text = text[:max_chars] + f"\n\n[truncated: {max_chars} of {total} chars; full file at {r['path']}]"
+    return f"# {os.path.basename(r['path'])}\nURL: {url}\n\n{text}"
 
 
 def t_search(query, max_results=10):
@@ -164,6 +178,17 @@ TOOLS = [
                            "description": "Truncate the body at this many characters."},
              "tries": {"type": "integer", "default": 20,
                        "description": "Max challenge-solve iterations."}}}),
+
+    dict(name="pdf", fn=t_pdf,
+         description=(
+             "Get a PDF that plain HTTP can't reach, as text. Use this INSTEAD of `fetch` for PDF "
+             "urls, and instead of curl when the file sits behind a bot wall. It clears the "
+             "challenge in the real browser, downloads the file through that cleared session "
+             "(cookies + matching User-Agent), and extracts the text. For an unprotected PDF, plain "
+             "`curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -` is still fine and cheaper."),
+         schema={"type": "object", "required": ["url"], "properties": {
+             "url": {"type": "string", "description": "Direct url to the PDF."},
+             "max_chars": {"type": "integer", "default": 40000}}}),
 
     dict(name="search", fn=t_search,
          description=(

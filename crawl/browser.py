@@ -103,7 +103,7 @@ async def attach(port=8731):
     but status lies), we shut it down cleanly (/shutdown — never pkill) and start a fresh one. Retries
     the whole sequence a few times before giving up. Open your own tabs, close them when done."""
     last_err = None
-    for attempt in range(4):
+    for _attempt in range(4):   # index unused; the loop is a bounded retry
         # 1) server up?
         if not is_up(port):
             _start_server(port)

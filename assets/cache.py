@@ -29,6 +29,7 @@ CLI:
     python -m assets.cache --profiles-glob '/tmp/uc_*' --root /path/assets --host mysite.com [--dry-run]
 """
 from __future__ import annotations
+
 import glob
 import io
 import os
@@ -153,7 +154,9 @@ def harvest(sink, profiles_glob="/tmp/uc_*", url_filter=None, junk_markers=(), l
 
 def _main(argv=None):
     import argparse
-    from . import store as _store, imgmeta as _imgmeta
+
+    from . import imgmeta as _imgmeta
+    from . import store as _store
     ap = argparse.ArgumentParser(description="Recover images from Chrome's Simple Cache into an asset store.")
     ap.add_argument("--profiles-glob", default="/tmp/uc_*")
     ap.add_argument("--root", required=True, help="asset store root dir")

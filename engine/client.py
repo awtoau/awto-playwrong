@@ -6,13 +6,9 @@ This file is for DRIVING a page: click, key, js, tabs, marker injection, vision 
 
 Nothing here needs a server started by hand, and no PYTHONPATH is needed.
 
---- original notes ---
-drive.py — the LOGIC side. Sends primitives to the always-running server (start_server.py).
-
-This file changes as much as we like; the SERVER (and its alive browser + Turnstile clearance)
-never restarts. The server is a dumb executor — drive.py decides what to do.
-
-Primitives: goto/move/click/key/text/shot/js  (see start_server.py).
+This is the LOGIC side: it decides what to do, and sends primitives to the long-lived engine
+(engine/server.py), which is a dumb executor. This file can change as much as you like without ever
+restarting the browser or losing its cleared Turnstile session.
 
 CLI:
   client.py status                 # engine/browser state (the one verb that won't auto-start)
@@ -31,7 +27,12 @@ CLI:
   client.py newtab | clearcookies
   client.py shutdown               # stops the SHARED engine, for everyone
 """
-import os, sys, json, base64, urllib.request
+import base64
+import json
+import os
+import sys
+import urllib.request
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine import connect
 
@@ -105,7 +106,10 @@ def inject_marker(x, y):
 MODEL="qwen2.5vl:7b"
 def detect():
     """THE pipeline: screenshot -> Ollama vision finds the checkbox -> push coord + info to viz."""
-    import base64,json,time,struct
+    import base64
+    import json
+    import struct
+    import time
     png = base64.b64decode(call("shot")["b64"])
     w,h = struct.unpack(">II", png[16:24])
     prompt=(f"This is a {w}x{h} pixel screenshot. Find the Cloudflare 'Verify you are human' checkbox "
@@ -175,4 +179,13 @@ def main(av):
         except Exception as e: print("shutdown sent (server exiting):", str(e)[:60])
     else: print("unknown:",op)
 
-if __name__=="__main__": main(sys.argv[1:])
+if __name__=="__main__":
+    # An engine-side failure (a JS exception, a dead engine) is a normal outcome for a CLI, not a
+    # bug in this script — print it as a message instead of a Python traceback.
+    try:
+        main(sys.argv[1:])
+    except connect.EngineError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

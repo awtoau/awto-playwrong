@@ -42,6 +42,33 @@ packages = ["crawl", "assets", "engine"]   # engine ships too: it provides the `
 [tool.hatch.build.targets.wheel.force-include]
 "vendor/nodriver" = "crawl/_vendor/nodriver"
 
+# ── lint: ruff, configured to match the code that is actually here ──────────────────────────────
+#   uvx ruff check .          (no install needed)
+[tool.ruff]
+line-length = 110              # the code is written to ~100; 110 leaves room for a trailing comment
+extend-exclude = ["vendor"]    # patched third-party source — not ours to restyle
+
+[tool.ruff.lint]
+# E4/E7/E9 + F is the correctness core (undefined names, unused imports, broken syntax); I sorts
+# imports; UP and B catch genuinely outdated or bug-prone constructs. Deliberately NOT the whole
+# catalogue: a rule the project then blanket-ignores is worse than not selecting it.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = [
+    "E701", "E702",   # the engine and its client use a deliberately dense one-line-per-op style
+    "E731",           # ditto: a lambda dispatch table reads better than a def per verb
+    "UP031",          # %-formatting is used where it is clearer than an f-string
+]
+
+[tool.ruff.lint.per-file-ignores]
+# These import after a sys.path insert, which is the point: they must run as a plain script from a
+# checkout with nothing installed.
+"engine/mcp_server.py" = ["E402"]
+"engine/cli.py" = ["E402"]
+"engine/client.py" = ["E402"]
+# Same reason: crawl/__init__.py must put the patched vendored nodriver on sys.path BEFORE the
+# submodule imports that use it.
+"crawl/__init__.py" = ["E402"]
+
 # ── uv tool install: force the pure-Python, no-GIL-safe builds ──────────────────────────────────
 # SQLAlchemy's cyextension silently re-enables the GIL; installing it from an sdist with the C ext
 # disabled keeps no-GIL alive. uv reads these env vars during the build of that package.

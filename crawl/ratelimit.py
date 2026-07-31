@@ -20,6 +20,7 @@ Usage in a worker:
     rl.on_response(host, status, retry_after)  # 429/503 -> widens; 2xx -> relaxes
 """
 from __future__ import annotations
+
 import asyncio
 import time
 

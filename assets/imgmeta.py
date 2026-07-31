@@ -8,8 +8,8 @@ import io
 from dataclasses import dataclass, field
 
 try:
-    from PIL import Image
     import imagehash
+    from PIL import Image
 except Exception:                                   # Pillow optional — degrade gracefully
     Image = imagehash = None
 

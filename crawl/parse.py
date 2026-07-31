@@ -5,7 +5,7 @@ functions. Consumers call these on the raw HTML the engine captured.
 """
 import html as _html
 import re
-from urllib.parse import urljoin, urldefrag, urlsplit
+from urllib.parse import urldefrag, urljoin, urlsplit
 
 # ── visible text ──────────────────────────────────────────────────────────────────────────────
 # One open-tag + one close-tag pattern PER stripped element (no backreference, no `.*?` spanning the

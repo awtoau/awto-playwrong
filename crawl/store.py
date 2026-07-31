@@ -8,7 +8,6 @@ never touches a database.
 import hashlib
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 import zstandard
 
@@ -29,7 +28,7 @@ class StoredPage:
     title: str
     text: str
     text_chars: int
-    text_sha: Optional[str]
+    text_sha: str | None
     written: bool          # False if the file already existed (dedup by content)
 
 
@@ -59,7 +58,7 @@ def store_page(html: str, root: str, ext: str = "html") -> StoredPage:
                       text=text, text_chars=len(text), text_sha=text_sha, written=written)
 
 
-def load_page(root: str, sha: str, ext: str = "html") -> Optional[str]:
+def load_page(root: str, sha: str, ext: str = "html") -> str | None:
     """Read a stored page back to HTML (decompress). None if missing/corrupt."""
     _, full = shard_path(root, sha, ext)
     if not os.path.exists(full):

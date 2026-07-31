@@ -3,7 +3,7 @@
 Pure, stdlib-only, zero project refs. Consumers call these before/around store_asset to skip
 ad-beacons, tracking pixels and junk, and to pick a file extension from the MIME type.
 """
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # MIME -> file extension. Covers the image types a web crawl actually meets; extend per consumer.
 EXT_BY_MIME = {

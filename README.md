@@ -1,20 +1,29 @@
 # awto-playwrong
 
-**One place to go when an app or agent needs browser automation.** A generic, shareable browser-
-capture engine — port-based, so multiple agents/apps can hit the same running infrastructure. It
-documents **several methods** (plain Playwright style + the "powders" nodriver style that beats
-Cloudflare Turnstile), so you pick the right one for the job.
+**Fetch the pages that won't let you fetch them.**
 
-Extracted from the powderhounds project, where it was built + battle-tested (it beats Cloudflare
-Turnstile on a real site and recovered thousands of bot-blocked pages).
+```sh
+playwrong https://example.com      # the page, as readable text. Nothing to start first.
+```
+
+One shared, long-lived, headed Chrome — driven over a local port — that clears Cloudflare Turnstile
+and stays warm between calls. A CLI, an AI agent (via **MCP**), and your own scripts all drive the
+same browser and reuse the same cleared session.
+
+**Why not just `curl`?** Because more and more pages don't answer it. Cloudflare serves a challenge;
+DuckDuckGo now returns `HTTP 202` and an image CAPTCHA. A real browser isn't asked. Nothing here
+solves or breaks a CAPTCHA — it drives a real browser that isn't given one, and hands you the result.
+
+Built and hardened against real bot-walled sites, where it recovered thousands of pages that plain
+HTTP fetching could not.
 
 ## Install (fresh machine)
 
 ```sh
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
-.venv/bin/python scripts/install.py --deps --link --register      # deps, `playwrong` on PATH, MCP
-.venv/bin/python scripts/mcp_selftest.py                         # prove it works (28 assertions)
+.venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (32 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
@@ -35,7 +44,8 @@ fetch("https://example.com")   # auto-starts the engine + Chrome, clears Cloudfl
                                # returns readable text, closes its own tab
 ```
 
-Also: `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
+Also: `search`, `pdf`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`,
+`tabs`, `close_tab`.
 No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
 front of the same engine described below — driving it over HTTP still works exactly as before.
 
@@ -51,6 +61,8 @@ text.
 
 ```sh
 ./playwrong --search "nodriver turnstile"  # DuckDuckGo results (curl gets a CAPTCHA now)
+./playwrong --pdf https://site/paper.pdf  # a PDF from behind a bot wall, as text
+./playwrong --profile work https://site   # persistent named profile: logins survive a restart
 ./playwrong https://a.com https://b.com   # several urls, reusing the same warm browser
 ./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
 ./playwrong https://awto.au --html        # raw markup instead of text
@@ -74,7 +86,8 @@ running a *second*, isolated browser.
 
 ```sh
 python engine/client.py goto https://example.com
-python engine/client.py js "document.title"
+python engine/client.py js "document.title"       # promises resolve; objects come back as JSON
+python engine/client.py read --links              # current page as text, hrefs kept
 python engine/client.py shot page.png
 ```
 
@@ -87,35 +100,27 @@ you drive over **IP:port** — `goto a page → get back {html, cookies, status,
 that any number of apps/agents can share. No DB, no project specifics: pure capture. Wire your own
 data layer on top (the project keeps its DB code; this stays generic).
 
-## The methods (pick one)
-| Method | What | When to use |
-|---|---|---|
-| **engine/ (nodriver, "powders" style)** ⭐ | raw-CDP real Chrome via [nodriver]; **beats Cloudflare Turnstile** (Playwright is the detection tell — see docs) | anything behind Cloudflare/Turnstile/bot-protection; the default |
-| **methods/playwright-\*** | classic Playwright server + client | sites with no bot protection; familiar Playwright API |
+## Why nodriver, and not Playwright
+**Playwright is the detection tell.** Cloudflare serves it a dead challenge that never resolves, no
+matter how the automation is configured. nodriver drives a real Chrome over raw CDP and passes. The
+browser also runs **headed** deliberately — headless is itself a signal. That is the whole
+architectural choice, and it's why this repo exists rather than a Playwright wrapper.
 
-### engine/ — the recommended capture server
-- `engine/server.py` — persistent **headed real Chrome** (nodriver), driven over HTTP on a port.
-  Ops: `goto`, `solve` (Turnstile), `text` (html), `shot` (screenshot, base64). Stable, browser
-  stays alive across requests; clean shutdown over the port.
+### The pieces
+- `engine/server.py` — the engine: one persistent **headed real Chrome** (nodriver), driven over HTTP
+  on a port. Holds the browser, the cleared session, and every verb.
 - `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
-  html→text. Every entry point (CLI, MCP server, your scripts) goes through it, so "how do I start
-  this thing" has exactly one answer and callers stop reimplementing it.
+  html→text, one-shot `capture()`, `search()` and `download()`/`pdf()`. Every entry point goes
+  through it, so "how do I start this thing" has exactly one answer.
 - `engine/cli.py` + `./playwrong` — the one-shot command: url in, readable page out.
-- `engine/client.py` — the interactive port client (`goto/click/key/js/shot/tabs/...`).
-- `engine/solve.py` — standalone Turnstile solve (find "verify you are human" inside the cross-origin
-  iframe + click).
+- `engine/client.py` — the interactive port client (`goto/click/key/js/read/tabs/…`).
+- `engine/mcp_server.py` — the MCP stdio server for agents ([docs/MCP.md](docs/MCP.md)).
+- `crawl/` — an optional library for crawling many pages on top of the engine (its own heavier deps).
 - `vendor/nodriver` — patched nodriver 0.50.3 (fixes a non-UTF-8 byte in `cdp/network.py` line ~1345
   that raises `SyntaxError` on import under CPython 3.14). Upstream: issue
   [ultrafunkamsterdam/nodriver#35](https://github.com/ultrafunkamsterdam/nodriver/issues/35) + fix PR
   [#36](https://github.com/ultrafunkamsterdam/nodriver/pull/36) (both open/unmerged). **Drop the vendor
   pin once #36 merges and a fixed release ships.**
-
-### methods/ — alternative / historical
-- `playwright-server.py` + `playwright-ctl.py` — the earlier Playwright-based server/client. **Note:
-  Playwright is detectable by Cloudflare Turnstile** (it gets served a dead, never-rendering
-  challenge) — kept for non-protected sites + reference. Use the nodriver engine for anything behind
-  Cloudflare.
-- `playwright-crawl.py` — a one-shot Playwright crawler (headed).
 
 ## Usage (engine)
 ```
@@ -199,28 +204,13 @@ sys._is_gil_enabled() and not u.has_compiled_ext()"` on the tool's interpreter.
 For development, an editable install in a free-threaded venv works too:
 `uv pip install -e .` after `DISABLE_SQLALCHEMY_CEXT=1 uv pip install --no-binary sqlalchemy "sqlalchemy>=2.0"`.
 
-## Handoff state (for the next agent)
-
-**DONE + verified:** the `crawl/` library above; the SQLAlchemy-Core DB layer (SQLite/Postgres/MySQL,
-tested both); a 3-agent adversarial review with all findings fixed (subdomain-escape, a `<script>`
-ReDoS, HTML-entity decoding, feed/infra over-matching, stuck-frontier reclaim); a live **472-page
-parallel crawl, 0 failures, 85% rich pages**. `sniff.py` (powderhounds) consumes `crawl.challenge` +
-`crawl.netblock`.
-
-**OPEN:**
-- **Finish the #165 fold-back** — re-point powderhounds' `nd_crawl.py` at this engine (it still has its
-  own copy), and fold PH's DNS tracker-block (`tracker_resolver_rules`/`TRACKER_HOSTS`) into the engine
-  (`sniff.py` still imports those from `nd_crawl`).
-- Review follow-ups (medium): `--no-js` mode should skip the render-wait (blocking Script means no
-  client render to wait for); surface `netblock.enable()` failures instead of swallowing them.
-
-**GOTCHAS — read before running:**
+## Gotchas — read before running
 - **nodriver import landmine.** Upstream `nodriver/cdp/network.py` has a non-UTF-8 byte (line ~1345)
   that raises `SyntaxError` under **Python 3.14** (both the GIL and free-threaded builds — 3.14 tightened
   the source tokenizer to reject non-UTF-8 bytes with no encoding declaration; 3.13 and earlier were
-  lenient). `vendor/nodriver` here is patched, but a consumer's
-  `site-packages` copy may NOT be — **put `vendor` FIRST in `PYTHONPATH`** (`PYTHONPATH=vendor:…`) so
-  the patched copy wins. This is the #1 thing that breaks a fresh run.
+  lenient). `vendor/nodriver` here is patched, and `engine/server.py` puts it FIRST on `sys.path`, so
+  the patched copy wins over any `site-packages` install automatically. If you import nodriver
+  yourself in another process, make sure `vendor/` leads there too.
 - **SQLAlchemy on no-GIL.** Its `cyextension` C module silently re-enables the GIL. Install the
   pure-Python build: `DISABLE_SQLALCHEMY_CEXT=1 pip install --no-binary SQLAlchemy "SQLAlchemy>=2.0"`.
   Verify `not sys._is_gil_enabled()` after import. Drivers must be pure-Python too: `psycopg` (not
@@ -241,10 +231,9 @@ parallel crawl, 0 failures, 85% rich pages**. `sniff.py` (powderhounds) consumes
 - **Python 3.14t free-threaded** — sync Playwright segfaults; use async / nodriver. Vendored nodriver
   is patched for it.
 
-## Status
-Public on GitHub at https://github.com/awtoau/awto-playwrong. `main` carries the `engine/` capture
-server + the `crawl/` library + `assets/`. Local working checkout remains on your machine.
+## Licence
+MIT — see [LICENSE](LICENSE).
 
-_Browser automation + a reusable crawl library: the nodriver engine (Turnstile-beating), a port-driven
-capture server, and `crawl/` (walk a site → content-addressed store + SQLAlchemy DB + reference-graph
-reports). Ref-free — the shared home for any app/agent that needs a browser or a crawler._
+Use it lawfully: respect the terms of the sites you fetch, and don't point it at anything you have no
+right to access. It exists so that legitimate access — research, archiving, your own accounts and
+your own sites — isn't blocked by a bot check aimed at someone else.

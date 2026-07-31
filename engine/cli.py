@@ -6,6 +6,8 @@
     playwrong https://awto.au --html          # raw markup
     playwrong https://awto.au --shot page.png # also save a screenshot
     playwrong https://awto.au --json          # {text,title,url,challenge} for scripting
+    playwrong --pdf https://site/paper.pdf    # a PDF from behind a bot wall, as text
+    playwrong --profile work https://site     # persistent named profile (logins survive)
     playwrong --status                        # is anything running?
     playwrong --stop                          # stop the shared engine (affects everyone)
 
@@ -23,7 +25,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine import connect                                                   # noqa: E402
+from engine import connect  # noqa: E402
 
 
 def _note(msg):
@@ -50,6 +52,13 @@ def main(argv=None):
                    help="DuckDuckGo search -> title + url per result (curl gets a CAPTCHA now; a "
                         "real browser is not challenged)")
     p.add_argument("-n", type=int, default=10, metavar="N", help="max search results (default 10)")
+    p.add_argument("--pdf", metavar="URL",
+                   help="download a PDF (or any file) THROUGH the cleared session and print its "
+                        "text — works when the file sits behind a bot wall that curl alone can't pass")
+    p.add_argument("-o", "--out", metavar="PATH", help="where --pdf/--shot writes (default tmp/)")
+    p.add_argument("--profile", metavar="NAME",
+                   help="use a persistent, named Chrome profile so logins and cleared sessions "
+                        "survive a restart. Each name gets its own engine on its own stable port.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--html", action="store_true", help="raw markup instead of text")
     mode.add_argument("--links", action="store_true", help="text, keeping hrefs as `anchor <url>`")
@@ -69,14 +78,32 @@ def main(argv=None):
 
     if a.stop:
         try:
-            connect.call("shutdown", port=a.port, timeout=10.0)
+            connect.call("shutdown",
+                         port=a.port or (connect.profile_port(a.profile) if a.profile else None),
+                         timeout=10.0)
             print("engine stopped")
         except connect.EngineError:
             print("engine was not running")           # already-stopped is the desired state, not an error
         return 0
 
+    if a.pdf:
+        r = connect.pdf(a.pdf, path=a.out, port=a.port, on_start=note, solve=not a.no_solve,
+                        tries=a.tries, profile=a.profile)
+        if a.json:
+            print(json.dumps({k: v for k, v in r.items() if k != "text"}, indent=2))
+        elif r.get("text"):
+            print(r["text"])
+        if r.get("warning"):
+            print(f"warning: {r['warning']}", file=sys.stderr)
+        elif r.get("text") is None:
+            print("saved, but pdftotext is not installed so there is no text to print "
+                  "(dnf install poppler-utils / apt install poppler-utils)", file=sys.stderr)
+        print(f"[{r['bytes']} bytes -> {r['path']}]", file=sys.stderr)
+        return 1 if r.get("warning") else 0
+
     if a.search:
-        hits = connect.search(a.search, max_results=a.n, port=a.port, on_start=note)
+        hits = connect.search(a.search, max_results=a.n, port=a.port, on_start=note,
+                              profile=a.profile)
         if a.json:
             print(json.dumps(hits, indent=2))
         else:
@@ -88,7 +115,7 @@ def main(argv=None):
         return 0
 
     if a.status or not a.urls:
-        port = a.port or connect.default_port()
+        port = a.port or (connect.profile_port(a.profile) if a.profile else connect.default_port())
         if not connect.reachable(port):
             print(json.dumps({"server": False, "alive": False, "port": port}))
             if not a.status:
@@ -112,7 +139,8 @@ def main(argv=None):
     for i, url in enumerate(a.urls):
         try:
             r = connect.capture(url, mode=fmt, solve=not a.no_solve, max_chars=a.max_chars,
-                                tries=a.tries, port=a.port, shot=bool(a.shot), on_start=note)
+                                tries=a.tries, port=a.port, shot=bool(a.shot), on_start=note,
+                                profile=a.profile)
         except connect.EngineError as e:
             failed += 1
             print(f"{url}: {e}", file=sys.stderr)

@@ -30,11 +30,24 @@ Databases note in python-coding-style.md. This module doesn't enforce that; the 
 """
 import json
 
-from sqlalchemy import (Boolean, Column, Engine, Integer, MetaData, String, Table, Text,
-                        create_engine, delete, func, insert, select, text, update)
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Engine,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    func,
+    insert,
+    select,
+    update,
+)
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 # Standard scan-status vocabulary (portable: a CHECK, not a Postgres-only ENUM, so all backends enforce).
 SCAN_STATUSES = ("ok", "empty", "nav_timeout", "http_error", "blocked", "render_error",
@@ -124,11 +137,13 @@ unhandled = Table(
 # composite-PK-ish uniqueness is enforced via upsert index elements below (page_link + page_asset use
 # (page_sha, href/img_url)). SQLAlchemy needs them declared for ON CONFLICT targets:
 from sqlalchemy import PrimaryKeyConstraint  # noqa: E402
+
 page_link.append_constraint(PrimaryKeyConstraint("page_sha", "href"))
 page_asset.append_constraint(PrimaryKeyConstraint("page_sha", "img_url"))
 
 # CHECK constraint for the status vocabulary (portable across all three backends).
 from sqlalchemy import CheckConstraint  # noqa: E402
+
 _status_in = "'" + "','".join(SCAN_STATUSES) + "'"
 frontier.append_constraint(CheckConstraint(f"scan_status IS NULL OR scan_status IN ({_status_in})"))
 page.append_constraint(CheckConstraint(f"scan_status IN ({_status_in})"))
@@ -233,8 +248,9 @@ class CrawlDB:
           turn, so a batch of n covers up to n DIFFERENT hosts. A host with only deep pages left still
           contributes (goes deeper) rather than a shallow-heavy host dominating every tab. This is the
           "one site per tab, even if it means going deeper" model. Overrides shuffle."""
-        import sqlalchemy as _sa
         from urllib.parse import urlsplit
+
+        import sqlalchemy as _sa
         with self.engine.begin() as c:
             if host_diverse:
                 # Pull a generous candidate window (shallowest first), then greedily round-robin by host

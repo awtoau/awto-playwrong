@@ -86,7 +86,7 @@ def check_nodriver(deps_ok):
         return
     sys.path.insert(0, os.path.join(REPO, "vendor"))
     try:
-        import nodriver                                    # noqa: F401
+        import nodriver  # noqa: F401
         check("vendored nodriver", "PASS", f"imports from {vend}")
     except Exception as e:
         check("vendored nodriver", "FAIL", f"import failed: {e!r}",
@@ -159,7 +159,7 @@ def check_engine_port():
         check(f"engine :{PORT}", "PASS", "not running; port is free (it will auto-start)")
     except OSError:
         check(f"engine :{PORT}", "FAIL", "port is taken by something that is not the engine",
-              f"pick another port: export PH_PORT=8732")
+              "pick another port: export PH_PORT=8732")
     finally:
         s.close()
 

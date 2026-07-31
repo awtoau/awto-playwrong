@@ -27,7 +27,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from . import browser, netblock, render, parse, store, db, graph, ratelimit
+from . import browser, db, graph, netblock, parse, ratelimit, render, store
 
 
 def _same_site(url, hosts):
@@ -82,7 +82,7 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
         nav_timed_out = False
         try:
             await asyncio.wait_for(tab.get(url), timeout=cfg.nav_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             nav_timed_out = True
         # rate-limited? back the host off and requeue this URL — don't store the 429 body as content.
         if rl is not None and rl.on_response(host, doc_status["code"], doc_status["retry_after"]):
@@ -215,7 +215,7 @@ async def _worker(slot, b, queue, cfg, d, stats):
                 try:
                     await asyncio.wait_for(
                         _fetch_one(tab, url, depth, cfg, d, stats, link_code), timeout=stall_ceiling)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     try:
                         d.scan(url, status="render_error", note=f"stall>{stall_ceiling:.0f}s (tab abandoned)")
                     except Exception:

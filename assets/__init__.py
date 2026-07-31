@@ -16,6 +16,6 @@ likes. See `schema.sql` for a recommended relational model a consumer can adopt 
 Nothing here knows what the assets are OF or where their rows live. Reuse it for any crawl.
 """
 
-from . import store, classify, imgmeta  # noqa: F401
+from . import classify, imgmeta, store  # noqa: F401
 
 __all__ = ["store", "classify", "imgmeta"]

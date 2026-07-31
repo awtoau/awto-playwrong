@@ -19,6 +19,7 @@ import html as htmlmod
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from html.parser import HTMLParser
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +37,18 @@ SERVER_LOG = os.path.join(LOGDIR, "playwrong-engine.log")
 
 def default_port():
     return int(os.environ.get("PH_PORT", "8731"))
+
+
+def profile_port(name):
+    """A stable port per named profile, derived from the name.
+
+    A Chrome profile is fixed when the browser launches, so one engine serves exactly one profile.
+    Rather than making you track "which port did I start `work` on", the name picks the port: the
+    same --profile always finds the same warm engine, and two profiles never collide on one browser.
+    zlib.crc32 because Python's hash() is randomised per process and would pick a different port
+    every run.
+    """
+    return 8740 + (zlib.crc32(name.encode()) % 50)
 
 
 def base_url(port=None):
@@ -58,7 +72,7 @@ def reachable(port=None, timeout=2.0):
         return False
 
 
-def spawn(port=None):
+def spawn(port=None, profile=None):
     """Launch engine/server.py detached, output to a log file.
 
     No PYTHONPATH is set: server.py puts vendor/ on sys.path itself (and does it with
@@ -67,13 +81,16 @@ def spawn(port=None):
     """
     port = port or default_port()
     os.makedirs(LOGDIR, exist_ok=True)
+    env = {**os.environ, "PH_PORT": str(port)}
+    if profile:
+        env["PH_PROFILE"] = profile      # engine/server.py turns the NAME into a user-data-dir
     subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
-                     env={**os.environ, "PH_PORT": str(port)},
+                     env=env,
                      stdout=open(SERVER_LOG, "a"), stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
 
-def ensure(port=None, want_browser=True, on_start=None):
+def ensure(port=None, want_browser=True, on_start=None, profile=None):
     """Guarantee an engine on `port`, and by default a launched Chrome behind it. Idempotent and
     cheap when everything is already up (one /status round-trip).
 
@@ -86,13 +103,13 @@ def ensure(port=None, want_browser=True, on_start=None):
     on_start: optional callback, invoked once if we actually had to spawn something, so a CLI can say
     "starting the browser…" instead of appearing to hang.
     """
-    port = port or default_port()
+    port = port or (profile_port(profile) if profile else default_port())
     started = False
     if not reachable(port):
         if on_start:
             on_start("starting the capture engine")
         started = True
-        spawn(port)
+        spawn(port, profile=profile)
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             if reachable(port, timeout=1.0):
@@ -131,8 +148,8 @@ def call(op, port=None, method="POST", timeout=60.0, body=None, **kw):
         raise EngineError(f"engine op {op!r} failed: {e}") from e
     try:
         out = json.loads(raw)
-    except ValueError:
-        raise EngineError(f"engine op {op!r} returned non-JSON ({len(raw)} bytes)")
+    except ValueError as e:
+        raise EngineError(f"engine op {op!r} returned non-JSON ({len(raw)} bytes)") from e
     if isinstance(out, dict) and out.get("error"):
         raise EngineError(f"engine op {op!r}: {out['error']}")
     return out
@@ -265,7 +282,7 @@ def _settled_text(port, page=None):
 
 
 def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, shot=False,
-            on_start=None):
+            on_start=None, profile=None):
     """Everything needed to get one page, in one call: start the engine and Chrome if they are down,
     open OUR OWN tab, navigate, clear a Cloudflare challenge if one appears, extract, close the tab.
 
@@ -274,7 +291,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
 
     Returns {text, title, url, challenge, b64?}.
     """
-    port = ensure(port, on_start=on_start)
+    port = ensure(port, on_start=on_start, profile=profile)
     with _lock:
         idx = call("newtab", port=port, url="about:blank").get("index", -1)
         final_url, out = None, {}
@@ -348,7 +365,7 @@ def parse_ddg(html):
     return out
 
 
-def search(query, max_results=20, port=None, on_start=None):
+def search(query, max_results=20, port=None, on_start=None, profile=None):
     """DuckDuckGo results, through the real browser.
 
     DDG now answers curl with an image CAPTCHA ("select all squares containing a duck") on both the
@@ -357,8 +374,120 @@ def search(query, max_results=20, port=None, on_start=None):
     all: nothing is being solved or bypassed here, the browser simply looks like a browser.
     """
     page = capture(DDG_LITE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
-                   port=port, on_start=on_start)
+                   port=port, on_start=on_start, profile=profile)
     return parse_ddg(page["text"])[:max_results]
+
+
+# ── downloads: PDFs and other files behind a bot wall ───────────────────────────────────────────
+
+def _origin(url):
+    p = urllib.parse.urlparse(url)
+    return f"{p.scheme}://{p.netloc}/"
+
+
+def _cookie_applies(domain, host):
+    """Cookie-domain match, the ordinary way: a leading dot means "and all subdomains"."""
+    if not domain:
+        return False
+    d = domain.lstrip(".")
+    return host == d or host.endswith("." + d)
+
+
+def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile=None):
+    """Clear the wall for this url's origin in the real browser, then hand back the headers that let
+    a plain HTTP client through as that same cleared session: Cookie (incl. cf_clearance) + the
+    browser's exact User-Agent.
+
+    This is the missing half of "don't open PDFs in the browser". Curl alone fails on a bot-walled
+    file, and Chrome's built-in PDF viewer cannot be driven reliably — so neither tool works on its
+    own. Clearing in the browser and downloading with the cleared session works, and is what
+    download() does.
+    """
+    port = ensure(port, on_start=on_start, profile=profile)
+    with _lock:
+        idx = call("newtab", port=port, url="about:blank").get("index", -1)
+        final_url = None
+        try:
+            # Navigate to the ORIGIN, not the file: a challenge is served per-origin, and going
+            # straight at a PDF drops us in Chrome's PDF viewer where evaluate() is unreliable.
+            call("goto", port=port, url=_origin(url), timeout=90.0)
+            page = call("text", port=port)
+            if solve and is_challenge(page):
+                if on_start:
+                    on_start("clearing a Cloudflare challenge")
+                call("solve", port=port, tries=tries, timeout=solve_timeout(tries))
+            final_url = call("text", port=port).get("url")
+            ua = call("js", port=port, expr="navigator.userAgent").get("result") or ""
+            cookies = call("cookies", port=port).get("cookies", [])
+        finally:
+            _close_tab(idx, final_url, port)
+    host = urllib.parse.urlparse(url).netloc.split(":")[0]
+    jar = "; ".join(f"{c['name']}={c['value']}" for c in cookies
+                    if _cookie_applies(c.get("domain"), host))
+    h = {"Referer": _origin(url)}
+    if ua:
+        h["User-Agent"] = ua
+    if jar:
+        h["Cookie"] = jar
+    return h
+
+
+def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None):
+    """Fetch a file (PDF, zip, image, …) from behind a bot wall and write it to disk.
+
+    Returns {path, bytes, content_type, headers_used}. `path` defaults to tmp/ + the url's basename.
+    """
+    headers = session_headers(url, port=port, on_start=on_start, solve=solve, tries=tries,
+                              profile=profile)
+    if on_start:
+        on_start(f"downloading with the cleared session ({len(headers.get('Cookie',''))} B of cookies)")
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:   # 3 min: documents can be tens of MB
+            data = r.read()
+            ctype = r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
+    except (urllib.error.URLError, OSError) as e:
+        raise EngineError(f"download failed: {e}") from e
+    if path is None:
+        name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
+        os.makedirs(os.path.join(REPO, "tmp"), exist_ok=True)
+        path = os.path.join(REPO, "tmp", name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return {"path": path, "bytes": len(data), "content_type": ctype}
+
+
+def pdf_text(path):
+    """Extract text with pdftotext if it's installed. Returns None when it isn't, so callers can say
+    'saved, but install poppler-utils to read it' rather than failing."""
+    exe = shutil.which("pdftotext")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-layout", path, "-"], capture_output=True, text=True, timeout=120)
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def pdf(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None):
+    """A PDF, even behind a bot wall: clear the challenge, download through the cleared session, and
+    extract the text. Returns {path, bytes, text, content_type}."""
+    out = download(url, path=path, port=port, on_start=on_start, solve=solve, tries=tries,
+                   profile=profile)
+    head = open(out["path"], "rb").read(5)
+    if head != b"%PDF-":
+        # A challenge page saved as .pdf is the classic silent failure — say so instead of handing
+        # back bytes that will not open.
+        out["text"] = None
+        out["warning"] = (f"not a PDF (starts with {head!r}) — the server likely returned an HTML "
+                          f"block page. Try fetching the containing page first so the session is "
+                          f"fully cleared.")
+        return out
+    out["text"] = pdf_text(out["path"])
+    return out
 
 
 def save_shot(path, port=None, on_start=None):

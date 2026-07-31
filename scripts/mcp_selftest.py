@@ -164,6 +164,16 @@ def live_tests(c):
        json.dumps(tabs))
     r = c.call("js", expr="document.title")
     ok("js evaluates in the page", "Example Domain" in text_of(r), text_of(r)[:80])
+    # Regression guards. js used to hand back a bare Promise (serialised to null) for anything
+    # async, and nodriver's RemoteObject repr for anything non-primitive.
+    r = c.call("js", expr="await new Promise(r=>setTimeout(()=>r('resolved'),200))")
+    ok("js awaits a promise", "resolved" in text_of(r), text_of(r)[:80])
+    r = c.call("js", expr="({a:1,b:[2,3]})")
+    ok("js returns real objects, not a RemoteObject repr",
+       json.loads(text_of(r)) == {"a": 1, "b": [2, 3]}, text_of(r)[:80])
+    r = c.call("js", expr="nope.nope()")
+    ok("js exception is reported, not swallowed",
+       is_error(r) and "ReferenceError" in text_of(r), text_of(r)[:90])
     r = c.call("read", mode="text+links")
     ok("read mode=text+links keeps hrefs", "<https://" in text_of(r) or "<http" in text_of(r))
 

@@ -22,8 +22,8 @@ Four commands, starting from nothing:
 ```sh
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                  # optional but recommended
-.venv/bin/python scripts/install.py --deps --register   # deps + register with Claude Code
-.venv/bin/python scripts/mcp_selftest.py               # prove it (28 assertions, ~40s)
+.venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, both registries
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (32 assertions)
 ```
 
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
@@ -105,13 +105,23 @@ server with no shell and no PATH of yours — a bare `python` is a coin flip. `i
 interpreter that ran it, which is why you invoke it with the venv's python.
 
 Options worth knowing: `--scope local|user|project`, `--name <other>` (if you want two registrations),
-`--port N` (pins `PH_PORT` for this registration, e.g. a second isolated browser).
+`--port N` (pins `PH_PORT` for this registration, e.g. a second isolated browser), `--link` (puts the
+`playwrong` command on your PATH), `--vscode` (the separate VSCode registry, above).
+
+### Persistent profiles
+By default each engine launch gets a throwaway Chrome profile. To keep logins and cleared sessions
+across restarts, name a profile: `PH_PROFILE=work` in the MCP entry's `env`, or `playwrong --profile
+work <url>` on the CLI. The name resolves to `$XDG_DATA_HOME/playwrong/profiles/<name>` and each name
+gets its own engine on its own stable, name-derived port — a Chrome profile is fixed at launch, so
+one engine serves exactly one profile. A stale `SingletonLock` left by a crash used to hang the next
+launch forever; the engine now clears it automatically if its owning process is gone.
 
 ## The tools
 
 | Tool | What it's for |
 |---|---|
 | **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
+| **`pdf`** | A PDF that plain HTTP can't reach, as text: clears the wall, downloads through the cleared session (cookies + matching User-Agent), extracts the text. |
 | **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
 | `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
@@ -125,6 +135,18 @@ Options worth knowing: `--scope local|user|project`, `--name <other>` (if you wa
 
 `mode` on the text-returning tools: `text` (default), `text+links` (keeps hrefs as `anchor <url>` so
 you can navigate without a second round-trip), or `html` (raw source, when you need markup).
+
+### Why `pdf` exists
+
+"Don't open PDFs in the browser" is right — Chrome's PDF viewer can't be driven via JS — but it is
+only half the advice. For a PDF **behind a bot wall**, curl alone gets the block page (often written
+to disk as a `.pdf` that won't open), and the browser can't be driven. Neither tool works alone.
+
+`pdf` does the sequence that works: clear the challenge in the real browser → read the cookies →
+fetch the file over plain HTTP with that jar *and the browser's exact User-Agent*. For an
+unprotected PDF, plain `curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -` is still fine and
+cheaper. `connect.download(url, path)` does the same for any file type, and
+`connect.session_headers(url)` hands back just the headers if you want to drive the transfer.
 
 ### Why `search` exists
 

@@ -128,26 +128,43 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 | POST | `/shutdown` | — | `{ok}` — clean stop |
 
 ## Notes for agents
-- **PDFs: download directly, don't open in the browser.** The browser's built-in PDF viewer (PDFViewerApplication) cannot be reliably controlled via JS — page navigation, scrolling, and thumbnail clicks all fail. For any PDF URL: `curl -sL <url> -o file.pdf`, then `pdftotext -layout file.pdf -` to extract text. Use playwrong only for HTML pages, not document files.
+- **PDFs: don't open them in the browser — but curl alone isn't the answer either.** Chrome's built-in
+  PDF viewer (PDFViewerApplication) can't be driven via JS: page navigation, scrolling and thumbnail
+  clicks all fail. So for an *unprotected* PDF, plain `curl -sL <url> -o f.pdf` + `pdftotext -layout
+  f.pdf -` is right and cheaper than any of this.
+  **For a PDF behind a bot wall, neither tool works alone** — curl gets the block page (often saved
+  as a .pdf that won't open), and the browser can't be driven. The working sequence is: clear the
+  challenge in the browser → read `/cookies` → fetch the file over HTTP with that jar *and the
+  browser's exact User-Agent*. That is implemented, so don't hand-roll it:
+  `playwrong --pdf <url>`, the MCP `pdf` tool, or `connect.pdf(url)` / `connect.download(url, path)`
+  for any file type. `connect.session_headers(url)` returns just the `{Cookie, User-Agent, Referer}`
+  if you want to drive the download yourself.
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
-- **Cookies:** read via the page after `goto` (the cleared cf_clearance is on the context). A
-  `cookies` field on the response is a small planned addition; until then use `text`/CDP.
+- **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,
+  including the cleared `cf_clearance`. (This used to be listed as "a small planned addition" — it
+  has existed and worked for a while; the note was stale.)
 - **Clean shutdown over the port** (`/shutdown`), never `pkill` — that orphans Chrome + loses the
   session.
 - **Concurrency:** multiple agents can POST to the same server; calls are serialised on the single
   browser. For true parallelism run multiple servers on different `PH_PORT`s.
-- **Stale `SingletonLock` on a persistent `PH_PROFILE_DIR`.** If the server process for a
-  persistent-profile instance died without a clean `/shutdown` (crash, `kill -9`, host reboot),
-  Chrome's `SingletonLock`/`SingletonCookie`/`SingletonSocket` symlinks in that profile dir can be
-  left pointing at a long-dead PID. A relaunch against that profile then hangs indefinitely with
-  `/status` never reporting `alive` and nothing in `tmp/nd-server.log` past `server_start` - it's
-  not a crash, the browser launch itself is stuck on the stale lock. Fix: `rm` the three
-  `Singleton*` files/symlinks in the profile dir, then relaunch - the real session data (cookies,
-  login) is untouched, only the lock is stale.
+- **Persistent profiles: `PH_PROFILE=<name>` (or `PH_PROFILE_DIR=<path>`).** Unset = ephemeral, a
+  throwaway profile per launch. A *name* is resolved to `$XDG_DATA_HOME/playwrong/profiles/<name>`
+  and created for you, so logins and cleared sessions survive a restart. On the CLI:
+  `playwrong --profile work <url>` — each name gets its own engine on its own stable, name-derived
+  port, since a Chrome profile is fixed at browser launch and one engine therefore serves one
+  profile.
+- **Stale `SingletonLock` — now healed automatically, no longer a manual step.** If a
+  persistent-profile engine died without a clean `/shutdown` (crash, `kill -9`, host reboot),
+  Chrome's `SingletonLock`/`SingletonCookie`/`SingletonSocket` are left pointing at a long-dead PID,
+  and a relaunch against that profile used to hang indefinitely — `/status` never reporting `alive`,
+  nothing in `tmp/nd-server.log` past `server_start`. Not a crash: the launch itself was stuck on
+  the lock. The engine now checks the lock's owning PID before launching and removes the three files
+  only if that process is gone (a live lock is left alone), logging `profile_lock_cleared`. Session
+  data is never touched.
 - **Diagnosing a launch that "hangs":** check `tmp/nd-server.log` (structured, one line per
   `server_start`/`nd_started`/`op_err` event - NOT the same as the HTTP process's own redirected
   stdout, which stays empty during a normal lazy-launch wait since nothing calls `print()`). A
@@ -174,8 +191,8 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `closetab` | `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by index OR url-substring; won't close tab 0 or the last tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
 | `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
-| `js` | `{expr}` | `{result}` — evaluate JS in the page |
-| `cookies` | — | `{cookies:[{name,value,domain}]}` |
+| `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
+| `cookies` | — | `{cookies:[{name,value,domain}]}` — the whole browser, incl. cleared `cf_clearance`. Feed these to an HTTP client to download a file the browser cleared for you. |
 | `clearcookies` | — | `{cleared}` |
 | `shutdown` | — | `{ok}` |
 
