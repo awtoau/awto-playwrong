@@ -153,24 +153,48 @@ def register_via_cli(name, entry, scope):
 # ~/.claude.json and the server works in Claude Code — but VSCode's MCP panel reads these files and
 # will show nothing, which reads as "the install failed" when it hasn't. Different schema too:
 # {"servers": {...}} with an explicit "type", not {"mcpServers": {...}}.
-VSCODE_USER_CONFIG = {
-    "Linux": ["~/.config/Code - Insiders/User/mcp.json", "~/.config/Code/User/mcp.json",
-              "~/.config/VSCodium/User/mcp.json"],
-    "Darwin": ["~/Library/Application Support/Code - Insiders/User/mcp.json",
-               "~/Library/Application Support/Code/User/mcp.json"],
-    "Windows": [r"~\AppData\Roaming\Code - Insiders\User\mcp.json",
-                r"~\AppData\Roaming\Code\User\mcp.json"],
+VSCODE_USER_DIRS = {
+    "Linux": ["~/.config/Code - Insiders/User", "~/.config/Code/User", "~/.config/VSCodium/User"],
+    "Darwin": ["~/Library/Application Support/Code - Insiders/User",
+               "~/Library/Application Support/Code/User"],
+    "Windows": [r"~\AppData\Roaming\Code - Insiders\User", r"~\AppData\Roaming\Code\User"],
 }
 
 
+def vscode_profile_names(user_dir):
+    """id -> human name, from VSCode's globalStorage, so we can say "the python profile" rather than
+    "2d9cffbd"."""
+    try:
+        d = json.load(open(os.path.join(user_dir, "globalStorage", "storage.json")))
+        return {p["location"]: p.get("name", p["location"]) for p in d.get("userDataProfiles") or []}
+    except Exception:
+        return {}
+
+
 def vscode_targets(explicit=None):
-    """Every VSCode-family config that already exists (Insiders and stable are separate installs
-    with separate registries, and people run both)."""
+    """Every VSCode MCP config: the default profile's, AND one per named profile.
+
+    **VSCode MCP config is per-profile.** A workspace bound to the "python" profile reads
+    User/profiles/<id>/mcp.json and never looks at User/mcp.json — so registering only at the user
+    level leaves the panel empty in exactly the window you're working in, which is indistinguishable
+    from a broken install. Writing every profile is deliberate: you want the browser available
+    whichever profile a project happens to use.
+    """
     if explicit:
         return [os.path.expanduser(explicit)]
+    import glob
     import platform
-    cands = VSCODE_USER_CONFIG.get(platform.system(), VSCODE_USER_CONFIG["Linux"])
-    return [p for p in (os.path.expanduser(c) for c in cands) if os.path.exists(p)]
+    out = []
+    for d in VSCODE_USER_DIRS.get(platform.system(), VSCODE_USER_DIRS["Linux"]):
+        d = os.path.expanduser(d)
+        if not os.path.isdir(d):
+            continue
+        names = vscode_profile_names(d)
+        out.append((os.path.join(d, "mcp.json"), "default profile"))
+        for p in sorted(glob.glob(os.path.join(d, "profiles", "*", "mcp.json"))):
+            pid = os.path.basename(os.path.dirname(p))
+            out.append((p, f"profile {names.get(pid, pid)!r}"))
+    return out
 
 
 def write_vscode(path, name, entry):
@@ -261,15 +285,20 @@ def main():
     say(json.dumps({"mcpServers": {name: entry}}, indent=2))
 
     if a.vscode:
+        say("\n── VSCode MCP registry (separate from Claude Code's) ───────")
         targets = vscode_targets(None if a.vscode is True else a.vscode)
         if not targets:
-            say("no VSCode mcp.json found. Create one via the Command Palette "
+            say("no VSCode install found. Create a config via the Command Palette "
                 "(\"MCP: Open User Configuration\"), then re-run with --vscode.")
         for t in targets:
-            write_vscode(t, name, entry)
+            path, label = t if isinstance(t, tuple) else (t, "")
+            if write_vscode(path, name, entry):
+                say(f"    ^ {label}")
         if targets:
+            say(f"\nwrote {len(targets)} VSCode config(s) — one per profile, because VSCode MCP "
+                f"config is PER-PROFILE and a workspace only reads its own profile's file.")
             say("VSCode reads mcp.json at startup — reload the window "
-                "(Developer: Reload Window) to see it in the MCP panel.")
+                "(Command Palette -> Developer: Reload Window) to see it in the MCP panel.")
 
     if a.write_config:
         write_config(a.write_config, name, entry)

@@ -59,9 +59,16 @@ They also use different schemas:
 | key | `"mcpServers"` | `"servers"` |
 | entry | `{command, args}` | `{"type": "stdio", command, args}` |
 
-Insiders and stable are separate installs with separate files; people run both. `install.py --vscode`
-writes every VSCode config it finds (with a timestamped backup of each) and preserves the file's
-existing `inputs`/`servers` and indent style:
+**And VSCode's MCP config is PER-PROFILE.** This is the part that wastes an afternoon: if a folder is
+bound to a profile (Settings Profiles — "python", "flutter", …), that window reads
+`User/profiles/<id>/mcp.json` and **never looks at `User/mcp.json`**. Register at the user level only
+and the panel stays empty in exactly the window you're working in — identical symptoms to a broken
+install. The profile ↔ workspace mapping lives in `User/globalStorage/storage.json` under
+`profileAssociations.workspaces`.
+
+Insiders and stable are separate installs with separate files, and people run both. `install.py
+--vscode` writes the default config **and every profile's**, naming each as it goes, with a
+timestamped backup of each, preserving existing `inputs`/`servers` and indent style:
 
 ```sh
 python scripts/install.py --register --vscode      # both registries at once
@@ -180,6 +187,8 @@ None of them need a server started first. If you find yourself writing `ensure_s
 
 | Symptom | Cause / fix |
 |---|---|
+| Tools work in Claude Code but the **VSCode panel is empty** | Two separate registries — see above. Run `install.py --vscode`, then reload the window. |
+| Ran `--vscode`, panel *still* empty | VSCode MCP config is per-profile. The window's profile has its own `mcp.json`; writing only `User/mcp.json` does nothing for it. `--vscode` now writes every profile — re-run it and reload. |
 | Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |
 | Every tool errors with "engine did not bind" | Run `python scripts/doctor.py` — nearly always a missing dep or no Chrome. Full engine output is in `tmp/logs/playwrong-engine.log`. |
 | Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
