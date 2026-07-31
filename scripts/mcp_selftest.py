@@ -1,4 +1,4 @@
-"""mcp_selftest.py — drive mcp/server.py over real stdio JSON-RPC and assert it behaves.
+"""mcp_selftest.py — drive engine/mcp_server.py over real stdio JSON-RPC and assert it behaves.
 
 This is the regression test for the MCP layer AND the thing a new user runs to prove their install
 works end to end (protocol -> engine autostart -> Chrome -> a real page -> tab cleanup).
@@ -52,7 +52,7 @@ class Client:
 
     def __init__(self, port):
         env = {**os.environ, "PH_PORT": str(port)}
-        self.p = subprocess.Popen([sys.executable, os.path.join(REPO, "mcp", "server.py")],
+        self.p = subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "mcp_server.py")],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=open(os.path.join(LOGDIR, "mcp-server-stderr.log"), "a"),
                                   env=env, text=True, bufsize=1)

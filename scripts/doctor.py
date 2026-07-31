@@ -134,7 +134,7 @@ def check_tmp():
 
 
 def check_mcp():
-    f = os.path.join(REPO, "mcp", "server.py")
+    f = os.path.join(REPO, "engine", "mcp_server.py")
     if not os.path.exists(f):
         check("mcp server", "FAIL", f"{f} missing", "re-clone the repo")
         return

@@ -44,7 +44,7 @@ def main(argv=None):
         description="Fetch web pages through a real headed Chrome that beats Cloudflare Turnstile. "
                     "The browser starts itself and stays warm between commands.",
         epilog="Interactive driving (click/key/js/tabs) lives in engine/client.py; the MCP server "
-               "for agents is in mcp/server.py (see docs/MCP.md).")
+               "for agents is in engine/mcp_server.py (see docs/MCP.md).")
     p.add_argument("urls", nargs="*", help="one or more urls to fetch, in order")
     p.add_argument("-s", "--search", metavar="QUERY",
                    help="DuckDuckGo search -> title + url per result (curl gets a CAPTCHA now; a "

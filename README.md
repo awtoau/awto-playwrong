@@ -36,7 +36,7 @@ fetch("https://example.com")   # auto-starts the engine + Chrome, clears Cloudfl
 ```
 
 Also: `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
-No script to write, no API doc to read, no tab bookkeeping. `mcp/server.py` is a stdlib-only proxy in
+No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
 front of the same engine described below — driving it over HTTP still works exactly as before.
 
 ## I just want to view / fetch one web page

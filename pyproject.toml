@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 playwrong = "engine.cli:main"          # playwrong <url> -> the page as text; starts the browser itself
+playwrong-mcp = "engine.mcp_server:main"   # the MCP stdio server, for an installed-package registration
 crawl = "crawl.run:main"
 crawl-report = "crawl.report:main"
 

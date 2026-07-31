@@ -12,7 +12,7 @@ fetch("https://example.com")  ->  "# Example Domain\nURL: https://example.com/\n
 
 That single call starts the HTTP engine if it isn't up, launches Chrome if it isn't up, opens its own
 tab, navigates, detects and clears a Cloudflare Turnstile wall, converts the HTML to readable text,
-**closes its tab**, and returns. Behind it is the same unchanged `engine/server.py` — `mcp/server.py`
+**closes its tab**, and returns. Behind it is the same unchanged `engine/server.py` — `engine/mcp_server.py`
 is a thin JSON-RPC-over-stdio proxy, stdlib only.
 
 ## Install on a fresh machine
@@ -45,6 +45,31 @@ It checks: Python version, the two deps, the vendored nodriver import, a Chrome 
 paths), `DISPLAY`/`WAYLAND_DISPLAY`, a writable `tmp/`, the MCP server compiling, and whether the
 engine port is free or already serving. Exit code 0 = ready.
 
+### VSCode has a SEPARATE registry — this is the #1 "it didn't install" confusion
+
+**Claude Code and VSCode keep entirely different MCP registries.** `claude mcp add` writes
+`~/.claude.json`, and the server genuinely works in Claude Code — but **VSCode's MCP panel will show
+nothing**, which reads as a failed install when the tools are actually running fine.
+
+They also use different schemas:
+
+| | Claude Code | VSCode |
+|---|---|---|
+| file | `~/.claude.json` | `~/.config/Code*/User/mcp.json` (Linux), `~/Library/Application Support/Code*/User/mcp.json` (macOS), `%APPDATA%\Code*\User\mcp.json` (Windows) — or `.vscode/mcp.json` per workspace |
+| key | `"mcpServers"` | `"servers"` |
+| entry | `{command, args}` | `{"type": "stdio", command, args}` |
+
+Insiders and stable are separate installs with separate files; people run both. `install.py --vscode`
+writes every VSCode config it finds (with a timestamped backup of each) and preserves the file's
+existing `inputs`/`servers` and indent style:
+
+```sh
+python scripts/install.py --register --vscode      # both registries at once
+```
+
+VSCode reads `mcp.json` at startup, so **reload the window** (Command Palette → *Developer: Reload
+Window*) before expecting it in the panel. Claude Code likewise picks the server up on restart.
+
 ### Registering by hand
 
 `install.py --register` shells out to `claude mcp add` (scope `user`, so it works in every project),
@@ -60,7 +85,7 @@ python scripts/install.py --print-config
   "mcpServers": {
     "playwrong": {
       "command": "/abs/path/to/.venv/bin/python",
-      "args": ["/abs/path/to/awto-playwrong/mcp/server.py"]
+      "args": ["/abs/path/to/awto-playwrong/engine/mcp_server.py"]
     }
   }
 }
@@ -136,7 +161,7 @@ None of them need a server started first. If you find yourself writing `ensure_s
 - **One implementation of "start it and drive it".** The CLI, the MCP server, and your own scripts
   all go through `connect.py`. When each caller had its own copy, they drifted — and the copies in
   the docs drifted furthest.
-- **Stdlib only.** `mcp/server.py` imports nothing outside the standard library, so it starts
+- **Stdlib only.** `engine/mcp_server.py` imports nothing outside the standard library, so it starts
   instantly and can report a broken *engine* install as a tool error rather than failing to load.
 - **stdout is the wire.** MCP stdio is newline-delimited JSON-RPC on stdin/stdout. Diagnostics go to
   stderr; the spawned engine's output is redirected to `tmp/logs/playwrong-engine.log`. Nothing else

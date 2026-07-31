@@ -1,4 +1,4 @@
-"""mcp/server.py — MCP (stdio) front-end for the playwrong capture engine.
+"""engine/mcp_server.py — MCP (stdio) front-end for the playwrong capture engine.
 
 WHY THIS EXISTS
 An agent that wants one bot-walled page used to have to: read docs/AGENT-API.md, write a script with
@@ -20,7 +20,7 @@ broken engine install as a tool error instead of failing to load.
 PROTOCOL: MCP over stdio = newline-delimited JSON-RPC 2.0 on stdin/stdout. STDOUT IS THE WIRE —
 nothing may print to it except protocol messages (all diagnostics go to stderr, and the engine
 child's output is redirected to tmp/logs/). Run manually with:
-    python mcp/server.py            # then type JSON-RPC lines, or use scripts/mcp_selftest.py
+    python engine/mcp_server.py            # then type JSON-RPC lines, or use scripts/mcp_selftest.py
 """
 import json
 import os

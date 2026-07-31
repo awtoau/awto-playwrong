@@ -22,7 +22,7 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
-SERVER = os.path.join(REPO, "mcp", "server.py")
+SERVER = os.path.join(REPO, "engine", "mcp_server.py")
 REQS = os.path.join(REPO, "requirements-engine.txt")
 _log = []
 
@@ -149,6 +149,56 @@ def register_via_cli(name, entry, scope):
     return r.returncode == 0, out
 
 
+# VSCode has its OWN MCP registry, entirely separate from Claude Code's. `claude mcp add` writes
+# ~/.claude.json and the server works in Claude Code — but VSCode's MCP panel reads these files and
+# will show nothing, which reads as "the install failed" when it hasn't. Different schema too:
+# {"servers": {...}} with an explicit "type", not {"mcpServers": {...}}.
+VSCODE_USER_CONFIG = {
+    "Linux": ["~/.config/Code - Insiders/User/mcp.json", "~/.config/Code/User/mcp.json",
+              "~/.config/VSCodium/User/mcp.json"],
+    "Darwin": ["~/Library/Application Support/Code - Insiders/User/mcp.json",
+               "~/Library/Application Support/Code/User/mcp.json"],
+    "Windows": [r"~\AppData\Roaming\Code - Insiders\User\mcp.json",
+                r"~\AppData\Roaming\Code\User\mcp.json"],
+}
+
+
+def vscode_targets(explicit=None):
+    """Every VSCode-family config that already exists (Insiders and stable are separate installs
+    with separate registries, and people run both)."""
+    if explicit:
+        return [os.path.expanduser(explicit)]
+    import platform
+    cands = VSCODE_USER_CONFIG.get(platform.system(), VSCODE_USER_CONFIG["Linux"])
+    return [p for p in (os.path.expanduser(c) for c in cands) if os.path.exists(p)]
+
+
+def write_vscode(path, name, entry):
+    """Merge into a VSCode mcp.json, preserving its existing inputs/servers and indent style."""
+    data, indent = {}, "\t"
+    if os.path.exists(path):
+        raw = open(path).read()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = f"{path}.bak-{stamp}"
+        shutil.copy2(path, backup)
+        say(f"backed up {path} -> {backup}")
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except ValueError as e:
+            say(f"refusing to write: {path} is not valid JSON ({e})")
+            return False
+        for line in raw.splitlines():          # keep whatever indent the file already uses
+            if line[:1] in (" ", "\t"):
+                indent = "  " if line[0] == " " else "\t"
+                break
+    data.setdefault("servers", {})[name] = {"type": "stdio", **entry}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=indent)
+        f.write("\n")
+    say(f"wrote {name} into {path}")
+    return True
+
+
 def write_config(path, name, entry):
     """Fallback: merge the entry into a client's JSON config, keeping a timestamped backup."""
     path = os.path.expanduser(path)
@@ -176,6 +226,10 @@ def main():
     ap.add_argument("--register", action="store_true", help="register with Claude Code")
     ap.add_argument("--link", nargs="?", const="~/.local/bin", metavar="DIR",
                     help="symlink the `playwrong` command onto PATH (default ~/.local/bin)")
+    ap.add_argument("--vscode", nargs="?", const=True, metavar="PATH",
+                    help="also register in VSCode's OWN mcp.json (its MCP panel is a separate "
+                         "registry from Claude Code's — a server registered only with `claude mcp "
+                         "add` will not appear there). Defaults to every VSCode config found.")
     ap.add_argument("--scope", default="user", choices=["local", "user", "project"],
                     help="claude mcp scope (default user = available in every project)")
     ap.add_argument("--name", default="playwrong", help="MCP server name (tools appear as "
@@ -205,6 +259,17 @@ def main():
 
     say("\n── MCP registration ────────────────────────────────────────")
     say(json.dumps({"mcpServers": {name: entry}}, indent=2))
+
+    if a.vscode:
+        targets = vscode_targets(None if a.vscode is True else a.vscode)
+        if not targets:
+            say("no VSCode mcp.json found. Create one via the Command Palette "
+                "(\"MCP: Open User Configuration\"), then re-run with --vscode.")
+        for t in targets:
+            write_vscode(t, name, entry)
+        if targets:
+            say("VSCode reads mcp.json at startup — reload the window "
+                "(Developer: Reload Window) to see it in the MCP panel.")
 
     if a.write_config:
         write_config(a.write_config, name, entry)
