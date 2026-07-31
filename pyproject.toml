@@ -7,19 +7,30 @@ name = "awto-playwrong"
 version = "0.1.0"
 description = "Turnstile-beating browser-capture engine + a reusable, ref-free crawl library (content-addressed store, SQLAlchemy DB, reference-graph reports)."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 license = "MIT"
 keywords = ["crawler", "browser-automation", "cloudflare", "turnstile", "nodriver", "scraping"]
 
-# Runtime deps. All PURE-PYTHON so the package runs on free-threaded (no-GIL) CPython 3.14t without
-# re-enabling the GIL — SQLAlchemy's C extension (cyextension) and psycopg's C/binary impl both do,
-# so they are pinned to the pure-Python forms. See "Install" in README.md.
+# BASE deps = what it takes to drive a browser, and nothing else. Two packages.
+#
+# `nodriver` is deliberately NOT listed. A patched copy is vendored (see [tool.hatch] below) because
+# upstream 0.50.x fails to import on CPython 3.14; declaring the dependency made pip install the
+# BROKEN copy into site-packages, where it shadowed the vendored one and killed the engine on its
+# first run. These two are nodriver's own runtime requirements, which the vendored copy still needs.
 dependencies = [
+    "websockets>=12",      # nodriver's CDP websocket transport
+    "Deprecated>=1.2",     # imported by nodriver's generated cdp/* modules
+]
+
+# The crawl/ LIBRARY's deps. Optional, because `pip install awto-playwrong` to fetch a page should
+# not drag in three database drivers. All PURE-PYTHON so it runs on free-threaded (no-GIL) CPython
+# without re-enabling the GIL — SQLAlchemy's cyextension and psycopg's C/binary impl both do.
+[project.optional-dependencies]
+crawl = [
     "sqlalchemy>=2.0",     # DB layer — MUST be the pure-Python build (see [tool.uv] + README)
     "psycopg>=3.1",        # Postgres driver, pure-Python impl (NOT psycopg[binary]/[c])
     "pymysql>=1.1",        # MySQL/MariaDB driver, pure-Python
     "zstandard>=0.22",     # page-store compression
-    "nodriver>=0.50",      # raw-CDP Chrome (patched copy vendored — see [tool.hatch] below)
 ]
 
 [project.scripts]

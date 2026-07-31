@@ -31,7 +31,27 @@ import zlib
 from html.parser import HTMLParser
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOGDIR = os.path.join(REPO, "tmp", "logs")
+
+
+def data_dir():
+    """Scratch/log directory. The checkout's tmp/ when that is genuinely ours, otherwise an XDG cache
+    dir — an installed package must not write into site-packages (the old unconditional REPO/tmp did
+    exactly that, and the engine log landed in site-packages/tmp/logs/)."""
+    cand = os.path.join(REPO, "tmp")
+    if "site-packages" not in cand and "dist-packages" not in cand:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            pass
+    d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "playwrong")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+DATA = data_dir()
+LOGDIR = os.path.join(DATA, "logs")
 SERVER_LOG = os.path.join(LOGDIR, "playwrong-engine.log")
 
 
@@ -296,7 +316,13 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
         idx = call("newtab", port=port, url="about:blank").get("index", -1)
         final_url, out = None, {}
         try:
-            call("goto", port=port, url=url, timeout=90.0)
+            landed = call("goto", port=port, url=url, timeout=90.0)
+            # Chrome's first-run/profile page can occupy a brand-new tab, so the navigation lands
+            # somewhere internal and we would return THAT page's text as if it were the url asked
+            # for — a silently wrong answer, seen once on the very first launch of a fresh profile.
+            # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
+            if str(landed.get("url", "")).startswith(("chrome://", "about:")):
+                call("goto", port=port, url=url, timeout=90.0)
             page = _settled_text(port)
             challenge = None
             if solve and is_challenge(page):
@@ -347,6 +373,8 @@ DDG_LITE = "https://lite.duckduckgo.com/lite/?q={}"
 # DDG wraps every result in a redirector: //duckduckgo.com/l/?uddg=<urlencoded real url>&rut=...
 _RESULT = re.compile(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', re.S | re.I)
 _TAGS = re.compile(r"<[^>]+>")
+# DDG's anomaly/CAPTCHA page, which a real browser also gets under rapid repeat querying.
+DDG_BLOCKED = re.compile(r"bots use DuckDuckGo too|squares containing|anomaly", re.I)
 
 
 def parse_ddg(html):
@@ -384,7 +412,14 @@ def search(query, max_results=20, port=None, on_start=None, profile=None):
     """
     page = capture(DDG_LITE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
                    port=port, on_start=on_start, profile=profile)
-    return parse_ddg(page["text"])[:max_results]
+    hits = parse_ddg(page["text"])[:max_results]
+    if not hits and DDG_BLOCKED.search(page["text"] or ""):
+        # Distinguish "they challenged us" from "their markup changed". Even a real browser gets the
+        # anomaly page under rapid repeat querying, and it is transient — blaming the parser sends
+        # you off debugging code that is fine.
+        raise EngineError("DuckDuckGo served an anti-bot challenge instead of results (usually rate "
+                          "limiting from rapid repeat queries) — retry in a minute")
+    return hits
 
 
 # ── downloads: PDFs and other files behind a bot wall ───────────────────────────────────────────
@@ -461,8 +496,7 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
         raise EngineError(f"download failed: {e}") from e
     if path is None:
         name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
-        os.makedirs(os.path.join(REPO, "tmp"), exist_ok=True)
-        path = os.path.join(REPO, "tmp", name)
+        path = os.path.join(DATA, name)
     with open(path, "wb") as f:
         f.write(data)
     return {"path": path, "bytes": len(data), "content_type": ctype}

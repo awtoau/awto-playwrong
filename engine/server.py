@@ -24,9 +24,27 @@ import traceback
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vendor"))
-import nodriver as uc
-from nodriver import cdp
+
+def _use_vendored_nodriver():
+    """Put the PATCHED nodriver first on sys.path, in a checkout AND in an installed package.
+
+    Upstream nodriver 0.50.x has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on
+    import under CPython 3.14+. The fixed copy lives at `vendor/nodriver` in a source checkout and
+    ships to `crawl/_vendor/nodriver` in the wheel. Looking only at `../vendor` (as this did) meant
+    an INSTALLED playwrong found no vendored copy, imported the broken PyPI one, and died on its
+    first run with exactly that SyntaxError — the landmine the README warns about, in the one place
+    a user cannot fix it themselves."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "vendor"),                  # source checkout
+                 os.path.join(os.path.dirname(here), "crawl", "_vendor")):   # installed wheel
+        if os.path.isdir(os.path.join(cand, "nodriver")):
+            sys.path.insert(0, cand)
+            return
+
+
+_use_vendored_nodriver()
+import nodriver as uc  # noqa: E402
+from nodriver import cdp  # noqa: E402
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
 
@@ -56,8 +74,26 @@ def profile_dir():
 
 
 PROFILE_DIR = profile_dir()
-TMP = os.path.join(os.path.dirname(__file__), "..", "tmp")
-os.makedirs(TMP, exist_ok=True)                 # ensure tmp/ exists on a fresh checkout
+
+
+def data_dir():
+    """Scratch/log directory: the checkout's tmp/ when that is really ours to write to, otherwise an
+    XDG cache dir. An INSTALLED package must never write into site-packages — which is exactly what
+    the old unconditional `../tmp` did, creating site-packages/tmp/logs/."""
+    cand = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp"))
+    if "site-packages" not in cand and "dist-packages" not in cand:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            pass
+    d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "playwrong")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+TMP = data_dir()
 LOG = os.path.join(TMP, "nd-server.log")
 CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
