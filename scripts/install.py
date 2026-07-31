@@ -106,6 +106,33 @@ def install_deps():
     return False
 
 
+def link_cli(dest_dir=None):
+    """Symlink the `playwrong` command onto PATH. A symlink (not a copy) so a git pull updates the
+    command too; the shim resolves its own realpath to find the repo, so it works from anywhere."""
+    src = os.path.join(REPO, "playwrong")
+    dest_dir = os.path.expanduser(dest_dir or "~/.local/bin")
+    dest = os.path.join(dest_dir, "playwrong")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        os.chmod(src, 0o755)
+        if os.path.islink(dest) or os.path.exists(dest):
+            if os.path.realpath(dest) == os.path.realpath(src):
+                say(f"already linked: {dest}")
+                return True
+            say(f"refusing to overwrite existing {dest} (points at {os.path.realpath(dest)})")
+            return False
+        os.symlink(src, dest)
+        say(f"linked {dest} -> {src}")
+    except OSError as e:
+        say(f"could not link into {dest_dir}: {e}")
+        return False
+    if dest_dir not in (os.environ.get("PATH") or "").split(os.pathsep):
+        say(f"NOTE: {dest_dir} is not on your PATH — add it, or run {src} directly")
+    else:
+        say("try it:  playwrong https://example.com")
+    return True
+
+
 def register_via_cli(name, entry, scope):
     claude = shutil.which("claude")
     if not claude:
@@ -147,6 +174,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deps", action="store_true", help="install runtime deps")
     ap.add_argument("--register", action="store_true", help="register with Claude Code")
+    ap.add_argument("--link", nargs="?", const="~/.local/bin", metavar="DIR",
+                    help="symlink the `playwrong` command onto PATH (default ~/.local/bin)")
     ap.add_argument("--scope", default="user", choices=["local", "user", "project"],
                     help="claude mcp scope (default user = available in every project)")
     ap.add_argument("--name", default="playwrong", help="MCP server name (tools appear as "
@@ -169,6 +198,9 @@ def main():
 
     if a.deps:
         install_deps()
+    if a.link:
+        say("\n── playwrong command ───────────────────────────────────────")
+        link_cli(a.link)
     healthy = run_doctor()
 
     say("\n── MCP registration ────────────────────────────────────────")

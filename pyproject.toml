@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
+playwrong = "engine.cli:main"          # playwrong <url> -> the page as text; starts the browser itself
 crawl = "crawl.run:main"
 crawl-report = "crawl.report:main"
 
@@ -35,7 +36,7 @@ Homepage = "https://github.com/awtoau/awto-playwrong"
 # package (crawl/_vendor/nodriver) and prepend it to sys.path at import time (see crawl/__init__.py),
 # so a tool install carries the fix and no consumer PYTHONPATH juggling is needed.
 [tool.hatch.build.targets.wheel]
-packages = ["crawl", "assets"]
+packages = ["crawl", "assets", "engine"]   # engine ships too: it provides the `playwrong` command
 
 [tool.hatch.build.targets.wheel.force-include]
 "vendor/nodriver" = "crawl/_vendor/nodriver"

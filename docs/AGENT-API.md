@@ -1,13 +1,21 @@
 # Agent API — connect to awto-playwrong (and start it if needed)
 
-> **If you are an agent, you probably want [MCP.md](MCP.md) instead.** Registering the MCP server
-> once puts these ops in your tool list already described and auto-starting, and collapses the whole
-> goto → detect → solve → text → close-tab sequence below into one `fetch` call. This page is the raw
-> HTTP contract — read it when you're building something that isn't an MCP client, or when you need a
-> verb the MCP layer doesn't expose.
+> **Before writing any of the code below, check whether you need to.** The
+> goto → detect → solve → text → close-tab sequence on this page is already implemented:
+>
+> - **agent** → the MCP tools, [MCP.md](MCP.md): `fetch{url}` and you're done.
+> - **shell** → `./playwrong <url>` — starts everything itself, prints the page as text.
+> - **python** → `from engine import connect; connect.capture(url)` — same code path as both of the
+>   above.
+>
+> None of them need a server started first, and none need `PYTHONPATH` (server.py puts `vendor/` on
+> `sys.path` itself — snippets that export it are copying a step that hasn't been required in a long
+> time). This page is the raw HTTP contract: read it when you're building something that is none of
+> the above, or need a verb those layers don't expose.
 
 How an app or agent uses the shared capture engine: it's an **HTTP server on a port**; you POST ops
-and get JSON back. If the server isn't running, start it first. No SDK needed — plain HTTP.
+and get JSON back. No SDK needed — plain HTTP. If the server isn't running, `connect.ensure()` (or
+any of the three entry points above) starts it; starting it by hand is a fallback, not the workflow.
 
 ## TL;DR
 ```
@@ -35,7 +43,19 @@ off guard before. If you just want the browser up and ready before doing anythin
 about what to poll for.
 
 ## Connect, auto-starting the server if needed
-The pattern: ping `/status`; if it's not reachable, launch `engine/server.py` and wait for the port.
+
+**This is now `engine/connect.py` — import it instead of copying the snippet:**
+
+```python
+from engine import connect
+connect.ensure()                                  # engine + Chrome up, idempotent
+page = connect.call("text")                       # or connect.op("text"), which ensures first
+whole = connect.capture("https://example.com")    # own tab, solve, extract, close  <- usually this
+```
+
+The snippet below is kept as documentation of what `ensure()` does, for non-Python callers. Note it
+does **not** need `PYTHONPATH` — that line has been redundant since `server.py` started inserting
+`vendor/` into `sys.path` itself.
 
 ```python
 import os, sys, json, time, subprocess, urllib.request
@@ -55,7 +75,7 @@ def ensure_server():
     and does not need to: up() checks reachability only, never the "alive" field."""
     if up(): return
     subprocess.Popen([sys.executable, f"{REPO}/engine/server.py"],
-                     env={**os.environ, "PYTHONPATH": f"{REPO}/vendor", "PH_PORT": str(PORT)},
+                     env={**os.environ, "PH_PORT": str(PORT)},   # no PYTHONPATH needed
                      stdout=open(os.path.join(REPO, "tmp", "playwrong-server.log"), "a"),
                      stderr=subprocess.STDOUT)
     for _ in range(60):                 # wait up to ~30s for the HTTP server to bind
@@ -84,8 +104,8 @@ shot = call("shot")["b64"]                         # base64 PNG
 Shell equivalent (the bundled client):
 ```
 REPO_ROOT="$(pwd)"  # set to your local checkout root if needed
-PYTHONPATH="$REPO_ROOT/vendor" \
-  python "$REPO_ROOT/engine/server.py" &     # start (headed real Chrome)
+# no need to start the server: every client verb below starts it (and Chrome) if they're down
+"$REPO_ROOT/playwrong" https://example.com      # one page, as text
 python "$REPO_ROOT/engine/client.py" goto https://example.com
 python .../engine/client.py solvecf      # solve Turnstile
 python .../engine/client.py text         # html

@@ -1,4 +1,13 @@
-"""drive.py — the LOGIC side. Sends primitives to the always-running server (start_server.py).
+"""client.py — the interactive CLI. Sends primitives to the shared engine, starting it if it's down.
+
+For "just give me this page", use the `playwrong` command instead (engine/cli.py):
+    ./playwrong https://awto.au
+This file is for DRIVING a page: click, key, js, tabs, marker injection, vision detection.
+
+Nothing here needs a server started by hand, and no PYTHONPATH is needed.
+
+--- original notes ---
+drive.py — the LOGIC side. Sends primitives to the always-running server (start_server.py).
 
 This file changes as much as we like; the SERVER (and its alive browser + Turnstile clearance)
 never restarts. The server is a dumb executor — drive.py decides what to do.
@@ -6,17 +15,27 @@ never restarts. The server is a dumb executor — drive.py decides what to do.
 Primitives: goto/move/click/key/text/shot/js  (see start_server.py).
 
 CLI:
-  drive.py status
-  drive.py goto <url>
-  drive.py move <x> <y>            # CDP synthetic move — no real-cursor jump
-  drive.py click <x> <y>
-  drive.py shot [path]             # returns b64; saves png to tmp/shot.png (for Ollama/testing)
-  drive.py text                    # current page html length + title
-  drive.py passed                  # is the current page past Turnstile?
+  client.py status                 # engine/browser state (the one verb that won't auto-start)
+  client.py goto <url>
+  client.py read [--links]         # current page as readable text
+  client.py js <expr>              # evaluate in the page
+  client.py move <x> <y>           # CDP synthetic move — no real-cursor jump
+  client.py click <x> <y>
+  client.py key <key>
+  client.py shot [path]            # returns b64; saves png to tmp/shot.png (for Ollama/testing)
+  client.py text                   # current page html length + title
+  client.py passed                 # is the current page past Turnstile?
+  client.py solvecf [tries]        # clear a Turnstile challenge
+  client.py cookies
+  client.py tabs | closetab [i] | closeextra     # tab hygiene — close what you opened
+  client.py newtab | clearcookies
+  client.py shutdown               # stops the SHARED engine, for everyone
 """
 import os, sys, json, base64, urllib.request
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from engine import connect
 
-PORT = int(os.environ.get("PH_PORT","8731")); BASE=f"http://127.0.0.1:{PORT}"
+PORT = connect.default_port(); BASE = connect.base_url()
 
 
 def rightmon_bounds():
@@ -27,12 +46,16 @@ def rightmon_bounds():
     except Exception:
         return {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"}
 
+def _note(m): print(f"… {m}", file=sys.stderr, flush=True)
+
 def call(op, **a):
+    """Send one primitive. Every verb AUTO-STARTS the engine and Chrome if they are down — there is
+    no "start the server first" step any more, and no PYTHONPATH to set (server.py puts vendor/ on
+    sys.path itself). `status` deliberately does not auto-start: its job is to report what is true."""
     if op=="status":
-        return json.loads(urllib.request.urlopen(BASE+"/status",timeout=120).read())
-    req=urllib.request.Request(BASE+"/"+op, data=json.dumps(a).encode(),
-                               headers={"Content-Type":"application/json"}, method="POST")
-    return json.loads(urllib.request.urlopen(req,timeout=120).read())
+        if not connect.reachable(): return {"server":False,"alive":False,"port":PORT}
+        return connect.call("status", method="GET")
+    return connect.op(op, on_start=_note, **a)
 
 def save_shot(path="tmp/shot.png"):
     r=call("shot"); open(path,"wb").write(base64.b64decode(r["b64"]))
@@ -126,15 +149,25 @@ def main(av):
     elif op=="passed": print("PASSED" if is_passed() else "BLOCKED (challenge)")
     elif op=="clearcookies": print(call("clearcookies"))
     elif op=="newtab": print(call("newtab"))
+    # js/tabs/closetab/closeextra were reachable over the port but had no CLI branch, so they came
+    # back as "unknown: js" — the ops existed, the dispatch just never listed them.
+    elif op=="js": print(json.dumps(call("js", expr=av[1])["result"], indent=2, default=str))
+    elif op=="read":
+        t=call("text"); print(connect.render(t, "text+links" if "--links" in av else "text", 0))
+    elif op=="tabs": print(json.dumps(call("tabs"), indent=2))
+    elif op=="closetab": print(call("closetab", index=int(av[1]) if len(av)>1 else None))
+    elif op=="closeextra": print(call("closeextra"))
+    elif op=="cookies": print(json.dumps(call("cookies")["cookies"], indent=2))
     elif op=="inject": inject_marker(int(av[1]), int(av[2]))
     elif op=="detect": detect()
     elif op=="solvecf": print(call("solve", tries=int(av[1]) if len(av)>1 else 30))
     elif op=="rightmon":
         # Set PH_RIGHTMON_BOUNDS=x,y,w,h if you want a specific placement.
         bounds = rightmon_bounds()
-        wid=call("cdp",method="Browser.getWindowForTarget",params={})["result"]["windowId"]
-        print(call("cdp",method="Browser.setWindowBounds",
-                   params={"windowId":wid,"bounds":bounds}))
+        # body= because these payload keys ("method"/"params") collide with call()'s own parameters
+        wid=call("cdp",body={"method":"Browser.getWindowForTarget","params":{}})["result"]["windowId"]
+        print(call("cdp",body={"method":"Browser.setWindowBounds",
+                               "params":{"windowId":wid,"bounds":bounds}}))
         print("real page positioned. Open viz at: http://127.0.0.1:8731/viz")
     elif op=="solve": solve(av[1], int(av[2]) if len(av)>2 else 5)
     elif op=="shutdown":

@@ -12,9 +12,9 @@ Turnstile on a real site and recovered thousands of bot-blocked pages).
 
 ```sh
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
-python3 -m venv .venv                                   # optional but recommended
-.venv/bin/python scripts/install.py --deps --register    # deps + register the MCP server
-.venv/bin/python scripts/mcp_selftest.py                # prove it works (28 assertions)
+python3 -m venv .venv                                            # optional but recommended
+.venv/bin/python scripts/install.py --deps --link --register      # deps, `playwrong` on PATH, MCP
+.venv/bin/python scripts/mcp_selftest.py                         # prove it works (28 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
@@ -41,21 +41,44 @@ front of the same engine described below — driving it over HTTP still works ex
 
 ## I just want to view / fetch one web page
 
-Start the browser server once, then grab a page — even one behind Cloudflare:
-
 ```sh
-PYTHONPATH=vendor python engine/server.py &          # starts a real headed Chrome (default port 8731)
-
-python engine/client.py goto https://example.com     # navigate
-python engine/client.py text                          # print the page HTML
-python engine/client.py shot page.png                 # save a screenshot
-python engine/client.py solvecf                        # if it hit a Cloudflare "verify you're human" wall
+./playwrong https://awto.au
 ```
 
-Or one HTTP call from anything: `curl -s localhost:8731/goto -d '{"url":"https://example.com"}'` →
-returns `{html, title, status, cookies, screenshot, …}`. The browser stays alive between calls, so the
-next `goto` reuses the same (Turnstile-cleared) session. That's the whole "view a page" story — the
-rest of this README is for crawling many pages.
+That's it. There is **nothing to start first** — no server to launch, no `PYTHONPATH`, no port to
+pick. The first command starts the engine and a real headed Chrome; the page comes back as readable
+text.
+
+```sh
+./playwrong https://a.com https://b.com   # several urls, reusing the same warm browser
+./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
+./playwrong https://awto.au --html        # raw markup instead of text
+./playwrong https://awto.au --shot p.png  # also save a screenshot
+./playwrong https://awto.au --json        # {text,title,url,challenge} for scripting
+./playwrong --status                      # what's running
+./playwrong --stop                        # stop the shared engine
+```
+
+**You never manage a host:port.** The engine is a long-lived local server on a fixed default port
+(`PH_PORT`, 8731). The first command starts it; every later command finds it already up and reuses
+it — same browser, same cookies, same cleared Turnstile session, no cold start (~3s cold, ~2s warm).
+Fire one command per url whenever you like and they compound. `--port` is only for deliberately
+running a *second*, isolated browser.
+
+`scripts/install.py --link` puts `playwrong` on your PATH so you can drop the `./`.
+
+### Driving a page, not just reading it
+`engine/client.py` has the interactive verbs — `goto`, `click`, `key`, `js`, `shot`, `tabs`,
+`solvecf`. It auto-starts the engine too:
+
+```sh
+python engine/client.py goto https://example.com
+python engine/client.py js "document.title"
+python engine/client.py shot page.png
+```
+
+Or POST directly to the port from anything: `curl -s localhost:8731/goto -d '{"url":"..."}'`. The
+browser stays alive between calls. The rest of this README is for crawling many pages.
 
 ## Why this exists
 Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**
@@ -73,7 +96,11 @@ data layer on top (the project keeps its DB code; this stays generic).
 - `engine/server.py` — persistent **headed real Chrome** (nodriver), driven over HTTP on a port.
   Ops: `goto`, `solve` (Turnstile), `text` (html), `shot` (screenshot, base64). Stable, browser
   stays alive across requests; clean shutdown over the port.
-- `engine/client.py` — the port client (`goto/solve/shot/text/...`).
+- `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
+  html→text. Every entry point (CLI, MCP server, your scripts) goes through it, so "how do I start
+  this thing" has exactly one answer and callers stop reimplementing it.
+- `engine/cli.py` + `./playwrong` — the one-shot command: url in, readable page out.
+- `engine/client.py` — the interactive port client (`goto/click/key/js/shot/tabs/...`).
 - `engine/solve.py` — standalone Turnstile solve (find "verify you are human" inside the cross-origin
   iframe + click).
 - `vendor/nodriver` — patched nodriver 0.50.3 (fixes a non-UTF-8 byte in `cdp/network.py` line ~1345
@@ -91,15 +118,21 @@ data layer on top (the project keeps its DB code; this stays generic).
 
 ## Usage (engine)
 ```
-# 1. start the server (headed real Chrome, stays alive)
-PYTHONPATH=vendor python engine/server.py        # listens on PH_PORT (default 8731)
-
-# 2. drive it over the port (from any app/agent/script)
+# there is no step 1 — every entry point starts the engine and Chrome if they're down
+./playwrong https://example.com                  # one page as text
 python engine/client.py goto https://example.com
 python engine/client.py solvecf                  # clear a Turnstile challenge
 python engine/client.py text                     # get the page HTML
 python engine/client.py shot frame.png           # screenshot
 ```
+From your own Python, use the same code path the CLI and the MCP server use:
+```python
+from engine import connect
+page = connect.capture("https://example.com")    # starts engine+Chrome, solves, closes its tab
+print(page["text"])
+```
+Launching `engine/server.py` by hand still works if you want it in the foreground — and it needs no
+`PYTHONPATH`, since it puts `vendor/` on `sys.path` itself.
 Or POST directly: `POST http://127.0.0.1:8731/goto {"url": "..."}` → returns the capture.
 
 ## The capture contract (what you get back)

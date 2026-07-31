@@ -99,11 +99,30 @@ you can navigate without a second round-trip), or `html` (raw source, when you n
 puts ~5KB of readable content in the agent's context instead, which is the difference between "one
 page" and "one page and no room to think about it". Ask for `html` when you actually need markup.
 
+## The same thing, without an agent
+
+The MCP tools are one of three front doors onto `engine/connect.py`. Same code path, same auto-start,
+same cleanup:
+
+```sh
+./playwrong https://awto.au              # shell
+```
+```python
+from engine import connect               # python
+print(connect.capture("https://awto.au")["text"])
+```
+
+None of them need a server started first. If you find yourself writing `ensure_server()` or exporting
+`PYTHONPATH=vendor`, you're reimplementing `connect.ensure()`.
+
 ## Design notes
 
-- **Thin proxy, not a rewrite.** Every tool is one or a few HTTP POSTs to `engine/server.py`. The
-  engine, its verbs, and `engine/client.py` are unchanged and still work; see
-  [AGENT-API.md](AGENT-API.md) for the HTTP contract if you're building something that isn't an agent.
+- **Thin proxy, not a rewrite.** Tools are shims over `engine/connect.py`, which POSTs to the
+  unchanged `engine/server.py`. The engine's verbs and `engine/client.py` still work exactly as
+  before; see [AGENT-API.md](AGENT-API.md) for the HTTP contract.
+- **One implementation of "start it and drive it".** The CLI, the MCP server, and your own scripts
+  all go through `connect.py`. When each caller had its own copy, they drifted — and the copies in
+  the docs drifted furthest.
 - **Stdlib only.** `mcp/server.py` imports nothing outside the standard library, so it starts
   instantly and can report a broken *engine* install as a tool error rather than failing to load.
 - **stdout is the wire.** MCP stdio is newline-delimited JSON-RPC on stdin/stdout. Diagnostics go to

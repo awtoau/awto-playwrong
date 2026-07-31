@@ -161,6 +161,22 @@ class ND:
             out.append({"index":i,"url":getattr(ti,"url","") or "",
                         "title":getattr(ti,"title","") or "","active":(t is self.tab)})
         return {"tabs":out,"count":len(out)}
+    async def _await_closed(self, ids):
+        """Wait until Chrome has actually destroyed the targets we asked it to close.
+
+        close_target is acknowledged immediately but the target is torn down asynchronously, so a
+        refresh taken right after the call still lists the tab — which made "remaining" report a
+        phantom leak on a tab that closed perfectly well. Observed teardown is single-digit ms; poll
+        at 50ms and give up after 2s, at which point the tab really is stuck and the honest answer is
+        to report it still open."""
+        if not ids: return
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while asyncio.get_event_loop().time() < deadline:
+            await self._refresh()
+            live = {getattr(getattr(t,"target",None),"target_id",None) for t in self.browser.tabs}
+            if not (ids & live): return
+            await asyncio.sleep(0.05)
+        log("close_timeout", ids=",".join(str(i) for i in ids))
     async def _closetab(self, index=None, url=None, keep_first=True):
         """Close a tab by index OR by url-substring match. keep_first protects tab 0 (the server's base
         tab). Never closes the last remaining tab. Returns how many were closed. This is how agents
@@ -171,18 +187,20 @@ class ND:
         targets=[]
         for i, t in enumerate(tabs):
             if keep_first and i==0: continue
+            # t.url does not exist on a nodriver Tab, so the documented url-substring form matched
+            # NOTHING before this; the url lives on the target info.
+            turl = getattr(getattr(t,"target",None),"url","") or ""
             if index is not None and i==index: targets.append((i,t))
-            elif url is not None and url in (getattr(t,"url","") or ""): targets.append((i,t))
-        closed=0
+            elif url is not None and url in turl: targets.append((i,t))
+        closed=0; ids=set()
         for i, t in targets:
             try:
+                tid = getattr(getattr(t,"target",None),"target_id",None)
                 await t.close()
-                closed+=1
-                if t is self.tab:   # if we closed the active tab, fall back to the base tab
-                    self.tab=self.browser.tabs[0] if self.browser.tabs else None
+                closed+=1; ids.add(tid)
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
-        await self._refresh()          # so "remaining" is the truth, not the pre-close cache
+        await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
         if self.tab not in self.browser.tabs:
             self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":closed,"remaining":len(self.browser.tabs)}
@@ -190,11 +208,13 @@ class ND:
         """Close ALL tabs except the base tab (index 0) — the panic 'clean up leaked tabs' button. Use
         after a crashed/aborted crawl left orphan tabs. Never touches the server process."""
         await self._ensure(); await self._refresh()
-        n=0
+        n=0; ids=set()
         for t in list(self.browser.tabs)[1:]:
-            try: await t.close(); n+=1
+            try:
+                ids.add(getattr(getattr(t,"target",None),"target_id",None))
+                await t.close(); n+=1
             except Exception: pass
-        await self._refresh()
+        await self._await_closed(ids)
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":n,"remaining":len(self.browser.tabs)}
     async def _js(self, expr):

@@ -22,34 +22,21 @@ nothing may print to it except protocol messages (all diagnostics go to stderr, 
 child's output is redirected to tmp/logs/). Run manually with:
     python mcp/server.py            # then type JSON-RPC lines, or use scripts/mcp_selftest.py
 """
-import base64
-import html as htmllib
 import json
 import os
-import subprocess
 import sys
-import threading
-import time
-import urllib.error
-import urllib.request
-from html.parser import HTMLParser
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORT = int(os.environ.get("PH_PORT", "8731"))
-BASE = f"http://127.0.0.1:{PORT}"
-LOGDIR = os.path.join(REPO, "tmp", "logs")
-SERVER_LOG = os.path.join(LOGDIR, "playwrong-engine.log")
+sys.path.insert(0, REPO)
+from engine import connect                                                    # noqa: E402
+from engine.connect import EngineError, call, capture, render, is_challenge   # noqa: E402
+
+PORT = connect.default_port()
 NAME, VERSION = "playwrong", "0.1.0"
 
 # Newest protocol revision we implement. If the client asks for a different one we echo THEIRS back
 # (the spec's negotiation rule) — every revision so far is wire-compatible for tools-only servers.
 PROTOCOL = "2025-06-18"
-
-# One capture = several engine ops (newtab -> goto -> text -> solve -> text -> closetab) and the
-# engine has ONE globally-active tab, so two interleaved captures would steal each other's tab. This
-# lock serialises captures within this process. Across processes (two agents, two MCP servers, one
-# engine) it does not help — run separate PH_PORTs, or attach via /cdp. See docs/MCP.md.
-_capture_lock = threading.Lock()
 
 
 def elog(*a):
@@ -57,327 +44,91 @@ def elog(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-# ── engine transport ────────────────────────────────────────────────────────────────────────────
-
-class EngineError(RuntimeError):
-    pass
-
-
-def _reachable(timeout=2.0):
-    """Is the engine's HTTP process answering? Deliberately checks reachability ONLY, never the
-    `alive` field — `alive` (Chrome launched) stays false until a real op asks for a browser, so
-    polling it in a loop waits forever. See docs/AGENT-API.md."""
-    try:
-        urllib.request.urlopen(f"{BASE}/status", timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
-def _spawn_engine():
-    """Start engine/server.py as a detached child. Its stdout+stderr go to a log file, never to our
-    stdout (which is the MCP wire)."""
-    os.makedirs(LOGDIR, exist_ok=True)
-    env = {**os.environ, "PYTHONPATH": os.path.join(REPO, "vendor"), "PH_PORT": str(PORT)}
-    out = open(SERVER_LOG, "a")
-    subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
-                     env=env, stdout=out, stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True)
-    elog(f"[{NAME}] spawned engine on :{PORT} (log: {SERVER_LOG})")
-
-
-def ensure_engine(want_browser=True):
-    """Guarantee an engine on PORT, and (by default) a launched Chrome behind it.
-
-    Two separate waits, for two separate things:
-      1. the HTTP process binding the port — no browser involved, just a Python import + bind, so a
-         20s ceiling is generous; polled every 0.25s to keep first-call latency low.
-      2. Chrome actually launching — done by POSTing /start, which BLOCKS until the browser is up, so
-         there is nothing to poll. Cold Chrome start is the slow part; 120s ceiling.
-    """
-    if not _reachable():
-        _spawn_engine()
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:
-            if _reachable(timeout=1.0):
-                break
-            time.sleep(0.25)
-        else:
-            raise EngineError(
-                f"engine did not bind 127.0.0.1:{PORT} within 20s. Check {SERVER_LOG}; the usual "
-                f"cause is a missing dependency — run: python {REPO}/scripts/doctor.py")
-    if want_browser:
-        st = call_raw("status", method="GET")
-        if not st.get("alive"):
-            call_raw("start", timeout=120.0)   # blocks until Chrome is up; do not poll /status
-
-
-def call_raw(op, method="POST", timeout=60.0, **body):
-    """One engine op. Raises EngineError on transport failure or an {"error": ...} payload."""
-    try:
-        if method == "GET":
-            raw = urllib.request.urlopen(f"{BASE}/{op}", timeout=timeout).read()
-        else:
-            req = urllib.request.Request(f"{BASE}/{op}", data=json.dumps(body).encode(),
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            raw = urllib.request.urlopen(req, timeout=timeout).read()
-    except urllib.error.URLError as e:
-        raise EngineError(f"engine op {op!r} failed: {e}") from e
-    except OSError as e:
-        raise EngineError(f"engine op {op!r} failed: {e}") from e
-    try:
-        out = json.loads(raw)
-    except ValueError:
-        raise EngineError(f"engine op {op!r} returned non-JSON ({len(raw)} bytes)")
-    if isinstance(out, dict) and out.get("error"):
-        raise EngineError(f"engine op {op!r}: {out['error']}")
-    return out
-
-
-def call(op, **body):
-    ensure_engine()
-    return call_raw(op, **body)
-
-
-# ── html -> readable text ───────────────────────────────────────────────────────────────────────
-
-_SKIP = {"script", "style", "noscript", "svg", "template", "head", "iframe", "canvas"}
-_BLOCK = {"p", "div", "section", "article", "header", "footer", "nav", "main", "aside", "br",
-          "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "table", "ul", "ol", "dl", "dt", "dd",
-          "blockquote", "pre", "form", "figure", "figcaption", "hr"}
-
-
-class _Text(HTMLParser):
-    """HTML -> plain text. Drops script/style/etc, keeps block boundaries as newlines, and can keep
-    links as `text <href>` so an agent can navigate without a second HTML round-trip."""
-
-    def __init__(self, links=False):
-        super().__init__(convert_charrefs=True)
-        self.out, self.skip, self.links, self._href = [], 0, links, None
-
-    def handle_starttag(self, tag, attrs):
-        if tag in _SKIP:
-            self.skip += 1
-            return
-        if tag in _BLOCK:
-            self.out.append("\n")
-        if tag == "a" and self.links:
-            self._href = dict(attrs).get("href")
-        if tag == "img":
-            alt = dict(attrs).get("alt")
-            if alt:
-                self.out.append(f"[img: {alt}]")
-
-    def handle_endtag(self, tag):
-        if tag in _SKIP:
-            self.skip = max(0, self.skip - 1)
-            return
-        if tag in _BLOCK:
-            self.out.append("\n")
-        if tag == "a" and self.links and self._href:
-            if not self._href.startswith(("javascript:", "#")):
-                self.out.append(f" <{self._href}>")
-            self._href = None
-
-    def handle_data(self, d):
-        if not self.skip and d.strip():
-            self.out.append(d.strip() + " ")
-
-    def text(self):
-        s = "".join(self.out)
-        lines, prev_blank = [], False
-        for ln in s.split("\n"):
-            ln = " ".join(ln.split())
-            if not ln:
-                if prev_blank:
-                    continue
-                prev_blank = True
-            else:
-                prev_blank = False
-            lines.append(ln)
-        return "\n".join(lines).strip()
-
-
-def html_to_text(h, links=False):
-    p = _Text(links=links)
-    try:
-        p.feed(h or "")
-    except Exception as e:                      # malformed markup must degrade, never fail a fetch
-        elog(f"[{NAME}] html parse warning: {e}")
-    return p.text()
-
-
-def render(page, mode, max_chars):
-    """page = {html,title,url} from the engine -> the string the agent sees."""
-    if mode == "html":
-        body = page.get("html") or ""
-    else:
-        body = html_to_text(page.get("html"), links=(mode == "text+links"))
-    head = f"# {page.get('title') or '(no title)'}\nURL: {page.get('url') or ''}\n\n"
-    total = len(body)
-    if max_chars and total > max_chars:
-        body = (body[:max_chars]
-                + f"\n\n[truncated: showing {max_chars} of {total} chars. Re-call with a larger "
-                  f"max_chars, or use the `js` tool to extract just the part you need.]")
-    return head + body
-
-
-CHALLENGE = ("just a moment", "verify you are human", "checking your browser",
-             "cf-chl", "challenge-platform")
-
-
-def is_challenge(page):
-    t = (page.get("title") or "").lower()
-    h = (page.get("html") or "").lower()
-    return any(k in t for k in CHALLENGE) or "verify you are human" in h
-
-
-def _open_tab():
-    """Open a scratch tab and return its index. The engine makes the new tab the ACTIVE one, so the
-    ops that follow apply to it."""
-    return call("newtab", url="about:blank").get("index", -1)
-
-
-def _close_tab(index, url=None):
-    """Close the tab we opened, and VERIFY it went. Indices are positional and shift when a
-    LOWER-indexed tab closes, so an exact url match is preferred and the index is the fallback. Tab 0
-    is protected by the engine. A leak here is the failure mode that leaves orphan renderers behind,
-    so it is checked rather than assumed."""
-    try:
-        before = call_raw("tabs", method="GET")
-        target = None
-        if url:
-            for t in before.get("tabs", []):
-                if t["index"] != 0 and t.get("url") == url:
-                    target = t["index"]
-                    break
-        if target is None and index and index > 0:
-            target = index
-        if target is None:
-            elog(f"[{NAME}] no tab to close (index={index} url={url!r})")
-            return {"closed": 0}
-        r = call("closetab", index=target)
-        if r.get("remaining", 0) >= before.get("count", 0):
-            elog(f"[{NAME}] LEAKED tab {target}: count still {r.get('remaining')} "
-                 f"(was {before.get('count')})")
-        return r
-    except EngineError as e:
-        elog(f"[{NAME}] tab cleanup failed (leaked tab {index}): {e}")
-    return {"closed": 0}
-
-
-def _solve_timeout(tries):
-    """Each solve iteration is a find(timeout=3) + up to 5s of settle sleeps, so ~8s worst case per
-    try, plus 30s of slack for the final page load."""
-    return tries * 8 + 30
+def op(name, **body):
+    """Every engine op goes through here: the engine and Chrome are guaranteed up first."""
+    return connect.op(name, **body)
 
 
 # ── tools ───────────────────────────────────────────────────────────────────────────────────────
+# Each tool is a thin shim over engine/connect.py, which is also what the `playwrong` CLI uses — one
+# implementation of "start the engine, drive it, clean up", not two that drift apart.
 
 def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20):
-    with _capture_lock:
-        idx = _open_tab()
-        final_url = None
-        try:
-            call("goto", url=url, timeout=90.0)
-            page = call("text")
-            solved = None
-            if solve and is_challenge(page):
-                solved = call("solve", tries=tries, timeout=_solve_timeout(tries))
-                page = call("text")
-            final_url = page.get("url")
-            body = render(page, mode, max_chars)
-            if solved is not None:
-                body += (f"\n\n[cloudflare challenge: "
-                         f"{'cleared' if solved.get('passed') else 'NOT cleared'} after "
-                         f"{solved.get('iter')} attempts]")
-            return body
-        finally:
-            _close_tab(idx, final_url)
+    r = capture(url, mode=mode, solve=solve, max_chars=max_chars, tries=tries)
+    body = r["text"]
+    if r.get("challenge"):
+        body += f"\n\n[cloudflare challenge: {r['challenge']}]"
+    return body
 
 
 def t_screenshot(url=None, solve=True):
     if url is None:
-        b64 = call("shot", timeout=90.0)["b64"]
-        return [{"type": "image", "data": b64, "mimeType": "image/png"}]
-    with _capture_lock:
-        idx = _open_tab()
-        final_url = None
-        try:
-            call("goto", url=url, timeout=90.0)
-            page = call("text")
-            if solve and is_challenge(page):
-                call("solve", tries=20, timeout=_solve_timeout(20))
-                page = call("text")
-            final_url = page.get("url")
-            b64 = call("shot", timeout=90.0)["b64"]
-            return [{"type": "text", "text": f"{page.get('title') or ''} — {final_url}"},
-                    {"type": "image", "data": b64, "mimeType": "image/png"}]
-        finally:
-            _close_tab(idx, final_url)
+        return [{"type": "image", "data": op("shot", timeout=90.0)["b64"], "mimeType": "image/png"}]
+    r = capture(url, solve=solve, max_chars=200, shot=True)
+    return [{"type": "text", "text": f"{r.get('title') or ''} — {r.get('url') or ''}"},
+            {"type": "image", "data": r["b64"], "mimeType": "image/png"}]
 
 
 def t_goto(url, solve=True, mode="text", max_chars=8000):
-    call("goto", url=url, timeout=90.0)
-    page = call("text")
+    op("goto", url=url, timeout=90.0)
+    page = op("text")
     note = ""
     if solve and is_challenge(page):
-        r = call("solve", tries=20, timeout=_solve_timeout(20))
-        page = call("text")
+        r = op("solve", tries=20, timeout=connect.solve_timeout(20))
+        page = op("text")
         note = f"\n\n[challenge {'cleared' if r.get('passed') else 'NOT cleared'}]"
     return render(page, mode, max_chars) + note
 
 
 def t_read(mode="text", max_chars=40000):
-    return render(call("text"), mode, max_chars)
+    return render(op("text"), mode, max_chars)
 
 
 def t_js(expr):
-    return json.dumps(call("js", expr=expr).get("result"), indent=2, default=str)
+    return json.dumps(op("js", expr=expr).get("result"), indent=2, default=str)
 
 
 def t_click(x, y):
-    return json.dumps(call("click", x=x, y=y))
+    return json.dumps(op("click", x=x, y=y))
 
 
 def t_key(key):
-    return json.dumps(call("key", key=key))
+    return json.dumps(op("key", key=key))
 
 
 def t_solve(tries=20):
-    return json.dumps(call("solve", tries=tries, timeout=_solve_timeout(tries)))
+    return json.dumps(op("solve", tries=tries, timeout=connect.solve_timeout(tries)))
 
 
 def t_cookies(domain=None):
-    cks = call("cookies").get("cookies", [])
+    cks = op("cookies").get("cookies", [])
     if domain:
         cks = [c for c in cks if domain in (c.get("domain") or "")]
     return json.dumps(cks, indent=2)
 
 
 def t_tabs():
-    return json.dumps(call_raw("tabs", method="GET"), indent=2)
+    return json.dumps(op("tabs", method="GET"), indent=2)
 
 
 def t_close_tab(index=None, url=None, close_extra=False):
     if close_extra:
-        return json.dumps(call("closeextra"))
+        return json.dumps(op("closeextra"))
     if index is None and url is None:
         raise ValueError("give index or url, or set close_extra:true")
-    return json.dumps(call("closetab", index=index, url=url))
+    return json.dumps(op("closetab", index=index, url=url))
 
 
 def t_status():
-    try:
-        st = call_raw("status", method="GET")
-    except EngineError:
-        return json.dumps({"server": False, "alive": False, "port": PORT,
+    """The one tool that must NOT auto-start anything — its job is to report what is true now."""
+    if not connect.reachable(PORT):
+        return json.dumps({"server": False, "alive": False, "port": PORT, "repo": REPO,
                            "hint": "engine not running; any other tool will auto-start it"})
-    st["port"] = PORT
-    st["repo"] = REPO
+    st = call("status", port=PORT, method="GET")
+    st["port"], st["repo"] = PORT, REPO
     if st.get("alive"):
         try:
-            st["tabs"] = call_raw("tabs", method="GET").get("count")
+            st["tabs"] = call("tabs", port=PORT, method="GET").get("count")
         except EngineError:
             pass
     return json.dumps(st, indent=2)
