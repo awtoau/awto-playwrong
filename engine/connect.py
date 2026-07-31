@@ -351,16 +351,25 @@ _TAGS = re.compile(r"<[^>]+>")
 
 def parse_ddg(html):
     """Pull {title, url} out of a DuckDuckGo lite results page, unwrapping the redirector so callers
-    get the real destination rather than a duckduckgo.com/l/ link."""
+    get the real destination rather than a duckduckgo.com/l/ link.
+
+    ADS carry the same `class="result-link"` as organic results, so matching on the class alone put a
+    "Fix Windows Driver Update" ad at position 1 for a search about `nodriver`. They are told apart
+    by their redirector: organic results go through `/l/?uddg=<real url>`, ads through `y.js?ad_domain=…`.
+    Requiring the `uddg` parameter drops every ad, and anything still pointing at duckduckgo.com is
+    the help/settings furniture rather than a result.
+    """
     out, seen = [], set()
     for href, title in _RESULT.findall(html or ""):
         href = htmlmod.unescape(href)
         real = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [None])[0]
-        real = real or ("https:" + href if href.startswith("//") else href)
-        title = " ".join(htmlmod.unescape(_TAGS.sub(" ", title)).split())
-        if real in seen:
+        if not real:
+            continue                       # an ad (y.js) or some other non-result link
+        host = urllib.parse.urlparse(real).netloc.lower()
+        if host.endswith("duckduckgo.com") or real in seen:
             continue
         seen.add(real)
+        title = " ".join(htmlmod.unescape(_TAGS.sub(" ", title)).split())
         out.append({"title": title, "url": real})
     return out
 

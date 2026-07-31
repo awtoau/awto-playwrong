@@ -154,11 +154,16 @@ def check_engine_port():
     except Exception:
         pass
     s = socket.socket()
+    # SO_REUSEADDR because that is what the engine's HTTPServer sets. Without it this probe fails on
+    # a port merely sitting in TIME_WAIT after a recent shutdown — reporting "port is taken" and
+    # sending you off to change PH_PORT when nothing is listening at all and the engine would bind
+    # it fine. Test the condition the server will actually face, not a stricter one.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("127.0.0.1", PORT))
         check(f"engine :{PORT}", "PASS", "not running; port is free (it will auto-start)")
-    except OSError:
-        check(f"engine :{PORT}", "FAIL", "port is taken by something that is not the engine",
+    except OSError as e:
+        check(f"engine :{PORT}", "FAIL", f"port is taken by something that is not the engine ({e})",
               "pick another port: export PH_PORT=8732")
     finally:
         s.close()

@@ -190,6 +190,10 @@ def live_tests(c):
     body = text_of(r)
     ok("search returns unwrapped result urls",
        "http" in body and "duckduckgo.com/l/" not in body, body.splitlines()[0] if body else "")
+    # Ads share the organic results' CSS class and once took the top two slots. Any duckduckgo.com
+    # url in the output means ad/help links are leaking back in.
+    ok("search returns no ads or DDG furniture", "duckduckgo.com" not in body,
+       next((ln for ln in body.splitlines() if "duckduckgo.com" in ln), ""))
 
     c.call("close_tab", close_extra=True)
     r = c.call("tabs")
