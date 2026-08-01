@@ -170,6 +170,7 @@ class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
+        self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
@@ -203,72 +204,111 @@ class ND:
     async def _cdp_info(self):
         await self._ensure()
         return getattr(self,"_cdp",{"error":"not published"})
-    async def _goto(self, url):
-        await self._ensure(); await self.tab.get(url); await self.tab.sleep(2)
+    async def _tab(self, ref=None):
+        """Resolve a tab reference to a live Tab.
+
+        THIS is what makes one browser safe for many agents. Every op used to act on self.tab — the
+        one globally-active tab — so two callers driving the engine at once silently read each
+        other's pages. Now each op can name the tab it means.
+
+        ref=None      the active tab (unchanged single-caller behaviour)
+        ref="<tag>"   a tag registered by newtab{tag} — an agent's own handle
+        ref=<int>     a positional index (convenient, but see the warning below)
+
+        Tags resolve to TARGET IDs, never to indices. An index shifts whenever a lower-numbered tab
+        closes, so an index handed out earlier can later point at somebody else's tab — the same
+        class of bug as the active-tab race, just slower to show up.
+        """
+        await self._ensure()
+        if ref is None: return self.tab
+        await self._refresh()
+        want = self.tags.get(ref, ref) if isinstance(ref, str) else None
+        for i, t in enumerate(self.browser.tabs):
+            if isinstance(ref, int) and i == ref: return t
+            if want and getattr(getattr(t, "target", None), "target_id", None) == want: return t
+        raise KeyError(f"no such tab: {ref!r} (tags: {sorted(self.tags)})")
+    async def _goto(self, url, tab=None):
+        t = await self._tab(tab)
+        await t.get(url); await t.sleep(2)
         # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
         # two differ, and a caller that stores the requested url records a page it never got.
-        return {"title": await self.tab.evaluate("document.title"),
-                "url": await self._href(), "requested": url}
-    async def _href(self):
+        return {"title": await t.evaluate("document.title"),
+                "url": await self._href(t), "requested": url}
+    async def _href(self, t=None):
         """Authoritative current url. nodriver's Tab has no .url attribute (only .target.url, which
         lags), so ask the page."""
-        try: return await self.tab.evaluate("location.href")
+        try: return await (t or self.tab).evaluate("location.href")
         except Exception: return ""
     def _is_chal(self, t, h):
         t=(t or "").lower(); h=(h or "").lower()
         return any(k in t for k in CHALLENGE) or "verify you are human" in h
-    async def _solve(self, tries=20):
-        await self._ensure()
+    async def _solve(self, tries=20, tab=None):
+        tb = await self._tab(tab)
         for i in range(tries):
-            t=await self.tab.evaluate("document.title"); h=await self.tab.get_content()
+            t=await tb.evaluate("document.title"); h=await tb.get_content()
             if not self._is_chal(t,h): log("solved",i=i); return {"passed":True,"iter":i}
             try:
-                el=await self.tab.find("verify you are human", best_match=True, timeout=3)
-                if el: await el.mouse_click(); log("clicked",i=i); await self.tab.sleep(4)
+                el=await tb.find("verify you are human", best_match=True, timeout=3)
+                if el: await el.mouse_click(); log("clicked",i=i); await tb.sleep(4)
             except Exception as e: log("click_err",e=str(e)[:50])
-            await self.tab.sleep(1)
+            await tb.sleep(1)
         return {"passed":False,"iter":tries}
-    async def _text(self):
-        await self._ensure()
-        return {"title":await self.tab.evaluate("document.title"),"html":await self.tab.get_content(),
-                "url": await self._href()}
-    async def _frame(self):
-        await self._ensure()
-        p=os.path.join(TMP,"nd-frame.png")
-        await self.tab.save_screenshot(p); return open(p,"rb").read()
-    async def _shot(self):
-        return {"b64": base64.b64encode(await self._frame()).decode()}
+    async def _text(self, tab=None):
+        t = await self._tab(tab)
+        return {"title":await t.evaluate("document.title"),"html":await t.get_content(),
+                "url": await self._href(t)}
+    async def _frame(self, tab=None):
+        t = await self._tab(tab)
+        # Per-tab filename: two agents screenshotting at once would otherwise overwrite each other's
+        # file between the save and the read.
+        p=os.path.join(TMP,f"nd-frame-{getattr(getattr(t,'target',None),'target_id','x')}.png")
+        await t.save_screenshot(p)
+        try: return open(p,"rb").read()
+        finally:
+            try: os.remove(p)
+            except OSError: pass
+    async def _shot(self, tab=None):
+        return {"b64": base64.b64encode(await self._frame(tab)).decode()}
     async def _clearcookies(self):
         await self._ensure(); await self.browser.cookies.clear(); return {"cleared":True}
     # --- added verbs (CDP input + tab ops) so the full client surface works on the nodriver engine ---
-    async def _move(self, x, y):
-        await self._ensure()
-        await self.tab.send(cdp.input_.dispatch_mouse_event(type_="mouseMoved", x=float(x), y=float(y)))
+    async def _move(self, x, y, tab=None):
+        t = await self._tab(tab)
+        await t.send(cdp.input_.dispatch_mouse_event(type_="mouseMoved", x=float(x), y=float(y)))
         return {"ok":1,"x":x,"y":y}
-    async def _click(self, x, y):
-        await self._ensure()
+    async def _click(self, x, y, tab=None):
+        t = await self._tab(tab)
         for ty in ("mousePressed","mouseReleased"):
-            await self.tab.send(cdp.input_.dispatch_mouse_event(
+            await t.send(cdp.input_.dispatch_mouse_event(
                 type_=ty, x=float(x), y=float(y), button=cdp.input_.MouseButton.LEFT, click_count=1))
         return {"ok":1,"x":x,"y":y}
-    async def _key(self, key):
-        await self._ensure()
+    async def _key(self, key, tab=None):
+        tb = await self._tab(tab)
         # named keys (Enter/Tab/...) carry a code; printable chars go as text
         named = {"Enter":13,"Tab":9,"Escape":27,"Backspace":8,"ArrowDown":40,"ArrowUp":38,
                   "ArrowLeft":37,"ArrowRight":39,"PageUp":33,"PageDown":34,"Home":36,"End":35,
                   "Space":32,"Delete":46}
         if key in named:
             for ty in ("keyDown","keyUp"):
-                await self.tab.send(cdp.input_.dispatch_key_event(
+                await tb.send(cdp.input_.dispatch_key_event(
                     type_=ty, key=key, windows_virtual_key_code=named[key]))
         else:
-            await self.tab.send(cdp.input_.dispatch_key_event(type_="char", text=key))
+            await tb.send(cdp.input_.dispatch_key_event(type_="char", text=key))
         return {"ok":1,"key":key}
-    async def _newtab(self, url="about:blank"):
+    async def _newtab(self, url="about:blank", tag=None):
+        """Open a tab and, optionally, TAG it as yours.
+
+        A tag is how one agent keeps its work separate from another's inside a single shared
+        browser: pass it back as `tab` on later ops and they act on your page regardless of what
+        anyone else does to the active tab."""
         await self._ensure()
-        self.tab = await self.browser.get(url, new_tab=True)
+        t = await self.browser.get(url, new_tab=True)
+        self.tab = t
         await self._refresh()          # the cache may not list the tab we just opened yet
-        return {"ok":1,"url":url,"index":self._tab_index(self.tab)}
+        tid = getattr(getattr(t, "target", None), "target_id", None)
+        if tag:
+            self.tags[tag] = tid
+        return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"target_id":str(tid or "")}
     # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
     # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
     # single-tab crawler that opened 8 tabs/run and never closed them left 22 orphan renderers). These
@@ -290,13 +330,16 @@ class ND:
         """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
         use this to track what they opened and find tabs to close."""
         await self._ensure(); await self._refresh()
+        by_id = {v: k for k, v in self.tags.items()}
         out=[]
         for i, t in enumerate(self.browser.tabs):
             # url/title come off the TargetInfo, not an evaluate(): it works for BACKGROUND tabs too
             # (evaluate only ever worked on the active one) and costs no round-trip per tab.
             ti = getattr(t, "target", None)
+            tid = getattr(ti, "target_id", None)
             out.append({"index":i,"url":getattr(ti,"url","") or "",
-                        "title":getattr(ti,"title","") or "","active":(t is self.tab)})
+                        "title":getattr(ti,"title","") or "","active":(t is self.tab),
+                        "tag":by_id.get(tid),"target_id":str(tid or "")})
         return {"tabs":out,"count":len(out)}
     async def _await_closed(self, ids):
         """Wait until Chrome has actually destroyed the targets we asked it to close.
@@ -314,16 +357,24 @@ class ND:
             if not (ids & live): return
             await asyncio.sleep(0.05)
         log("close_timeout", ids=",".join(str(i) for i in ids))
-    async def _closetab(self, index=None, url=None, keep_first=True):
+    async def _closetab(self, index=None, url=None, keep_first=True, tag=None):
         """Close a tab by index OR by url-substring match. keep_first protects tab 0 (the server's base
         tab). Never closes the last remaining tab. Returns how many were closed. This is how agents
         clean up their shard — NOT by killing the server."""
         await self._ensure(); await self._refresh()
         tabs=list(self.browser.tabs)
         if len(tabs)<=1: return {"closed":0,"reason":"only one tab; refusing to close the last"}
+        # By TAG first: under concurrency an index is stale the moment another caller closes a
+        # lower-numbered tab, so index-based cleanup starts closing other agents' tabs (or missing
+        # its own and reporting a leak). A tag resolves to a target id, which never shifts.
+        want_id = self.tags.get(tag) if tag else None
         targets=[]
         for i, t in enumerate(tabs):
             if keep_first and i==0: continue
+            if want_id is not None:
+                if getattr(getattr(t,"target",None),"target_id",None) == want_id:
+                    targets.append((i,t))
+                continue
             # t.url does not exist on a nodriver Tab, so the documented url-substring form matched
             # NOTHING before this; the url lives on the target info.
             turl = getattr(getattr(t,"target",None),"url","") or ""
@@ -338,6 +389,8 @@ class ND:
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
         await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
+        if tag:
+            self.tags.pop(tag, None)
         if self.tab not in self.browser.tabs:
             self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":closed,"remaining":len(self.browser.tabs)}
@@ -354,16 +407,16 @@ class ND:
         await self._await_closed(ids)
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":n,"remaining":len(self.browser.tabs)}
-    async def _js(self, expr):
+    async def _js(self, expr, tab=None):
         """Evaluate in the page, RESOLVING promises.
 
         Without await_promise an async expression handed back a bare Promise, which serialised to
         null — so `js` looked like it silently returned nothing for anything async. Top-level `await`
         is also not valid inside a CDP evaluate, so an expression starting with it is wrapped in an
         async IIFE rather than being rejected."""
-        await self._ensure()
-        raw = await self.tab.evaluate(JS_WRAP % expr.strip().rstrip(";"),
-                                      await_promise=True, return_by_value=True)
+        t = await self._tab(tab)
+        raw = await t.evaluate(JS_WRAP % expr.strip().rstrip(";"),
+                               await_promise=True, return_by_value=True)
         if not isinstance(raw, str):
             # The wrapper always resolves to a string, so anything else means the driver could not
             # evaluate it at all (usually a syntax error in the expression).
@@ -381,13 +434,20 @@ class ND:
         return {"cookies":[{"name":c.name,"value":c.value,"domain":getattr(c,"domain",None)} for c in cks]}
     def do(self, op, a):
         m={"start":lambda:self._start(),
-           "goto":lambda:self._goto(a["url"]),"solve":lambda:self._solve(a.get("tries",20)),
-           "text":lambda:self._text(),"shot":lambda:self._shot(),"clearcookies":lambda:self._clearcookies(),
-           "move":lambda:self._move(a["x"],a["y"]),"click":lambda:self._click(a["x"],a["y"]),
-           "key":lambda:self._key(a["key"]),"newtab":lambda:self._newtab(a.get("url","about:blank")),
-           "js":lambda:self._js(a["expr"]),"cookies":lambda:self._cookies(),
+           # every driving op takes an optional `tab` (a tag, or an index) so concurrent callers
+           # never have to rely on which tab happens to be active
+           "goto":lambda:self._goto(a["url"],a.get("tab")),
+           "solve":lambda:self._solve(a.get("tries",20),a.get("tab")),
+           "text":lambda:self._text(a.get("tab")),"shot":lambda:self._shot(a.get("tab")),
+           "clearcookies":lambda:self._clearcookies(),
+           "move":lambda:self._move(a["x"],a["y"],a.get("tab")),
+           "click":lambda:self._click(a["x"],a["y"],a.get("tab")),
+           "key":lambda:self._key(a["key"],a.get("tab")),
+           "newtab":lambda:self._newtab(a.get("url","about:blank"),a.get("tag")),
+           "js":lambda:self._js(a["expr"],a.get("tab")),"cookies":lambda:self._cookies(),
            "tabs":lambda:self._tabs(),
-           "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True)),
+           "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True),
+                                            a.get("tag")),
            "closeextra":lambda:self._closeextra(),
            "cdp":lambda:self._cdp_info()}
         if op not in m: return {"error":f"unknown {op}"}

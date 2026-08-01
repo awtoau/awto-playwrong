@@ -49,6 +49,23 @@ def op(name, **body):
     return connect.op(name, **body)
 
 
+# THIS agent's own tab inside the shared browser. Interactive tools (goto/read/js/click/key) drive it
+# BY TAG rather than "whatever tab is active", so several agents can work in one browser at once
+# without moving each other's pages out from under them. fetch/pdf/search don't need it — each opens
+# and closes a tagged tab of its own per call.
+_MY_TAB = f"{connect.SESSION}-mcp"
+_have_tab = False
+
+
+def my_tab():
+    """The tag of this agent's tab, opened on first use."""
+    global _have_tab
+    if not _have_tab:
+        op("newtab", url="about:blank", tag=_MY_TAB)
+        _have_tab = True
+    return _MY_TAB
+
+
 # ── tools ───────────────────────────────────────────────────────────────────────────────────────
 # Each tool is a thin shim over engine/connect.py, which is also what the `playwrong` CLI uses — one
 # implementation of "start the engine, drive it, clean up", not two that drift apart.
@@ -84,41 +101,44 @@ def t_search(query, max_results=10):
 
 def t_screenshot(url=None, solve=True):
     if url is None:
-        return [{"type": "image", "data": op("shot", timeout=90.0)["b64"], "mimeType": "image/png"}]
+        return [{"type": "image", "data": op("shot", tab=my_tab(), timeout=90.0)["b64"],
+                 "mimeType": "image/png"}]
     r = capture(url, solve=solve, max_chars=200, shot=True)
     return [{"type": "text", "text": f"{r.get('title') or ''} — {r.get('url') or ''}"},
             {"type": "image", "data": r["b64"], "mimeType": "image/png"}]
 
 
 def t_goto(url, solve=True, mode="text", max_chars=8000):
-    op("goto", url=url, timeout=90.0)
-    page = op("text")
+    tab = my_tab()
+    op("goto", url=url, tab=tab, timeout=90.0)
+    page = op("text", tab=tab)
     note = ""
     if solve and is_challenge(page):
-        r = op("solve", tries=20, timeout=connect.solve_timeout(20))
-        page = op("text")
+        r = op("solve", tries=20, tab=tab, timeout=connect.solve_timeout(20))
+        page = op("text", tab=tab)
         note = f"\n\n[challenge {'cleared' if r.get('passed') else 'NOT cleared'}]"
     return render(page, mode, max_chars) + note
 
 
 def t_read(mode="text", max_chars=40000):
-    return render(op("text"), mode, max_chars)
+    return render(op("text", tab=my_tab()), mode, max_chars)
 
 
 def t_js(expr):
-    return json.dumps(op("js", expr=expr).get("result"), indent=2, default=str)
+    return json.dumps(op("js", expr=expr, tab=my_tab()).get("result"), indent=2, default=str)
 
 
 def t_click(x, y):
-    return json.dumps(op("click", x=x, y=y))
+    return json.dumps(op("click", x=x, y=y, tab=my_tab()))
 
 
 def t_key(key):
-    return json.dumps(op("key", key=key))
+    return json.dumps(op("key", key=key, tab=my_tab()))
 
 
 def t_solve(tries=20):
-    return json.dumps(op("solve", tries=tries, timeout=connect.solve_timeout(tries)))
+    return json.dumps(op("solve", tries=tries, tab=my_tab(),
+                         timeout=connect.solve_timeout(tries)))
 
 
 def t_cookies(domain=None):
@@ -133,10 +153,17 @@ def t_tabs():
 
 
 def t_close_tab(index=None, url=None, close_extra=False):
+    global _have_tab
     if close_extra:
+        _have_tab = False
         return json.dumps(op("closeextra"))
     if index is None and url is None:
-        raise ValueError("give index or url, or set close_extra:true")
+        # No target given: close YOUR OWN tab. That is the common case for an agent finishing up,
+        # and it can never take out another agent's page by accident.
+        if not _have_tab:
+            return json.dumps({"closed": 0, "reason": "you have no open tab"})
+        _have_tab = False
+        return json.dumps(op("closetab", tag=_MY_TAB))
     return json.dumps(op("closetab", index=index, url=url))
 
 

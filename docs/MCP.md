@@ -182,6 +182,59 @@ print(connect.capture("https://awto.au")["text"])
 None of them need a server started first. If you find yourself writing `ensure_server()` or exporting
 `PYTHONPATH=vendor`, you're reimplementing `connect.ensure()`.
 
+## Many agents, one browser
+
+**You do not need an engine per agent.** One shared browser is the point — it holds one cleared
+Turnstile session, one cookie jar, one set of logins, and costs one Chrome's worth of memory. What
+you *do* need is for each agent to name the tab it is driving, which is now automatic.
+
+Every tab carries a **tag**, and every driving op takes a `tab` argument. An agent's ops therefore
+act on its own page regardless of what anyone else is doing:
+
+| Tool | Which tab |
+|---|---|
+| `fetch`, `pdf`, `search`, `screenshot(url)` | open a freshly tagged tab, use it, close it — nothing shared, nothing to clean up |
+| `goto`, `read`, `js`, `click`, `key`, `solve`, `screenshot()` | **this agent's own tab**, opened on first use and reused |
+| `close_tab` with no arguments | closes *your* tab, never anyone else's |
+| `tabs` | lists every tab with its `tag`, so you can see who owns what |
+
+Nothing about this needs configuring. Each MCP server process takes an identity at startup and tags
+accordingly, so N agents pointed at the same engine simply work.
+
+### Why this was needed
+
+Before tagging, every op acted on the engine's single **active** tab. Two agents interleaved: A
+issued `goto`, B's `goto` moved the active tab, and A's read returned **B's page** — as a
+plausible-looking answer to A's url. No error, no warning. It was caught when a release check fetched
+`example.com` and got the unrelated page the human user happened to be browsing at that moment.
+
+`scripts/concurrency_test.py` is the regression guard: it runs N processes against one engine and
+asserts each got the url it asked for and that no tabs leaked.
+
+```sh
+python scripts/concurrency_test.py -n 12
+```
+
+### When you DO want a separate engine
+
+Tags solve contention, not isolation. Use a separate engine when agents need genuinely different
+browser state:
+
+- **different logins or cookie jars** → `--profile work` / `--profile scrape` (each name gets its own
+  persistent profile and its own engine on a stable, name-derived port)
+- **a throwaway session that must not touch your real one** → `--port 8799`
+- **true parallel throughput** beyond what one browser can serialise → several engines, or attach
+  your own nodriver via the engine's `/cdp` endpoint and drive many tabs yourself
+
+### Rules to give an agent
+
+1. Use `fetch` for a page. It handles its own tab; there is nothing to clean up.
+2. For interactive work, just call `goto`/`js`/`click` — you already have your own tab.
+3. Call `close_tab` when finished with an interactive session.
+4. **Never** `shutdown` the engine, `pkill` Chrome, or launch your own browser. It is shared.
+5. If you need different cookies or logins from another agent, ask for a `--profile`, not a fight
+   over the same one.
+
 ## Design notes
 
 - **Thin proxy, not a rewrite.** Tools are shims over `engine/connect.py`, which POSTs to the

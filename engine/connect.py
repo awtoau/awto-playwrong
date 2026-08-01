@@ -16,6 +16,7 @@ an ImportError.
 """
 import base64
 import html as htmlmod
+import itertools
 import json
 import os
 import re
@@ -29,6 +30,12 @@ import urllib.parse
 import urllib.request
 import zlib
 from html.parser import HTMLParser
+
+# This process's identity inside a SHARED browser. Every tab this process opens is tagged with it,
+# and every op it issues names the tab it means — so a second agent driving the same engine cannot
+# move the page out from under us. One browser, many agents, no contention.
+SESSION = f"pw-{os.getpid()}-{zlib.crc32(os.urandom(8)):x}"
+_seq = itertools.count()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -282,32 +289,7 @@ def solve_timeout(tries):
 _lock = threading.Lock()
 
 
-def _assert_our_tab(port, idx, url):
-    """Confirm the tab we opened is still the engine's ACTIVE tab before we read from it.
-
-    The engine drives one globally-active tab, and _lock only serialises captures inside THIS
-    process. When a second process (another agent, or a human using the same shared browser) drives
-    the engine at the same time, it moves the active tab — and the read below then returns THAT
-    page's text as the answer to our url. Silently. This was observed for real: a verification run
-    asked for example.com and got the unrelated page the user was browsing at that moment.
-
-    Failing loudly is the point. A wrong page returned as if it were right is far worse than an
-    error, and the fix is concrete: give the caller its own engine.
-    """
-    try:
-        tabs = call("tabs", port=port, method="GET").get("tabs", [])
-    except EngineError:
-        return                       # tab listing is a nicety; never fail a capture over it
-    active = next((t for t in tabs if t.get("active")), None)
-    if active is not None and idx >= 0 and active.get("index") != idx:
-        raise EngineError(
-            f"another process moved the shared browser's active tab while fetching {url} "
-            f"(expected tab {idx}, active is {active.get('index')}: {active.get('url','')!r}). "
-            f"Refusing to return the wrong page. Use an isolated engine for concurrent work: "
-            f"--port <n>, or --profile <name>.")
-
-
-def _settled_text(port, page=None):
+def _settled_text(port, page=None, tab=None):
     """Read the page, waiting for it to have actually rendered.
 
     /goto settles for a fixed 2s, which is a guess, and on a JS-rendered page it is sometimes short:
@@ -316,13 +298,13 @@ def _settled_text(port, page=None):
     250ms for up to 5s beyond goto's own wait; past that, empty is the honest answer (a genuinely
     blank page, or a hard block) and not something more waiting fixes.
     """
-    page = page if page is not None else call("text", port=port)
+    page = page if page is not None else call("text", port=port, tab=tab)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if html_to_text(page.get("html")).strip():
             return page
         time.sleep(0.25)
-        page = call("text", port=port)
+        page = call("text", port=port, tab=tab)
     return page
 
 
@@ -338,40 +320,46 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
     """
     port = ensure(port, on_start=on_start, profile=profile)
     with _lock:
-        idx = call("newtab", port=port, url="about:blank").get("index", -1)
+        tag = f"{SESSION}-{next(_seq)}"
+        idx = call("newtab", port=port, url="about:blank", tag=tag).get("index", -1)
         final_url, out = None, {}
         try:
-            landed = call("goto", port=port, url=url, timeout=90.0)
+            landed = call("goto", port=port, url=url, tab=tag, timeout=90.0)
             # Chrome's first-run/profile page can occupy a brand-new tab, so the navigation lands
             # somewhere internal and we would return THAT page's text as if it were the url asked
             # for — a silently wrong answer, seen once on the very first launch of a fresh profile.
             # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
             if str(landed.get("url", "")).startswith(("chrome://", "about:")):
-                call("goto", port=port, url=url, timeout=90.0)
-            _assert_our_tab(port, idx, url)
-            page = _settled_text(port)
+                call("goto", port=port, url=url, tab=tag, timeout=90.0)
+            page = _settled_text(port, tab=tag)
             challenge = None
             if solve and is_challenge(page):
                 if on_start:
                     on_start("clearing a Cloudflare challenge")
-                r = call("solve", port=port, tries=tries, timeout=solve_timeout(tries))
+                r = call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
                 challenge = "cleared" if r.get("passed") else "NOT cleared"
-                page = call("text", port=port)
-            page = _settled_text(port, page)      # a solve navigates again; re-settle after it
+                page = call("text", port=port, tab=tag)
+            page = _settled_text(port, page, tab=tag)  # a solve navigates again; re-settle after it
             final_url = page.get("url")
             out = {"text": render(page, mode, max_chars), "title": page.get("title"),
                    "url": final_url, "challenge": challenge}
             if shot:
-                out["b64"] = call("shot", port=port, timeout=90.0)["b64"]
+                out["b64"] = call("shot", port=port, tab=tag, timeout=90.0)["b64"]
             return out
         finally:
-            _close_tab(idx, final_url, port)
+            _close_tab(idx, final_url, port, tag=tag)
 
 
-def _close_tab(index, url=None, port=None):
+def _close_tab(index, url=None, port=None, tag=None):
     """Close the tab we opened, and VERIFY it went. Indices shift when a LOWER-indexed tab closes, so
     an exact url match is preferred with the index as fallback. Tab 0 is protected by the engine."""
     try:
+        if tag:
+            # Closing by tag is exact and race-free; index/url are the fallbacks for tabs opened
+            # without one.
+            r = call("closetab", port=port, tag=tag)
+            if r.get("closed"):
+                return r
         before = call("tabs", port=port, method="GET")
         target = None
         if url:
@@ -475,22 +463,23 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
     """
     port = ensure(port, on_start=on_start, profile=profile)
     with _lock:
-        idx = call("newtab", port=port, url="about:blank").get("index", -1)
+        tag = f"{SESSION}-{next(_seq)}"
+        idx = call("newtab", port=port, url="about:blank", tag=tag).get("index", -1)
         final_url = None
         try:
             # Navigate to the ORIGIN, not the file: a challenge is served per-origin, and going
             # straight at a PDF drops us in Chrome's PDF viewer where evaluate() is unreliable.
-            call("goto", port=port, url=_origin(url), timeout=90.0)
-            page = call("text", port=port)
+            call("goto", port=port, url=_origin(url), tab=tag, timeout=90.0)
+            page = call("text", port=port, tab=tag)
             if solve and is_challenge(page):
                 if on_start:
                     on_start("clearing a Cloudflare challenge")
-                call("solve", port=port, tries=tries, timeout=solve_timeout(tries))
-            final_url = call("text", port=port).get("url")
-            ua = call("js", port=port, expr="navigator.userAgent").get("result") or ""
+                call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
+            final_url = call("text", port=port, tab=tag).get("url")
+            ua = call("js", port=port, expr="navigator.userAgent", tab=tag).get("result") or ""
             cookies = call("cookies", port=port).get("cookies", [])
         finally:
-            _close_tab(idx, final_url, port)
+            _close_tab(idx, final_url, port, tag=tag)
     host = urllib.parse.urlparse(url).netloc.split(":")[0]
     jar = "; ".join(f"{c['name']}={c['value']}" for c in cookies
                     if _cookie_applies(c.get("domain"), host))

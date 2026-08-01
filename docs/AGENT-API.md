@@ -186,9 +186,9 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `move` | `{x,y}` | `{ok,x,y}` — CDP synthetic mouse move (no real-cursor jump) |
 | `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
 | `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
-| `newtab` | `{url?}` | `{ok,url,index}` — fresh tab; **index** is its position (track it, close it later) |
-| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active}],count}` — enumerate every open tab. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
-| `closetab` | `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by index OR url-substring; won't close tab 0 or the last tab |
+| `newtab` | `{url?, tag?}` | `{ok,url,index,tag,target_id}` — fresh tab. **Pass a `tag`** and every later op can name it via `tab`, which is how concurrent callers avoid driving each other's page |
+| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active,tag,target_id}],count}` — enumerate every open tab, including who owns it. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
+| `closetab` | `{tag?}`, `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by **tag** (exact, race-free), index, or url-substring; won't close tab 0 or the last tab. Prefer `tag`: an index goes stale the instant another caller closes a lower-numbered tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
 | `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
 | `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
@@ -226,6 +226,26 @@ is the core operating model — treat it accordingly:
 
 Multiple agents can POST concurrently; ops are serialised on the single browser. For true parallel
 browsers, run multiple servers on different `PH_PORT`s — but within one server, shard by tab.
+
+### Tab tagging — the built-in answer for concurrent callers
+
+**Every driving op takes an optional `tab`** (`goto`, `text`, `shot`, `js`, `click`, `key`, `move`,
+`solve`). Omit it and you get the engine's active tab, which is fine for a single caller. Pass a tag
+and the op acts on YOUR page no matter what anyone else is doing:
+
+```python
+connect.call("newtab", tag="agent-7", url="about:blank")
+connect.call("goto", url="https://example.com", tab="agent-7")
+page = connect.call("text", tab="agent-7")          # your page, guaranteed
+connect.call("closetab", tag="agent-7")
+```
+
+Without this, two callers on one engine silently returned each other's pages: A's `goto`, then B's
+`goto` moving the active tab, then A's `text` reading B's page. Tags resolve to CDP target ids, which
+never shift — unlike indices, which move whenever a lower-numbered tab closes.
+
+`engine/connect.py` does all of this for you (`capture()` tags per call), and the MCP server gives
+each agent its own tagged tab. You only need the raw form when driving the port directly.
 
 ### Parallel sharding — attach to the same browser via `/cdp`
 The HTTP ops (`goto`/`text`/…) drive ONE active tab, serialised — fine for a single agent driving one
