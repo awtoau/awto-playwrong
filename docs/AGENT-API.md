@@ -190,6 +190,9 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active,tag,target_id}],count}` — enumerate every open tab, including who owns it. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
 | `closetab` | `{tag?}`, `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by **tag** (exact, race-free), index, or url-substring; won't close tab 0 or the last tab. Prefer `tag`: an index goes stale the instant another caller closes a lower-numbered tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
+| `prefetch` | `{urls,concurrency?,solve?,tries?,timeout?}` | `{job,count,concurrency,timeout}` — starts loading all of them in parallel tabs and returns IMMEDIATELY. Per-url `timeout` (30s) so one stalled page cannot hold the batch |
+| `jobs` | `{job?}` | counts: `{ready,loading,pending,errors,urls}` — cheap to poll, never ships page bodies |
+| `collect` | `{job,drain?}` | `{results:[{status,title,html,url,partial?}],remaining}` — every READY result, removed from the engine once handed over |
 | `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
 | `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
 | `cookies` | — | `{cookies:[{name,value,domain}]}` — the whole browser, incl. cleared `cf_clearance`. Feed these to an HTTP client to download a file the browser cleared for you. |

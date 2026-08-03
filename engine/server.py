@@ -171,6 +171,7 @@ class ND:
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
+        self.jobs = {}          # prefetch job id -> {results, total}
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
@@ -428,6 +429,143 @@ class ND:
         if isinstance(val, dict) and "__playwrong_error" in val:
             return {"error": f"js exception: {val['__playwrong_error']}"}
         return {"result": val}
+    # ── prefetch: fire a batch of urls, collect them when they are ready ─────────────────────────
+    # A page load is mostly WAITING. Fetching ten urls one at a time serialises ten waits; loading
+    # them in N tabs at once overlaps them, and the caller reads results as they land instead of
+    # blocking on the slowest page. Same one browser — each url gets its own tab, so nothing
+    # contends, and the tab is closed the moment its page has been captured.
+    async def _prefetch(self, urls, concurrency=8, solve=True, tries=20, timeout=30):
+        """Start a batch and return IMMEDIATELY with a job id. Nothing here blocks the caller."""
+        await self._ensure()
+        self._jobn = getattr(self, "_jobn", 0) + 1
+        job = f"job{self._jobn}"
+        urls = [u for u in (urls or []) if u]
+        self.jobs[job] = {"results": {}, "total": len(urls), "started": True}
+        # ensure_future, not await: this coroutine is already running ON the browser loop, so
+        # scheduling the batch and returning hands the HTTP thread its response right away while
+        # the tabs keep loading in the background.
+        asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout))
+        return {"job": job, "count": len(urls), "concurrency": concurrency, "timeout": timeout}
+
+    async def _batch(self, job, urls, concurrency, solve, tries, timeout=30):
+        """Load every url, at most `concurrency` at a time, each in its own tab.
+
+        PER-URL DEADLINE, not just a batch one. Measured on a real run: 7 of 8 pages finished in 3
+        seconds while a single wedged page held the batch for 104 more — exactly the stall this
+        feature exists to remove. A page that has not finished within `timeout` is recorded as timed
+        out and its tab closed, so one bad url costs one slot, never the whole batch.
+
+        `timeout` covers the load AND any Turnstile solve, so raise it for challenge-heavy batches:
+        a solve legitimately spends 10-30s clicking and waiting.
+        """
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+        store = self.jobs[job]["results"]
+
+        async def load(url, tabs):
+            t = await self.browser.get("about:blank", new_tab=True)
+            tabs[url] = t                       # recorded so a timeout can still close it
+            await t.get(url)
+            await t.sleep(2)
+            title = await t.evaluate("document.title")
+            html = await t.get_content()
+            passed = None
+            if solve and self._is_chal(title, html):
+                passed = False
+                for _ in range(tries):
+                    title = await t.evaluate("document.title")
+                    html = await t.get_content()
+                    if not self._is_chal(title, html):
+                        passed = True
+                        break
+                    try:
+                        el = await t.find("verify you are human", best_match=True, timeout=3)
+                        if el:
+                            await el.mouse_click()
+                            await t.sleep(4)
+                    except Exception:
+                        pass
+                    await t.sleep(1)
+            try: href = await t.evaluate("location.href")
+            except Exception: href = url
+            store[url] = {"status": "ready", "title": title, "html": html, "url": href,
+                          "requested": url, "challenge": passed}
+
+        async def one(url):
+            async with sem:                     # at most `concurrency` tabs open at once
+                store[url] = {"status": "loading"}
+                tabs = {}
+                try:
+                    await asyncio.wait_for(load(url, tabs), timeout=timeout)
+                except TimeoutError:
+                    # A load that never "finishes" usually still RENDERED — pypi.org does exactly
+                    # this, sitting on an open connection long after the content is there. Throwing
+                    # the page away because an event never fired would waste a perfectly good
+                    # capture, so take what rendered and mark it partial.
+                    store[url] = await self._partial(tabs.get(url), url, timeout)
+                    log("prefetch_timeout", url=url[:60], salvaged=store[url]["status"])
+                except Exception as e:
+                    store[url] = {"status": "error", "requested": url, "error": repr(e)[:200]}
+                    log("prefetch_err", url=url[:60], e=repr(e)[:80])
+                finally:
+                    t = tabs.get(url)
+                    if t is not None:
+                        try: await t.close()
+                        except Exception: pass
+
+        await asyncio.gather(*(one(u) for u in urls), return_exceptions=True)
+        await self._refresh()
+        log("prefetch_done", job=job, n=len(urls))
+
+    async def _partial(self, t, url, timeout):
+        """Best-effort capture from a tab whose load never completed. Returns a ready result when
+        there is real content, otherwise an honest error."""
+        if t is not None:
+            try:
+                title = await asyncio.wait_for(t.evaluate("document.title"), timeout=5)
+                html = await asyncio.wait_for(t.get_content(), timeout=10)
+                if html and len(html) > 500:      # enough to be a page, not a blank shell
+                    return {"status": "ready", "title": title, "html": html, "url": url,
+                            "requested": url, "partial": True}
+            except Exception:
+                pass
+        return {"status": "error", "requested": url, "error": f"timed out after {timeout}s"}
+
+    async def _jobstatus(self, job=None):
+        """Counts only — cheap to poll, and never ships page bodies you have not asked for."""
+        def summarise(j, d):
+            r = d["results"]
+            return {"job": j, "total": d["total"],
+                    "ready": sum(1 for v in r.values() if v.get("status") == "ready"),
+                    "loading": sum(1 for v in r.values() if v.get("status") == "loading"),
+                    "errors": sum(1 for v in r.values() if v.get("status") == "error"),
+                    "pending": d["total"] - len(r),
+                    "urls": {u: v.get("status") for u, v in r.items()}}
+        if job:
+            d = self.jobs.get(job)
+            return summarise(job, d) if d else {"error": f"no such job {job!r}"}
+        return {"jobs": [summarise(j, d) for j, d in self.jobs.items()]}
+
+    async def _collect(self, job, drain=True):
+        """Hand back every result that is READY, and by default forget them.
+
+        Draining matters: a batch of pages is tens of MB of HTML, and holding it after the caller has
+        read it is a slow memory leak in a long-lived server.
+        """
+        d = self.jobs.get(job)
+        if not d:
+            return {"error": f"no such job {job!r}"}
+        done = {u: v for u, v in d["results"].items() if v.get("status") in ("ready", "error")}
+        if drain:
+            for u in done:
+                d["results"].pop(u, None)
+            d["total"] -= len(done)
+            if d["total"] <= 0:
+                self.jobs.pop(job, None)
+        return {"job": job, "results": list(done.values()),
+                "remaining": max(0, d["total"] - len([v for v in d["results"].values()
+                                                      if v.get("status") in ("ready", "error")]))
+                if d else 0}
+
     async def _cookies(self):
         await self._ensure()
         cks = await self.browser.cookies.get_all()
@@ -449,7 +587,12 @@ class ND:
            "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True),
                                             a.get("tag")),
            "closeextra":lambda:self._closeextra(),
-           "cdp":lambda:self._cdp_info()}
+           "cdp":lambda:self._cdp_info(),
+           "prefetch":lambda:self._prefetch(a.get("urls"),a.get("concurrency",8),
+                                            a.get("solve",True),a.get("tries",20),
+                                            a.get("timeout",30)),
+           "jobs":lambda:self._jobstatus(a.get("job")),
+           "collect":lambda:self._collect(a.get("job"),a.get("drain",True))}
         if op not in m: return {"error":f"unknown {op}"}
         try: return self.run(m[op]())
         except Exception as e:

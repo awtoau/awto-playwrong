@@ -92,6 +92,28 @@ def t_pdf(url, max_chars=40000):
     return f"# {os.path.basename(r['path'])}\nURL: {url}\n\n{text}"
 
 
+def t_prefetch(urls, concurrency=8, timeout=30):
+    job = connect.prefetch(urls, concurrency=concurrency, timeout=timeout)
+    return (f"started job {job}: {len(urls)} urls loading, {concurrency} at a time.\n"
+            f"Go do something else, then call `collect` with job=\"{job}\" to take the pages that "
+            f"are ready. Call it again for the rest.")
+
+
+def t_collect(job, wait=0, max_chars=40000):
+    r = connect.collect(job, max_chars=max_chars, wait=wait, want=1)
+    if not r["results"]:
+        return (f"nothing ready yet for {job} ({r.get('remaining', '?')} still loading). "
+                f"Call collect again, or pass wait=10 to block for up to 10s.")
+    parts = []
+    for item in r["results"]:
+        if item.get("error"):
+            parts.append(f"## {item['url']}\nFAILED: {item['error']}")
+        else:
+            parts.append(item["text"])
+    return (f"[{len(r['results'])} ready, {r.get('remaining', 0)} still loading]\n\n"
+            + "\n\n———\n\n".join(parts))
+
+
 def t_search(query, max_results=10):
     hits = connect.search(query, max_results=max_results)
     if not hits:
@@ -215,6 +237,36 @@ TOOLS = [
              "`curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -` is still fine and cheaper."),
          schema={"type": "object", "required": ["url"], "properties": {
              "url": {"type": "string", "description": "Direct url to the PDF."},
+             "max_chars": {"type": "integer", "default": 40000}}}),
+
+    dict(name="prefetch", fn=t_prefetch,
+         description=(
+             "Start loading MANY urls at once and return immediately with a job id — then call "
+             "`collect` for the pages as they finish. Use this instead of looping `fetch` whenever "
+             "you have several urls: a page load is almost entirely waiting, so loading 8 at a time "
+             "overlaps the waiting and you read results while the rest are still loading. Each url "
+             "gets its own tab, and a url that stalls is timed out (with whatever rendered salvaged) "
+             "rather than holding up the others."),
+         schema={"type": "object", "required": ["urls"], "properties": {
+             "urls": {"type": "array", "items": {"type": "string"},
+                      "description": "Absolute URLs to load."},
+             "concurrency": {"type": "integer", "default": 8,
+                             "description": "How many tabs load at once."},
+             "timeout": {"type": "integer", "default": 30,
+                         "description": "Per-url seconds before it is timed out. Raise it for "
+                                        "pages behind a Cloudflare challenge."}}}),
+
+    dict(name="collect", fn=t_collect,
+         description=(
+             "Take the pages from a `prefetch` job that are READY, as readable text. Returns "
+             "immediately with whatever has finished and tells you how many are still loading — "
+             "call it again for the rest. Results are handed over once and then forgotten, so each "
+             "page comes back exactly once."),
+         schema={"type": "object", "required": ["job"], "properties": {
+             "job": {"type": "string", "description": "The job id from `prefetch`."},
+             "wait": {"type": "integer", "default": 0,
+                      "description": "Seconds to wait for at least one result before returning. 0 = "
+                                     "take what is ready right now."},
              "max_chars": {"type": "integer", "default": 40000}}}),
 
     dict(name="search", fn=t_search,

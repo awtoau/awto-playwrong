@@ -2,6 +2,7 @@
 
     playwrong https://awto.au                 # text of the page
     playwrong https://a.com https://b.com     # several, reusing the SAME warm browser
+    playwrong -j 8 url1 url2 ... url20        # 8 at a time, printed as each finishes
     playwrong https://awto.au --links         # keep hrefs, so you can pick the next url
     playwrong https://awto.au --html          # raw markup
     playwrong https://awto.au --shot page.png # also save a screenshot
@@ -68,6 +69,9 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument("--no-solve", action="store_true", help="don't auto-clear Cloudflare challenges")
     p.add_argument("--tries", type=int, default=20, help="max challenge-solve iterations")
+    p.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                   help="load N urls IN PARALLEL and print each as it finishes, instead of one at a "
+                        "time (try 8). A page load is mostly waiting; this overlaps the waiting.")
     p.add_argument("--port", type=int, help="use/start an engine on this port (a second browser)")
     p.add_argument("-q", "--quiet", action="store_true", help="no progress notes on stderr")
     p.add_argument("--status", action="store_true", help="report engine/browser state and exit")
@@ -135,6 +139,29 @@ def main(argv=None):
         return 0
 
     fmt = "html" if a.html else ("text+links" if a.links else "text")
+
+    if a.jobs > 1 and len(a.urls) > 1:
+        # Parallel: results arrive in COMPLETION order, not the order given, so each is labelled.
+        results, failed, n = [], 0, 0
+        for r in connect.fetch_many(a.urls, concurrency=a.jobs, mode=fmt, max_chars=a.max_chars,
+                                    solve=not a.no_solve, tries=a.tries, port=a.port,
+                                    on_start=note, profile=a.profile):
+            results.append(r)
+            if r.get("error"):
+                failed += 1
+                print(f"{r['url']}: {r['error']}", file=sys.stderr)
+                continue
+            if not a.json:
+                if n:
+                    print("\n" + "─" * 72 + "\n")
+                print(r["text"])
+            n += 1
+        if a.json:
+            print(json.dumps(results, indent=2))
+        if note:
+            note(f"{n}/{len(a.urls)} pages, {a.jobs} at a time")
+        return 1 if failed else 0
+
     results, failed = [], 0
     for i, url in enumerate(a.urls):
         try:

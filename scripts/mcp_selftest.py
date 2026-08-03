@@ -195,6 +195,17 @@ def live_tests(c):
     ok("search returns no ads or DDG furniture", "duckduckgo.com" not in body,
        next((ln for ln in body.splitlines() if "duckduckgo.com" in ln), ""))
 
+    # prefetch/collect: fire a batch, take results as they land. The point is that this is FASTER
+    # than looping fetch and that a stalled url cannot hold the rest.
+    t0 = time.monotonic()
+    r = c.call("prefetch", urls=[TEST_URL, "https://example.org", TEST_URL], concurrency=3)
+    ok("prefetch returns immediately with a job", "job" in text_of(r) and time.monotonic()-t0 < 5,
+       f"{time.monotonic()-t0:.1f}s")
+    job = text_of(r).split("job ")[1].split(":")[0].strip()
+    r = c.call("collect", job=job, wait=30, max_chars=200)
+    body = text_of(r)
+    ok("collect returns prefetched pages", "Example Domain" in body, body.splitlines()[0][:60])
+
     c.call("close_tab", close_extra=True)
     r = c.call("tabs")
     ok("close_extra leaves only the base tab", json.loads(text_of(r)).get("count") == 1)
@@ -215,6 +226,17 @@ def cloudflare_test(c):
        not walled and "nowsecure" in body.lower(),
        f"{len(body)} chars in {dt:.1f}s — {body[:120]!r}")
     ok("cf_clearance cookie present", "cf_clearance" in text_of(c.call("cookies")))
+    # prefetch/collect: fire a batch, take results as they land. The point is that this is FASTER
+    # than looping fetch and that a stalled url cannot hold the rest.
+    t0 = time.monotonic()
+    r = c.call("prefetch", urls=[TEST_URL, "https://example.org", TEST_URL], concurrency=3)
+    ok("prefetch returns immediately with a job", "job" in text_of(r) and time.monotonic()-t0 < 5,
+       f"{time.monotonic()-t0:.1f}s")
+    job = text_of(r).split("job ")[1].split(":")[0].strip()
+    r = c.call("collect", job=job, wait=30, max_chars=200)
+    body = text_of(r)
+    ok("collect returns prefetched pages", "Example Domain" in body, body.splitlines()[0][:60])
+
     c.call("close_tab", close_extra=True)
 
 

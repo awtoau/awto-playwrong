@@ -548,6 +548,72 @@ def pdf(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=
     return out
 
 
+# ── prefetch: overlap the waiting ────────────────────────────────────────────────────────────────
+
+def prefetch(urls, concurrency=8, solve=True, tries=20, timeout=30, port=None, on_start=None,
+             profile=None):
+    """Start loading many urls at once and return IMMEDIATELY with a job id.
+
+    Fetching pages one at a time serialises their load times, and a page load is almost entirely
+    waiting. This hands the whole list to the engine, which loads up to `concurrency` of them in
+    parallel tabs and holds each result until you collect it — so you fire the batch, go do
+    something else, and read the pages as they land instead of blocking on the slowest one.
+    """
+    port = ensure(port, on_start=on_start, profile=profile)
+    return call("prefetch", port=port, urls=list(urls), concurrency=concurrency,
+                solve=solve, tries=tries, timeout=timeout)["job"]
+
+
+def poll(job, port=None):
+    """Counts only — how many are ready, loading, still queued, failed. Cheap to call in a loop."""
+    return call("jobs", port=port, job=job)
+
+
+def collect(job, mode="text", max_chars=40000, port=None, wait=0.0, want=1):
+    """Take whatever is READY (rendered like capture() does) and forget it engine-side.
+
+    wait: seconds to keep waiting for at least `want` results before giving up and returning what
+    there is. 0 = take what is ready this instant and return. Polls at 0.5s, which is far below a
+    page load and cheap enough not to matter.
+    """
+    deadline = time.monotonic() + max(0.0, wait)
+    out = []
+    while True:
+        r = call("collect", port=port, job=job)
+        for item in r.get("results", []):
+            if item.get("status") == "error":
+                out.append({"url": item.get("requested"), "error": item.get("error"), "text": None})
+            else:
+                out.append({"url": item.get("url"), "title": item.get("title"),
+                            "challenge": item.get("challenge"),
+                            "text": render(item, mode, max_chars)})
+        if out and len(out) >= want:
+            return {"results": out, "remaining": r.get("remaining", 0)}
+        if time.monotonic() >= deadline:
+            return {"results": out, "remaining": r.get("remaining", 0)}
+        time.sleep(0.5)
+
+
+def fetch_many(urls, concurrency=8, mode="text", max_chars=40000, solve=True, tries=20,
+               port=None, on_start=None, profile=None, timeout=300.0, per_url=30):
+    """prefetch + drain: every page, in parallel, yielded as each one finishes.
+
+    A generator so a caller can start using the first page while the rest are still loading.
+    `timeout` is a whole-batch ceiling — without one a single wedged page would hang the generator
+    forever; 300s is generous for 8 concurrent loads and still bounded.
+    """
+    job = prefetch(urls, concurrency=concurrency, solve=solve, tries=tries, timeout=per_url,
+                   port=port, on_start=on_start, profile=profile)
+    seen, deadline = 0, time.monotonic() + timeout
+    while seen < len(urls) and time.monotonic() < deadline:
+        got = collect(job, mode=mode, max_chars=max_chars, port=port, wait=2.0)
+        for item in got["results"]:
+            seen += 1
+            yield item
+        if not got["results"] and got.get("remaining", 0) == 0 and seen >= len(urls):
+            break
+
+
 def save_shot(path, port=None, on_start=None):
     b64 = op("shot", port=port, on_start=on_start, timeout=90.0)["b64"]
     with open(path, "wb") as f:

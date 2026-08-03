@@ -122,6 +122,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 |---|---|
 | **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
 | **`pdf`** | A PDF that plain HTTP can't reach, as text: clears the wall, downloads through the cleared session (cookies + matching User-Agent), extracts the text. |
+| **`prefetch`** + **`collect`** | **A list of urls.** Fires them all off (8 tabs by default), returns a job id immediately; `collect` hands you pages as they finish. Don't loop `fetch` — see below. |
 | **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
 | `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
@@ -135,6 +136,38 @@ launch forever; the engine now clears it automatically if its owning process is 
 
 `mode` on the text-returning tools: `text` (default), `text+links` (keeps hrefs as `anchor <url>` so
 you can navigate without a second round-trip), or `html` (raw source, when you need markup).
+
+### Why `prefetch`/`collect` exist — don't loop `fetch`
+
+A page load is almost entirely **waiting**. Looping `fetch` over ten urls serialises ten waits, and
+one slow page blocks every page behind it. Measured on eight real urls: **119s sequential vs 3.5s for
+seven of the eight in parallel.**
+
+```
+prefetch(urls=[...20 urls...])   -> "started job1: 20 urls loading, 8 at a time"
+   ...go do other work, or just call collect...
+collect(job="job1")              -> "[6 ready, 14 still loading]" + the six pages
+collect(job="job1", wait=10)     -> blocks up to 10s for the next batch
+```
+
+Results come back in **completion order**, are handed over exactly once, then forgotten engine-side
+(a batch of pages is tens of MB of HTML; holding it after you have read it is a slow leak).
+
+**A stalled url costs one slot, never the batch.** Each url has its own deadline (`timeout`, 30s
+default). Some real pages never fire a load event at all — `pypi.org` sits on an open connection long
+after the content has rendered — so on timeout whatever *did* render is captured and marked partial
+rather than thrown away. Raise `timeout` for urls behind a Cloudflare challenge, since a solve
+legitimately spends 10-30s.
+
+The same thing from the shell and from Python:
+
+```sh
+playwrong -j 8 url1 url2 ... url20      # 8 at a time, printed as each finishes
+```
+```python
+for page in connect.fetch_many(urls, concurrency=8):   # a generator: use the first while the
+    print(page["text"])                                 # rest are still loading
+```
 
 ### Why `pdf` exists
 
