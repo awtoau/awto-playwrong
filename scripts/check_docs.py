@@ -6,8 +6,13 @@ repo shipped `mcp/server.py` in four documents after the file moved, and told pe
 
   1. every repo-relative path mentioned in a markdown file exists
   2. no doc references a file the repo no longer has (a stale-name blocklist)
-  3. every `playwrong` CLI flag shown in the docs is a real flag
-  4. every MCP tool named in docs/MCP.md's table is a real registered tool
+  3. every `playwrong` CLI flag shown in the docs is a real flag — AND every real flag is documented
+  4. every MCP tool named in docs/MCP.md's table is a real registered tool, and vice versa
+  5. every script in scripts/ is mentioned somewhere in the docs
+
+Checks 3-5 run in BOTH directions on purpose. Only checking documented-thing-exists lets new work go
+undocumented indefinitely: that hole hid six CLI flags and four scripts, including -j/--jobs, which
+is the entire parallel-fetch mode.
 
     python scripts/check_docs.py
 
@@ -98,6 +103,28 @@ def check_cli_flags():
                     note("unknown CLI flag", doc, f"{flag} in {line.strip()[:70]}")
 
 
+UNDOCUMENTED_OK = {"--help"}          # argparse's own; nothing to say about it
+
+
+def check_flags_documented():
+    """The reverse of check_cli_flags: a real flag nobody wrote down is invisible to users."""
+    help_text = subprocess.run([sys.executable, os.path.join(REPO, "engine", "cli.py"), "--help"],
+                               capture_output=True, text=True).stdout
+    real = set(re.findall(r"--[a-z][a-z-]+", help_text)) - UNDOCUMENTED_OK
+    blob = "\n".join(open(os.path.join(REPO, d)).read() for d in DOCS)
+    for flag in sorted(real):
+        if flag not in blob:
+            note("CLI flag is undocumented", "README.md/docs", flag)
+
+
+def check_scripts_documented():
+    d = os.path.join(REPO, "scripts")
+    blob = "\n".join(open(os.path.join(REPO, x)).read() for x in DOCS)
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".py") and f not in blob:
+            note("script is undocumented", "README.md/docs", f"scripts/{f}")
+
+
 def check_mcp_tools():
     sys.path.insert(0, REPO)
     from engine import mcp_server
@@ -119,6 +146,8 @@ def main():
     check_paths()
     check_gone()
     check_cli_flags()
+    check_flags_documented()
+    check_scripts_documented()
     check_mcp_tools()
     for p in problems:
         print(p)

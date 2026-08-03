@@ -72,6 +72,30 @@ text.
 ./playwrong --stop                        # stop the shared engine
 ```
 
+### Every option
+
+| Flag | What |
+|---|---|
+| `-j N`, `--jobs N` | load N urls **in parallel**, printing each as it finishes. A page load is mostly waiting; this overlaps it. |
+| `-s`, `--search Q` | DuckDuckGo results as `title + url` (curl gets a CAPTCHA; a real browser doesn't) |
+| `-n N` | max search results (default 10) |
+| `--pdf URL` | download a PDF **through the cleared session** and print its text |
+| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the cache dir) |
+| `--links` / `--html` | keep hrefs as `anchor <url>` / return raw markup instead of text |
+| `--max-chars N` | truncate each page (`0` = no limit; default 40000) |
+| `--shot PATH` | also save a PNG. Several urls get `name-0.png`, `name-1.png`. |
+| `--json` | machine-readable output instead of text |
+| `--no-solve` | don't auto-clear Cloudflare challenges |
+| `--tries N` | max challenge-solve iterations (default 20) |
+| `--profile NAME` | persistent named Chrome profile — logins survive a restart |
+| `--agent NAME` | how this caller is labelled in tab titles and `--tabs` |
+| `--tabs` | list every open tab with the agent and repo that opened it |
+| `--port N` | use/start an engine on another port (a second, isolated browser) |
+| `-q`, `--quiet` | no progress notes on stderr |
+| `--status` / `--stop` | what's running / stop the shared engine |
+
+Progress notes go to stderr and the page to stdout, so `playwrong <url> > page.txt` stays clean.
+
 **You never manage a host:port.** The engine is a long-lived local server on a fixed default port
 (`PH_PORT`, 8731). The first command starts it; every later command finds it already up and reuses
 it — same browser, same cookies, same cleared Turnstile session, no cold start (~3s cold, ~2s warm).
@@ -93,6 +117,22 @@ python engine/client.py shot page.png
 
 Or POST directly to the port from anything: `curl -s localhost:8731/goto -d '{"url":"..."}'`. The
 browser stays alive between calls. The rest of this README is for crawling many pages.
+
+## Testing and maintenance
+
+Every one of these runs standalone and prints a pass/fail tally.
+
+| Script | What it proves |
+|---|---|
+| `scripts/doctor.py` | preflight: Python, deps, vendored nodriver, Chrome, display, port. Prints the exact fix command for anything missing. |
+| `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup. `--cloudflare` adds a real Turnstile wall. |
+| `scripts/stress_test.py` | the edge cases: duplicate and bad urls, empty batches, double collect, missing tabs, a batch running while someone else drives, malformed requests. |
+| `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
+| `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume. No browser or network needed. |
+| `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
+| `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
+| `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |
+| `scripts/install.py` | deps, the `playwrong` command on PATH, and both MCP registries. |
 
 ## Why this exists
 Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**
@@ -131,12 +171,30 @@ python engine/client.py solvecf                  # clear a Turnstile challenge
 python engine/client.py text                     # get the page HTML
 python engine/client.py shot frame.png           # screenshot
 ```
-From your own Python, use the same code path the CLI and the MCP server use:
+From your own Python, use the same code path the CLI and the MCP server use — `engine/connect.py`:
+
 ```python
 from engine import connect
+
 page = connect.capture("https://awto.au")        # starts engine+Chrome, solves, closes its tab
-print(page["text"])
+print(page["text"])                              # {text, title, url, challenge}
 ```
+
+| Function | What |
+|---|---|
+| `capture(url, mode=, max_chars=, solve=)` | one page, own tab, auto-solve, auto-cleanup |
+| `fetch_many(urls, concurrency=8)` | a **generator** — every page in parallel, yielded as each finishes |
+| `prefetch(urls, concurrency=, timeout=)` | start a batch, return a job id immediately |
+| `poll(job)` | counts only: ready / loading / pending / errors / done |
+| `collect(job, wait=, max_chars=)` | take whatever is ready; each page delivered exactly once |
+| `search(query, max_results=)` | DuckDuckGo results as `[{title, url}]` |
+| `pdf(url)` / `download(url, path=)` | a file from behind a bot wall, via the cleared session |
+| `session_headers(url)` | just the `{Cookie, User-Agent, Referer}`, to drive a transfer yourself |
+| `ensure(port=, profile=)` | engine + Chrome up; idempotent, and safe when many processes call it at once |
+| `call(op, **body)` / `op(op, **body)` | any raw engine verb, without / with an auto-start |
+
+The crawl library adds `CrawlDB.host_counts()` — pages already attempted per host, which is what makes
+`--max-per-host` survive a resume.
 Launching `engine/server.py` by hand still works if you want it in the foreground — and it needs no
 `PYTHONPATH`, since it puts `vendor/` on `sys.path` itself.
 Or POST directly: `POST http://127.0.0.1:8731/goto {"url": "..."}` → returns the capture.
