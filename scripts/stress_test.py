@@ -164,6 +164,30 @@ def t_batch_plus_interactive():
        f"{checks} checks, {wrong} wrong")
 
 
+# ── ownership labelling ─────────────────────────────────────────────────────────────────────────
+
+def t_owner_labelling():
+    """The owner must be visible IN the browser and invisible in the data."""
+    tag, owner = "stress-owner", "stressbot@somerepo:999"
+    connect.call("newtab", port=PORT, url="about:blank", tag=tag, owner=owner)
+    r = connect.call("goto", port=PORT, url="https://example.com", tab=tag, timeout=60)
+    shown = connect.call("js", port=PORT, expr="document.title", tab=tag).get("result") or ""
+    ok("the browser tab title names its owner", owner in shown, shown[:70])
+    ok("the API title stays clean", r["title"] == "Example Domain", repr(r["title"]))
+    ok("read-back title stays clean",
+       connect.call("text", port=PORT, tab=tag)["title"] == "Example Domain")
+    listed = [t for t in connect.call("tabs", port=PORT, method="GET")["tabs"]
+              if t.get("tag") == tag]
+    ok("tabs reports the owner", listed and listed[0].get("owner") == owner,
+       json.dumps(listed[:1])[:90])
+    ok("tabs reports a clean title too", listed and listed[0].get("title") == "Example Domain")
+    # Re-navigating must not stack a second label on the same tab.
+    connect.call("goto", port=PORT, url="https://example.org", tab=tag, timeout=60)
+    again = connect.call("js", port=PORT, expr="document.title", tab=tag).get("result") or ""
+    ok("re-navigating does not stack labels", again.count("\u27e6") == 1, again[:70])
+    connect.call("closetab", port=PORT, tag=tag)
+
+
 # ── protocol robustness ─────────────────────────────────────────────────────────────────────────
 
 def t_malformed():
@@ -228,7 +252,7 @@ def main():
 
     for fn in (t_duplicate_urls, t_bad_urls, t_empty_and_unknown, t_drain_once,
                t_more_than_concurrency, t_tabs_return_to_baseline, t_bad_tag, t_close_twice,
-               t_batch_plus_interactive, t_malformed, t_parallel_ops, t_processes):
+               t_batch_plus_interactive, t_owner_labelling, t_malformed, t_parallel_ops, t_processes):
         try:
             fn()
         except Exception as e:

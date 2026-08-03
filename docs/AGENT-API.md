@@ -186,7 +186,7 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `move` | `{x,y}` | `{ok,x,y}` — CDP synthetic mouse move (no real-cursor jump) |
 | `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
 | `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
-| `newtab` | `{url?, tag?}` | `{ok,url,index,tag,target_id}` — fresh tab. **Pass a `tag`** and every later op can name it via `tab`, which is how concurrent callers avoid driving each other's page |
+| `newtab` | `{url?, tag?, owner?}` | `{ok,url,index,tag,target_id}` — fresh tab. **Pass a `tag`** and every later op can name it via `tab`, which is how concurrent callers avoid driving each other's page. `owner` ("agent@repo:pid") is prefixed to the tab's TITLE so a human can see who opened it, and stripped from every title the API returns |
 | `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active,tag,target_id}],count}` — enumerate every open tab, including who owns it. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
 | `closetab` | `{tag?}`, `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by **tag** (exact, race-free), index, or url-substring; won't close tab 0 or the last tab. Prefer `tag`: an index goes stale the instant another caller closes a lower-numbered tab |
 | `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |

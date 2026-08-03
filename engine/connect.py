@@ -37,6 +37,47 @@ from html.parser import HTMLParser
 SESSION = f"pw-{os.getpid()}-{zlib.crc32(os.urandom(8)):x}"
 _seq = itertools.count()
 
+
+def _repo_of(path):
+    """The git repo a path sits in, by name. Walking up for .git beats using the bare directory
+    name: an agent started in a subdirectory should still report the project, not `src`."""
+    d = os.path.abspath(path)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return os.path.basename(d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.basename(os.path.abspath(path))
+        d = parent
+
+
+def owner_label():
+    """Who is driving, in a form a human can read off the tab strip.
+
+    One shared browser plus several agents means the obvious question, looking at a window full of
+    tabs, is "who opened THAT one?" — so every tab carries this. It is derived automatically because
+    an identity you have to remember to pass is an identity that will be missing exactly when you
+    need it; PLAYWRONG_AGENT overrides the guessed name when you want something specific.
+    """
+    agent = (os.environ.get("PLAYWRONG_AGENT") or "").strip()
+    if not agent:
+        argv0 = os.path.basename(sys.argv[0] or "")
+        # argv[0] is "-c" for `python -c` and "" for a REPL — neither identifies anything.
+        if argv0 and not argv0.startswith("-"):
+            agent = argv0.removesuffix(".py")
+        if agent == "mcp_server":
+            agent = "mcp"               # what the caller IS, not the file that implements it
+    if not agent:
+        try:                            # the parent tells you more than "python" does
+            with open(f"/proc/{os.getppid()}/comm") as f:
+                agent = f.read().strip()
+        except OSError:
+            agent = "python"
+    return f"{agent}@{_repo_of(os.getcwd())}:{os.getpid()}"
+
+
+OWNER = owner_label()
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -374,7 +415,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
     port = ensure(port, on_start=on_start, profile=profile)
     with _lock:
         tag = f"{SESSION}-{next(_seq)}"
-        idx = call("newtab", port=port, url="about:blank", tag=tag).get("index", -1)
+        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
         final_url, out = None, {}
         try:
             landed = call("goto", port=port, url=url, tab=tag, timeout=90.0)
@@ -517,7 +558,7 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
     port = ensure(port, on_start=on_start, profile=profile)
     with _lock:
         tag = f"{SESSION}-{next(_seq)}"
-        idx = call("newtab", port=port, url="about:blank", tag=tag).get("index", -1)
+        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
         final_url = None
         try:
             # Navigate to the ORIGIN, not the file: a challenge is served per-origin, and going
@@ -614,7 +655,7 @@ def prefetch(urls, concurrency=8, solve=True, tries=20, timeout=30, port=None, o
     """
     port = ensure(port, on_start=on_start, profile=profile)
     return call("prefetch", port=port, urls=list(urls), concurrency=concurrency,
-                solve=solve, tries=tries, timeout=timeout)["job"]
+                solve=solve, tries=tries, timeout=timeout, owner=OWNER)["job"]
 
 
 def poll(job, port=None):

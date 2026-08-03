@@ -234,6 +234,34 @@ act on its own page regardless of what anyone else is doing:
 Nothing about this needs configuring. Each MCP server process takes an identity at startup and tags
 accordingly, so N agents pointed at the same engine simply work.
 
+### Seeing who owns what
+
+With one browser and several agents, the obvious question looking at a window full of tabs is *who
+opened that?* — so every tab carries its owner:
+
+```
+$ playwrong --tabs
+ #  OWNER                            TITLE                    URL
+ 0  -                                about:blank              about:blank
+ 1  claude@awto-vyvanse:41792        Notion Reviews | G2      https://www.g2.com/...
+ 2  mcp@awto-playwrong:41830         Web crawler - Wikipedia  https://en.wikipedia.org/...
+```
+
+The same label is prefixed to the **tab title in the browser**, so the window title and tab strip
+name the owner without you having to ask the API at all:
+
+```
+⟦claude@awto-vyvanse:41792⟧ Notion Reviews 2026 | G2
+```
+
+It is stripped from every title the API returns, so a capture, a `fetch` result and `--tabs` all show
+the page's own title — the label is decoration for the human watching the screen, never data.
+
+**Nothing has to be passed in.** The label is `agent@repo:pid`, derived from the program that is
+running and the git repo it was started in — an identity you must remember to supply is one that
+will be missing exactly when you need it. Override it when you want something specific:
+`playwrong --agent researcher <url>`, or `PLAYWRONG_AGENT=researcher` in the MCP entry's `env`.
+
 ### Why this was needed
 
 Before tagging, every op acted on the engine's single **active** tab. Two agents interleaved: A

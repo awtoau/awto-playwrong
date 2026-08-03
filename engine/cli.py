@@ -9,6 +9,8 @@
     playwrong https://awto.au --json          # {text,title,url,challenge} for scripting
     playwrong --pdf https://site/paper.pdf    # a PDF from behind a bot wall, as text
     playwrong --profile work https://site     # persistent named profile (logins survive)
+    playwrong --tabs                          # who (agent@repo) has which tab open
+    playwrong --agent researcher <url>        # label this caller in the browser + --tabs
     playwrong --status                        # is anything running?
     playwrong --stop                          # stop the shared engine (affects everyone)
 
@@ -57,6 +59,11 @@ def main(argv=None):
                    help="download a PDF (or any file) THROUGH the cleared session and print its "
                         "text — works when the file sits behind a bot wall that curl alone can't pass")
     p.add_argument("-o", "--out", metavar="PATH", help="where --pdf/--shot writes (default tmp/)")
+    p.add_argument("--agent", metavar="NAME",
+                   help="how this caller is labelled in tab titles and --tabs (default: guessed "
+                        "from the program and the git repo you are in). Same as PLAYWRONG_AGENT.")
+    p.add_argument("--tabs", action="store_true",
+                   help="list every open tab with the agent and repo that opened it")
     p.add_argument("--profile", metavar="NAME",
                    help="use a persistent, named Chrome profile so logins and cleared sessions "
                         "survive a restart. Each name gets its own engine on its own stable port.")
@@ -79,6 +86,10 @@ def main(argv=None):
                    help="shut the engine down — it is SHARED, this stops it for everyone")
     a = p.parse_args(argv)
     note = None if a.quiet else _note
+    if a.agent:
+        # Set before anything derives OWNER, so the label applies to tabs opened by this run.
+        os.environ["PLAYWRONG_AGENT"] = a.agent
+        connect.OWNER = connect.owner_label()
 
     if a.stop:
         try:
@@ -88,6 +99,21 @@ def main(argv=None):
             print("engine stopped")
         except connect.EngineError:
             print("engine was not running")           # already-stopped is the desired state, not an error
+        return 0
+
+    if a.tabs:
+        port = a.port or (connect.profile_port(a.profile) if a.profile else connect.default_port())
+        if not connect.reachable(port):
+            print("no engine running")
+            return 0
+        tabs = connect.call("tabs", port=port, method="GET").get("tabs", [])
+        if a.json:
+            print(json.dumps(tabs, indent=2))
+        else:
+            print(f"{'#':>2}  {'OWNER':32} {'TITLE':34} URL")
+            for t in tabs:
+                print(f"{t['index']:>2}  {(t.get('owner') or '-'):32.32} "
+                      f"{(t.get('title') or '-'):34.34} {(t.get('url') or '')[:44]}")
         return 0
 
     if a.pdf:

@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import traceback
@@ -97,6 +98,19 @@ TMP = data_dir()
 LOG = os.path.join(TMP, "nd-server.log")
 CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
+# Ownership shown IN the tab title, so a human looking at a shared browser can tell at a glance which
+# agent and which repo opened a given tab. The brackets are the rare "white square" pair specifically
+# so the marker cannot collide with anything a real page would put in its own title, which is what
+# makes stripping it again exact rather than a guess.
+OWNER_L, OWNER_R = "\u27e6", "\u27e7"
+OWNER_TITLE_RE = re.compile(rf"^{OWNER_L}[^{OWNER_R}]*{OWNER_R}\s*")
+
+
+def strip_owner(title):
+    """Titles reported by the API are the page's own. The label is decoration for the human watching
+    the window, and must never leak into a capture, a result, or a caller's data."""
+    return OWNER_TITLE_RE.sub("", title or "")
+
 # Serialise the caller's expression IN THE PAGE and hand back a JSON string.
 #
 # Reading nodriver's return value directly does not work: it yields a RemoteObject for anything that
@@ -173,6 +187,7 @@ class ND:
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
         self.jobs = {}          # prefetch job id -> {slots, total, delivered}
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
+        self.owners = {}        # target_id -> "agent@repo:pid", shown in the tab title and /tabs
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
@@ -241,10 +256,27 @@ class ND:
     async def _goto(self, url, tab=None):
         t = await self._tab(tab)
         await t.get(url); await t.sleep(2)
+        await self._label(t)
         # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
         # two differ, and a caller that stores the requested url records a page it never got.
-        return {"title": await t.evaluate("document.title"),
+        return {"title": strip_owner(await t.evaluate("document.title")),
                 "url": await self._href(t), "requested": url}
+    async def _label(self, t):
+        """Prefix this tab's title with its owner, best effort.
+
+        Best effort on purpose: a single-page app rewrites document.title whenever it likes, so the
+        label is a convenience for whoever is watching the screen, never something the code relies
+        on. Failing to set it must never fail the navigation that just succeeded."""
+        owner = self.owners.get(getattr(getattr(t, "target", None), "target_id", None))
+        if not owner:
+            return
+        try:
+            await t.evaluate(
+                "(()=>{const m=%r,o=%r;const t=document.title.replace(/^\u27e6[^\u27e7]*\u27e7\s*/,'');"
+                "document.title=m+o+'\u27e7 '+t;return 1})()" % (OWNER_L, owner))
+        except Exception:
+            pass
+
     async def _href(self, t=None):
         """Authoritative current url. nodriver's Tab has no .url attribute (only .target.url, which
         lags), so ask the page."""
@@ -266,8 +298,8 @@ class ND:
         return {"passed":False,"iter":tries}
     async def _text(self, tab=None):
         t = await self._tab(tab)
-        return {"title":await t.evaluate("document.title"),"html":await t.get_content(),
-                "url": await self._href(t)}
+        return {"title":strip_owner(await t.evaluate("document.title")),
+                "html":await t.get_content(),"url": await self._href(t)}
     async def _frame(self, tab=None):
         t = await self._tab(tab)
         # Per-tab filename: two agents screenshotting at once would otherwise overwrite each other's
@@ -306,7 +338,7 @@ class ND:
         else:
             await tb.send(cdp.input_.dispatch_key_event(type_="char", text=key))
         return {"ok":1,"key":key}
-    async def _newtab(self, url="about:blank", tag=None):
+    async def _newtab(self, url="about:blank", tag=None, owner=None):
         """Open a tab and, optionally, TAG it as yours.
 
         A tag is how one agent keeps its work separate from another's inside a single shared
@@ -319,7 +351,10 @@ class ND:
         tid = getattr(getattr(t, "target", None), "target_id", None)
         if tag:
             self.tags[tag] = tid
-        return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"target_id":str(tid or "")}
+        if owner:
+            self.owners[tid] = owner
+        return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"owner":owner,
+                "target_id":str(tid or "")}
     # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
     # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
     # single-tab crawler that opened 8 tabs/run and never closed them left 22 orphan renderers). These
@@ -349,8 +384,9 @@ class ND:
             ti = getattr(t, "target", None)
             tid = getattr(ti, "target_id", None)
             out.append({"index":i,"url":getattr(ti,"url","") or "",
-                        "title":getattr(ti,"title","") or "","active":(t is self.tab),
-                        "tag":by_id.get(tid),"target_id":str(tid or "")})
+                        "title":strip_owner(getattr(ti,"title","") or ""),
+                        "active":(t is self.tab),"tag":by_id.get(tid),
+                        "owner":self.owners.get(tid),"target_id":str(tid or "")})
         return {"tabs":out,"count":len(out)}
     async def _await_closed(self, ids):
         """Wait until Chrome has actually destroyed the targets we asked it to close.
@@ -444,7 +480,7 @@ class ND:
     # them in N tabs at once overlaps them, and the caller reads results as they land instead of
     # blocking on the slowest page. Same one browser — each url gets its own tab, so nothing
     # contends, and the tab is closed the moment its page has been captured.
-    async def _prefetch(self, urls, concurrency=8, solve=True, tries=20, timeout=30):
+    async def _prefetch(self, urls, concurrency=8, solve=True, tries=20, timeout=30, owner=None):
         """Start a batch and return IMMEDIATELY with a job id. Nothing here blocks the caller."""
         await self._ensure()
         self._jobn = getattr(self, "_jobn", 0) + 1
@@ -455,7 +491,7 @@ class ND:
         # forever. Duplicates in a url list are completely ordinary.
         self.jobs[job] = {"slots": {}, "total": len(urls), "delivered": 0}
         self._reap_jobs()
-        asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout))
+        asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout, owner))
         return {"job": job, "count": len(urls), "concurrency": concurrency, "timeout": timeout}
 
     def _reap_jobs(self):
@@ -470,7 +506,7 @@ class ND:
         for j in done[:-20]:
             self.jobs.pop(j, None)
 
-    async def _batch(self, job, urls, concurrency, solve, tries, timeout=30):
+    async def _batch(self, job, urls, concurrency, solve, tries, timeout=30, owner=None):
         """Load every url, at most `concurrency` at a time, each in its own tab.
 
         PER-URL DEADLINE, not just a batch one. Measured on a real run: 7 of 8 pages finished in 3
@@ -487,7 +523,11 @@ class ND:
         async def load(i, url, tabs):
             t = await self.browser.get("about:blank", new_tab=True)
             tabs[i] = t                         # recorded so a timeout can still close it
+            tid = getattr(getattr(t, "target", None), "target_id", None)
+            if owner:
+                self.owners[tid] = owner        # a batch tab is short-lived but still someone's
             await t.get(url)
+            await self._label(t)
             await t.sleep(2)
             title = await t.evaluate("document.title")
             html = await t.get_content()
@@ -510,7 +550,7 @@ class ND:
                     await t.sleep(1)
             try: href = await t.evaluate("location.href")
             except Exception: href = url
-            slots[i] = {"status": "ready", "title": title, "html": html, "url": href,
+            slots[i] = {"status": "ready", "title": strip_owner(title), "html": html, "url": href,
                         "requested": url, "challenge": passed}
 
         async def one(i, url):
@@ -600,7 +640,7 @@ class ND:
            "move":lambda:self._move(a["x"],a["y"],a.get("tab")),
            "click":lambda:self._click(a["x"],a["y"],a.get("tab")),
            "key":lambda:self._key(a["key"],a.get("tab")),
-           "newtab":lambda:self._newtab(a.get("url","about:blank"),a.get("tag")),
+           "newtab":lambda:self._newtab(a.get("url","about:blank"),a.get("tag"),a.get("owner")),
            "js":lambda:self._js(a["expr"],a.get("tab")),"cookies":lambda:self._cookies(),
            "tabs":lambda:self._tabs(),
            "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True),
@@ -609,7 +649,7 @@ class ND:
            "cdp":lambda:self._cdp_info(),
            "prefetch":lambda:self._prefetch(a.get("urls"),a.get("concurrency",8),
                                             a.get("solve",True),a.get("tries",20),
-                                            a.get("timeout",30)),
+                                            a.get("timeout",30),a.get("owner")),
            "jobs":lambda:self._jobstatus(a.get("job")),
            "collect":lambda:self._collect(a.get("job"),a.get("drain",True))}
         if op not in m: return {"error":f"unknown {op}"}
