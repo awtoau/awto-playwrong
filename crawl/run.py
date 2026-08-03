@@ -264,11 +264,21 @@ async def crawl(cfg):
         b = await browser.attach(cfg.port)
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
+        # Per-host cap. Counts come from the DB so a RESUMED run enforces the cap against pages
+        # earlier runs already took, and are then kept up to date in memory rather than re-queried
+        # every batch. Without this a broad crawl never stops: one 58-site run stored 800 pages and
+        # still had 10,195 urls queued.
+        per_host = d.host_counts() if cfg.max_per_host else {}
         while attempted < cfg.max_pages:
             batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
-                            shuffle=cfg.shuffle, host_diverse=cfg.host_diverse)
+                            shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
+                            max_per_host=cfg.max_per_host, host_counts=per_host)
             if not batch:
                 break
+            if cfg.max_per_host:
+                for u, _dep, _lc in batch:
+                    h = (urlsplit(u).netloc or "").lower()
+                    per_host[h] = per_host.get(h, 0) + 1
             queue = asyncio.Queue()
             for item in batch:                 # (url, depth, link_code)
                 queue.put_nowait(item)
@@ -279,6 +289,12 @@ async def crawl(cfg):
                        for _ in range(cfg.tabs)]
             await asyncio.gather(*workers)
             attempted += len(batch)
+        if cfg.max_per_host:
+            at_cap = sorted(h for h, n in per_host.items() if n >= cfg.max_per_host)
+            if at_cap:
+                print(f"\n{len(at_cap)} host(s) hit --max-per-host={cfg.max_per_host}; their "
+                      f"remaining urls are left QUEUED, not discarded: "
+                      f"{', '.join(at_cap[:5])}{' …' if len(at_cap) > 5 else ''}", flush=True)
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
               f"{stats['chars']} text chars\n", flush=True)
         if cfg.rl is not None:
@@ -296,7 +312,8 @@ async def crawl(cfg):
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
-                 rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0):
+                 rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0,
+                 max_per_host=0):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
@@ -312,6 +329,7 @@ class Config:
         # per-host politeness + 429 backoff (shared across all tabs). rate_delay=0 disables.
         self.shuffle = shuffle
         self.host_diverse = host_diverse
+        self.max_per_host = max_per_host     # 0 = unlimited
         self.rl = ratelimit.RateLimiter(base_delay=rate_delay) if rate_delay and rate_delay > 0 else None
 
 
@@ -321,6 +339,11 @@ def _parse_args(argv):
     p.add_argument("--db", required=True, help="SQLite path or a SQLAlchemy URL (postgresql+psycopg://…, mysql+pymysql://…)")
     p.add_argument("--store", default=None, help="On-disk page store dir (default: <db>.pages)")
     p.add_argument("--max", type=int, default=200, help="Max pages ATTEMPTED this run")
+    p.add_argument("--max-per-host", type=int, default=0, metavar="N",
+                   help="Stop taking new pages from a host once N have been attempted (0 = no "
+                        "limit). Counts include pages from EARLIER runs against the same db, and "
+                        "urls over the cap stay queued rather than being discarded, so raising the "
+                        "cap later picks up where this left off.")
     p.add_argument("--tabs", type=int, default=8, help="Parallel browser tabs")
     p.add_argument("--depth", type=int, default=3, help="Max link depth from a seed")
     p.add_argument("--nav-timeout", type=float, default=12.0, help="Per-page nav budget (s)")
@@ -347,7 +370,8 @@ def main(argv=None):
                              else a.db.rsplit("/", 1)[-1].split("?")[0] + ".pages")
     hosts = sorted({urlsplit(s).netloc.lower().split(":")[0] for s in a.seed} | set(a.host or []))
     cfg = Config(seeds=a.seed, db_dsn=a.db, store_root=store_root,
-                 max_pages=a.max, tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
+                 max_pages=a.max, max_per_host=a.max_per_host,
+                 tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
                  port=a.port, hosts=hosts, keep_js=not a.no_js,
                  rate_delay=a.rate_delay, shuffle=not a.no_shuffle,
                  host_diverse=not a.no_host_diverse, stall_ceiling=a.stall_ceiling)

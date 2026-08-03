@@ -182,6 +182,14 @@ def _upsert_stmt(engine, table, index_elements, set_cols=None):
     return base, name
 
 
+def _host_room(max_per_host, host_counts):
+    """{host: slots left} for a per-host cap, or None when uncapped. A host that is absent has its
+    full allowance, which is why a caller need only pass the hosts it has already fetched."""
+    if not max_per_host:
+        return None
+    return {h.lower(): max_per_host - n for h, n in (host_counts or {}).items()}
+
+
 class CrawlDB:
     """Thin, backend-agnostic crawl store over a SQLAlchemy Engine. Methods commit per call (each is a
     small transactional unit) so a crash mid-crawl leaves a consistent frontier."""
@@ -235,7 +243,25 @@ class CrawlDB:
         for r in rows:
             self.enqueue(*r[:4]) if len(r) >= 4 else self.enqueue(*r[:3])
 
-    def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False):
+    def host_counts(self):
+        """{host: pages already attempted} — anything no longer queued.
+
+        Read from the DB, not kept in memory, so a RESUMED run enforces a per-host cap against what
+        previous runs already fetched rather than starting the count from zero. Grouping happens in
+        Python because the frontier stores whole urls and there is no portable host expression across
+        SQLite, Postgres and MySQL."""
+        from urllib.parse import urlsplit
+        out = {}
+        with self.engine.begin() as c:
+            rows = c.execute(select(frontier.c.url)
+                             .where(frontier.c.state != "queued")).fetchall()
+        for (u,) in rows:
+            h = urlsplit(u).netloc.lower()
+            out[h] = out.get(h, 0) + 1
+        return out
+
+    def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False,
+              max_per_host=0, host_counts=None):
         """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth, link_code), …].
         Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
         same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
@@ -247,7 +273,14 @@ class CrawlDB:
         - host_diverse=True: ROUND-ROBIN across hosts — take the shallowest queued URL from EACH host in
           turn, so a batch of n covers up to n DIFFERENT hosts. A host with only deep pages left still
           contributes (goes deeper) rather than a shallow-heavy host dominating every tab. This is the
-          "one site per tab, even if it means going deeper" model. Overrides shuffle."""
+          "one site per tab, even if it means going deeper" model. Overrides shuffle.
+
+        max_per_host / host_counts: cap how many urls a single host may contribute, counting the
+        pages it has ALREADY given (host_counts, normally from host_counts()). The cap is enforced
+        WITHIN this batch, not just between batches — checking only between them let a single batch
+        take ten urls from a host that had one slot left, overshooting the cap by most of a batch.
+        Urls over the cap stay QUEUED: they are not errors, and a later run with a higher cap should
+        still be able to take them."""
         from urllib.parse import urlsplit
 
         import sqlalchemy as _sa
@@ -262,10 +295,16 @@ class CrawlDB:
                 if self.dialect == "postgresql":
                     win = win.with_for_update(skip_locked=True)
                 cand = c.execute(win).all()
+                room = _host_room(max_per_host, host_counts)
                 by_host = {}
                 for u, dep, lc in cand:
                     h = (urlsplit(u).netloc or "").lower()
+                    if room is not None and room.get(h, max_per_host) <= 0:
+                        continue                  # host is at its cap; leave its urls queued
                     by_host.setdefault(h, []).append((u, dep, lc))
+                if room is not None:              # never offer a host more than its remaining slots
+                    for h in by_host:
+                        by_host[h] = by_host[h][:max(0, room.get(h, max_per_host))]
                 for h in by_host:                        # shallowest first within each host
                     by_host[h].sort(key=lambda t: t[1])
                 picked, hosts = [], list(by_host.keys())
@@ -280,13 +319,29 @@ class CrawlDB:
                 rows = picked
             else:
                 order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
+                room = _host_room(max_per_host, host_counts)
+                # Over-fetch when a cap is in play: it is applied in Python (there is no portable
+                # host expression across SQLite/Postgres/MySQL), so asking for exactly n would come
+                # back short as soon as capped hosts start filling the window.
                 sel = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code)
                        .where(frontier.c.state == "queued")
                        .order_by(*order)
-                       .limit(n))
+                       .limit(max(n * 40, 400) if room is not None else n))
                 if self.dialect == "postgresql":
                     sel = sel.with_for_update(skip_locked=True)
                 rows = c.execute(sel).all()
+                if room is not None:
+                    keep, used = [], {}
+                    for r in rows:
+                        h = (urlsplit(r[0]).netloc or "").lower()
+                        allowed = max(0, room.get(h, max_per_host))
+                        if used.get(h, 0) >= allowed:
+                            continue
+                        used[h] = used.get(h, 0) + 1
+                        keep.append(r)
+                        if len(keep) >= n:
+                            break
+                    rows = keep
             if rows:
                 urls = [r[0] for r in rows]
                 c.execute(update(frontier).where(frontier.c.url.in_(urls))

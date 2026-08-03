@@ -168,7 +168,7 @@ the same shared browser.
 
 Point-and-go (one command rips a site + prints its shape):
 ```
-python -m crawl.run --seed https://example.com/ --db site.sqlite --max 200 --tabs 8
+python -m crawl.run --seed https://example.com/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
 python -m crawl.report --db site.sqlite            # re-print the report later
 ```
 `--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
@@ -185,7 +185,7 @@ DISABLE_SQLALCHEMY_CEXT=1 uv tool install \
   --no-binary-package sqlalchemy \
   git+https://github.com/awtoau/awto-playwrong     # or a local checkout path
 
-crawl --seed https://example.com/ --db site.sqlite --max 200 --tabs 8
+crawl --seed https://example.com/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
 ```
 
 Every flag is load-bearing on a free-threaded (no-GIL) machine — omit one and the GIL comes back on:
