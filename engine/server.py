@@ -618,6 +618,36 @@ if(m.aim){c.strokeStyle='red';c.strokeRect(m.aim[0]*sx-12,m.aim[1]*sy-12,24,24);
 let o=m.ollama||{};inf.innerHTML='model '+(o.model||'-')+'<br>time '+(o.ms||'-')+'ms<br>conf '+(o.confidence||'-')+'<br>'+(o.description||'');}
 setInterval(t,100);t();</script>"""
 
+def _shutdown():
+    """Stop the BROWSER, then exit.
+
+    This used to be a bare os._exit(0). The HTTP process died instantly and Chrome — a separate
+    process tree that nothing else was driving — kept running forever on its throwaway profile. Every
+    `playwrong --stop` therefore leaked an entire browser: 12 of them were found holding 15.7 GB, all
+    from one afternoon of testing. They are easy to miss because a headed window just sits there
+    behind everything else.
+
+    So: close the browser first, and only then exit. The stop is bounded (10s) because a wedged
+    browser must not turn "stop" into "hang" — if it will not go quietly we exit anyway and
+    scripts/cleanup_orphans.py can collect the remains.
+    """
+    try:
+        if B.browser is not None:
+            fut = asyncio.run_coroutine_threadsafe(_stop_browser(), B.loop)
+            fut.result(timeout=10)
+            log("browser_stopped")
+    except Exception as e:
+        log("shutdown_err", e=repr(e)[:120])
+    os._exit(0)
+
+
+async def _stop_browser():
+    try:
+        B.browser.stop()          # nodriver's own teardown: closes tabs and the browser process
+    except Exception:
+        pass
+
+
 class H(BaseHTTPRequestHandler):
     def _j(self,o,c=200):
         # default=str so ONE unserialisable value can never kill the response. Without it the
@@ -644,7 +674,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n=int(self.headers.get("Content-Length") or 0);a=json.loads(self.rfile.read(n) or b"{}")
         op=self.path.strip("/")
-        if op=="shutdown":self._j({"ok":1});threading.Thread(target=lambda:os._exit(0)).start();return
+        if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
         self._j(B.do(op,a))
 

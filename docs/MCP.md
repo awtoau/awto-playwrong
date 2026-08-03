@@ -297,6 +297,7 @@ browser state:
 |---|---|
 | Tools work in Claude Code but the **VSCode panel is empty** | Two separate registries — see above. Run `install.py --vscode`, then reload the window. |
 | Ran `--vscode`, panel *still* empty | VSCode MCP config is per-profile. The window's profile has its own `mcp.json`; writing only `User/mcp.json` does nothing for it. `--vscode` now writes every profile — re-run it and reload. |
+| Chrome windows piling up / lots of RAM gone | Orphaned browsers from an engine that died without closing its own. `python scripts/cleanup_orphans.py` reports them, `--kill` closes them. It only ever touches Chrome on a nodriver temp profile (`/tmp/uc_*`) or a playwrong profile, so your own browser can never match. |
 | Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |
 | Every tool errors with "engine did not bind" | Run `python scripts/doctor.py` — nearly always a missing dep or no Chrome. Full engine output is in `tmp/logs/playwrong-engine.log`. |
 | Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
