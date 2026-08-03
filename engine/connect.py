@@ -117,42 +117,95 @@ def spawn(port=None, profile=None):
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
 
+def _confirm_absent(port):
+    """Decide 'there is really no engine here' CAREFULLY.
+
+    A single 2s probe is not evidence of absence. Under load — say a dozen agents starting at once —
+    a live engine can miss that deadline, every caller concludes it must start one, and each new
+    browser loads the machine further so the next probe is even slower. That feedback loop is not
+    theoretical: one 12-process run spawned 1204 servers and 255 Chrome instances before it was
+    stopped. So: probe again, patiently, before spawning anything.
+    """
+    return not reachable(port, timeout=8.0)
+
+
 def ensure(port=None, want_browser=True, on_start=None, profile=None):
     """Guarantee an engine on `port`, and by default a launched Chrome behind it. Idempotent and
     cheap when everything is already up (one /status round-trip).
 
+    Concurrency-safe: the check-and-spawn is held under a file lock, so when N processes start at
+    once exactly ONE launches the engine and the rest wait for it. Without the lock they all spawn,
+    which is how you end up with a browser per caller instead of a shared one.
+
     Two waits for two different things:
-      1. the HTTP process binding the port — a Python import plus a bind, no browser, so 20s is
-         generous; polled at 0.25s to keep first-call latency low.
+      1. the HTTP process binding the port — a Python import plus a bind, no browser, so 30s is
+         generous even on a loaded machine; polled at 0.25s to keep first-call latency low.
       2. Chrome launching — done by POSTing /start, which BLOCKS until the browser is up, so there is
          nothing to poll. Cold start is the slow part, hence 120s.
-
-    on_start: optional callback, invoked once if we actually had to spawn something, so a CLI can say
-    "starting the browser…" instead of appearing to hang.
     """
     port = port or (profile_port(profile) if profile else default_port())
-    started = False
-    if not reachable(port):
-        if on_start:
-            on_start("starting the capture engine")
-        started = True
-        spawn(port, profile=profile)
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:
-            if reachable(port, timeout=1.0):
-                break
-            time.sleep(0.25)
-        else:
-            raise EngineError(
-                f"engine did not bind 127.0.0.1:{port} within 20s. Check {SERVER_LOG}; the usual "
-                f"cause is a missing dependency — run: {sys.executable} {REPO}/scripts/doctor.py")
-    if want_browser and not call(port=port, op="status", method="GET").get("alive"):
-        if on_start and not started:
-            on_start("launching Chrome")
-        elif on_start:
-            on_start("launching Chrome")
-        call(port=port, op="start", timeout=120.0)   # blocks until up; never poll /status for this
+    if reachable(port):                       # fast path: already up, no lock needed
+        if want_browser:
+            _wake(port, on_start)
+        return port
+
+    with _spawn_lock(port):
+        # Re-check INSIDE the lock: while we queued, the winner probably started it already.
+        if _confirm_absent(port):
+            if on_start:
+                on_start("starting the capture engine")
+            spawn(port, profile=profile)
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if reachable(port, timeout=1.0):
+                    break
+                time.sleep(0.25)
+            else:
+                raise EngineError(
+                    f"engine did not bind 127.0.0.1:{port} within 30s. Check {SERVER_LOG}; the "
+                    f"usual cause is a missing dependency — run: "
+                    f"{sys.executable} {REPO}/scripts/doctor.py")
+    if want_browser:
+        _wake(port, on_start)
     return port
+
+
+def _wake(port, on_start=None):
+    """Make sure Chrome itself is up. /start blocks until it is, so there is nothing to poll."""
+    if call(port=port, op="status", method="GET").get("alive"):
+        return
+    if on_start:
+        on_start("launching Chrome")
+    call(port=port, op="start", timeout=120.0)
+
+
+def _spawn_lock(port):
+    """An exclusive, cross-process lock for 'am I the one who starts the engine'.
+
+    flock is advisory and released automatically if the holder dies, so a crashed starter cannot
+    wedge everyone else. Where flock does not exist (Windows) this degrades to no locking, which is
+    the behaviour everything had before — correct for a single caller, racy for many.
+    """
+    os.makedirs(DATA, exist_ok=True)
+    path = os.path.join(DATA, f"spawn-{port}.lock")
+    try:
+        import fcntl
+    except ImportError:
+        import contextlib
+        return contextlib.nullcontext()
+
+    class _Lock:
+        def __enter__(self):
+            self.f = open(path, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+            return self
+        def __exit__(self, *a):
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+                self.f.close()
+            except Exception:
+                pass
+    return _Lock()
 
 
 def call(op, port=None, method="POST", timeout=60.0, body=None, **kw):
@@ -587,10 +640,8 @@ def collect(job, mode="text", max_chars=40000, port=None, wait=0.0, want=1):
                 out.append({"url": item.get("url"), "title": item.get("title"),
                             "challenge": item.get("challenge"),
                             "text": render(item, mode, max_chars)})
-        if out and len(out) >= want:
-            return {"results": out, "remaining": r.get("remaining", 0)}
-        if time.monotonic() >= deadline:
-            return {"results": out, "remaining": r.get("remaining", 0)}
+        if (out and len(out) >= want) or r.get("done") or time.monotonic() >= deadline:
+            return {"results": out, "remaining": r.get("remaining", 0), "done": bool(r.get("done"))}
         time.sleep(0.5)
 
 
@@ -604,13 +655,11 @@ def fetch_many(urls, concurrency=8, mode="text", max_chars=40000, solve=True, tr
     """
     job = prefetch(urls, concurrency=concurrency, solve=solve, tries=tries, timeout=per_url,
                    port=port, on_start=on_start, profile=profile)
-    seen, deadline = 0, time.monotonic() + timeout
-    while seen < len(urls) and time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         got = collect(job, mode=mode, max_chars=max_chars, port=port, wait=2.0)
-        for item in got["results"]:
-            seen += 1
-            yield item
-        if not got["results"] and got.get("remaining", 0) == 0 and seen >= len(urls):
+        yield from got["results"]
+        if got.get("done"):
             break
 
 

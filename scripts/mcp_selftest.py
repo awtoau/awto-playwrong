@@ -202,9 +202,17 @@ def live_tests(c):
     ok("prefetch returns immediately with a job", "job" in text_of(r) and time.monotonic()-t0 < 5,
        f"{time.monotonic()-t0:.1f}s")
     job = text_of(r).split("job ")[1].split(":")[0].strip()
-    r = c.call("collect", job=job, wait=30, max_chars=200)
-    body = text_of(r)
-    ok("collect returns prefetched pages", "Example Domain" in body, body.splitlines()[0][:60])
+    # Three urls with a DUPLICATE — results used to be keyed by url, so the duplicate collapsed and
+    # the batch never completed ("[2 ready, 1 still loading]" forever). Assert all three come back.
+    got, t0 = [], time.monotonic()
+    while len(got) < 3 and time.monotonic() - t0 < 60:
+        r = c.call("collect", job=job, wait=10, max_chars=200)
+        body = text_of(r)
+        got += [ln for ln in body.splitlines() if ln.startswith("# ")]
+        if "still loading]" not in body and "nothing ready" not in body:
+            break
+    ok("collect returns every prefetched page, duplicates included", len(got) == 3,
+       f"{len(got)}/3 in {time.monotonic()-t0:.0f}s")
 
     c.call("close_tab", close_extra=True)
     r = c.call("tabs")
@@ -226,17 +234,6 @@ def cloudflare_test(c):
        not walled and "nowsecure" in body.lower(),
        f"{len(body)} chars in {dt:.1f}s — {body[:120]!r}")
     ok("cf_clearance cookie present", "cf_clearance" in text_of(c.call("cookies")))
-    # prefetch/collect: fire a batch, take results as they land. The point is that this is FASTER
-    # than looping fetch and that a stalled url cannot hold the rest.
-    t0 = time.monotonic()
-    r = c.call("prefetch", urls=[TEST_URL, "https://example.org", TEST_URL], concurrency=3)
-    ok("prefetch returns immediately with a job", "job" in text_of(r) and time.monotonic()-t0 < 5,
-       f"{time.monotonic()-t0:.1f}s")
-    job = text_of(r).split("job ")[1].split(":")[0].strip()
-    r = c.call("collect", job=job, wait=30, max_chars=200)
-    body = text_of(r)
-    ok("collect returns prefetched pages", "Example Domain" in body, body.splitlines()[0][:60])
-
     c.call("close_tab", close_extra=True)
 
 

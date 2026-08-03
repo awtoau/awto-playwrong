@@ -171,17 +171,27 @@ class ND:
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
-        self.jobs = {}          # prefetch job id -> {results, total}
+        self.jobs = {}          # prefetch job id -> {slots, total, delivered}
+        self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
     async def _ensure(self):
+        """Launch the browser once, however many callers arrive at once.
+
+        The bare `if self.tab: return` was a double-checked lock with no lock. uc.start() awaits, so
+        twelve concurrent first-ops ALL saw self.tab as None and ALL launched a browser: one engine,
+        twelve Chromes, eleven of them untracked and therefore unclosable. Measured exactly that —
+        nd_started fired 12 times for a single server. The lock makes the launch happen once; the
+        re-check inside it is what the fast path outside cannot guarantee."""
         if self.tab: return
-        heal_profile(PROFILE_DIR)       # a stale lock would hang the launch below forever
-        self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
-        self.tab = await self.browser.get("about:blank")
-        self._publish_cdp()
-        log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
+        async with self._launch:
+            if self.tab: return         # someone else launched while we waited for the lock
+            heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
+            self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
+            self.tab = await self.browser.get("about:blank")
+            self._publish_cdp()
+            log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
     async def _start(self):
         """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
         primitive /status can't give you on its own. Chrome only launches on the FIRST real op
@@ -440,12 +450,25 @@ class ND:
         self._jobn = getattr(self, "_jobn", 0) + 1
         job = f"job{self._jobn}"
         urls = [u for u in (urls or []) if u]
-        self.jobs[job] = {"results": {}, "total": len(urls), "started": True}
-        # ensure_future, not await: this coroutine is already running ON the browser loop, so
-        # scheduling the batch and returning hands the HTTP thread its response right away while
-        # the tabs keep loading in the background.
+        # Slots are keyed by INDEX, not url. Keying by url silently collapsed a batch that contained
+        # the same url twice — "asked 3, got 2" — and any caller waiting for all of them then waited
+        # forever. Duplicates in a url list are completely ordinary.
+        self.jobs[job] = {"slots": {}, "total": len(urls), "delivered": 0}
+        self._reap_jobs()
         asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout))
         return {"job": job, "count": len(urls), "concurrency": concurrency, "timeout": timeout}
+
+    def _reap_jobs(self):
+        """Keep finished jobs queryable for a while, then drop the oldest.
+
+        A drained job used to be deleted outright, so a caller that polled once more — the obvious
+        way to check "am I done yet" — got "no such job" instead of "nothing left". Keeping the last
+        20 makes the answer honest without growing without bound; bodies are already gone by then,
+        so what remains is a counter."""
+        done = [j for j, d in self.jobs.items() if d.get("total", 0) <= d.get("delivered", 0)
+                and not d.get("slots")]
+        for j in done[:-20]:
+            self.jobs.pop(j, None)
 
     async def _batch(self, job, urls, concurrency, solve, tries, timeout=30):
         """Load every url, at most `concurrency` at a time, each in its own tab.
@@ -459,11 +482,11 @@ class ND:
         a solve legitimately spends 10-30s clicking and waiting.
         """
         sem = asyncio.Semaphore(max(1, int(concurrency)))
-        store = self.jobs[job]["results"]
+        slots = self.jobs[job]["slots"]
 
-        async def load(url, tabs):
+        async def load(i, url, tabs):
             t = await self.browser.get("about:blank", new_tab=True)
-            tabs[url] = t                       # recorded so a timeout can still close it
+            tabs[i] = t                         # recorded so a timeout can still close it
             await t.get(url)
             await t.sleep(2)
             title = await t.evaluate("document.title")
@@ -487,32 +510,31 @@ class ND:
                     await t.sleep(1)
             try: href = await t.evaluate("location.href")
             except Exception: href = url
-            store[url] = {"status": "ready", "title": title, "html": html, "url": href,
-                          "requested": url, "challenge": passed}
+            slots[i] = {"status": "ready", "title": title, "html": html, "url": href,
+                        "requested": url, "challenge": passed}
 
-        async def one(url):
+        async def one(i, url):
             async with sem:                     # at most `concurrency` tabs open at once
-                store[url] = {"status": "loading"}
+                slots[i] = {"status": "loading", "requested": url}
                 tabs = {}
                 try:
-                    await asyncio.wait_for(load(url, tabs), timeout=timeout)
+                    await asyncio.wait_for(load(i, url, tabs), timeout=timeout)
                 except TimeoutError:
                     # A load that never "finishes" usually still RENDERED — pypi.org does exactly
-                    # this, sitting on an open connection long after the content is there. Throwing
-                    # the page away because an event never fired would waste a perfectly good
-                    # capture, so take what rendered and mark it partial.
-                    store[url] = await self._partial(tabs.get(url), url, timeout)
-                    log("prefetch_timeout", url=url[:60], salvaged=store[url]["status"])
+                    # this, holding a connection open long after the content is there. Take what
+                    # rendered instead of discarding a good capture.
+                    slots[i] = await self._partial(tabs.get(i), url, timeout)
+                    log("prefetch_timeout", url=url[:60], salvaged=slots[i]["status"])
                 except Exception as e:
-                    store[url] = {"status": "error", "requested": url, "error": repr(e)[:200]}
+                    slots[i] = {"status": "error", "requested": url, "error": repr(e)[:200]}
                     log("prefetch_err", url=url[:60], e=repr(e)[:80])
                 finally:
-                    t = tabs.get(url)
+                    t = tabs.get(i)
                     if t is not None:
                         try: await t.close()
                         except Exception: pass
 
-        await asyncio.gather(*(one(u) for u in urls), return_exceptions=True)
+        await asyncio.gather(*(one(i, u) for i, u in enumerate(urls)), return_exceptions=True)
         await self._refresh()
         log("prefetch_done", job=job, n=len(urls))
 
@@ -533,38 +555,35 @@ class ND:
     async def _jobstatus(self, job=None):
         """Counts only — cheap to poll, and never ships page bodies you have not asked for."""
         def summarise(j, d):
-            r = d["results"]
-            return {"job": j, "total": d["total"],
-                    "ready": sum(1 for v in r.values() if v.get("status") == "ready"),
-                    "loading": sum(1 for v in r.values() if v.get("status") == "loading"),
-                    "errors": sum(1 for v in r.values() if v.get("status") == "error"),
-                    "pending": d["total"] - len(r),
-                    "urls": {u: v.get("status") for u, v in r.items()}}
+            v = list(d["slots"].values())
+            return {"job": j, "total": d["total"], "delivered": d.get("delivered", 0),
+                    "ready": sum(1 for x in v if x.get("status") == "ready"),
+                    "loading": sum(1 for x in v if x.get("status") == "loading"),
+                    "errors": sum(1 for x in v if x.get("status") == "error"),
+                    "pending": d["total"] - d.get("delivered", 0) - len(v),
+                    "done": d.get("delivered", 0) >= d["total"]}
         if job:
             d = self.jobs.get(job)
             return summarise(job, d) if d else {"error": f"no such job {job!r}"}
         return {"jobs": [summarise(j, d) for j, d in self.jobs.items()]}
 
     async def _collect(self, job, drain=True):
-        """Hand back every result that is READY, and by default forget them.
+        """Hand back every result that is READY, and by default forget it.
 
         Draining matters: a batch of pages is tens of MB of HTML, and holding it after the caller has
-        read it is a slow memory leak in a long-lived server.
-        """
+        read it is a slow leak in a long-lived server. The job record itself survives so that asking
+        again returns "nothing left" rather than "no such job"."""
         d = self.jobs.get(job)
         if not d:
             return {"error": f"no such job {job!r}"}
-        done = {u: v for u, v in d["results"].items() if v.get("status") in ("ready", "error")}
+        done = {i: v for i, v in d["slots"].items() if v.get("status") in ("ready", "error")}
         if drain:
-            for u in done:
-                d["results"].pop(u, None)
-            d["total"] -= len(done)
-            if d["total"] <= 0:
-                self.jobs.pop(job, None)
-        return {"job": job, "results": list(done.values()),
-                "remaining": max(0, d["total"] - len([v for v in d["results"].values()
-                                                      if v.get("status") in ("ready", "error")]))
-                if d else 0}
+            for i in done:
+                d["slots"].pop(i, None)
+            d["delivered"] = d.get("delivered", 0) + len(done)
+        remaining = d["total"] - d.get("delivered", 0)
+        return {"job": job, "results": list(done.values()), "remaining": max(0, remaining),
+                "done": remaining <= 0}
 
     async def _cookies(self):
         await self._ensure()
@@ -672,12 +691,41 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:self._j({"error":str(e)[:120]},500)
         else:self._j({"error":"?"},404)
     def do_POST(self):
-        n=int(self.headers.get("Content-Length") or 0);a=json.loads(self.rfile.read(n) or b"{}")
+        n=int(self.headers.get("Content-Length") or 0)
+        raw=self.rfile.read(n) or b"{}"
+        try:
+            a=json.loads(raw)
+        except ValueError as e:
+            # Parsing outside a try dropped the connection mid-response, so the client saw
+            # "Remote end closed connection without response" and no clue why.
+            self._j({"error":f"invalid JSON body: {e}"},400); return
+        if not isinstance(a, dict):
+            self._j({"error":"body must be a JSON object"},400); return
         op=self.path.strip("/")
         if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
         self._j(B.do(op,a))
 
+def _already_serving(port):
+    """Is a healthy engine already on this port? Then this process must not become a second one.
+
+    Belt and braces behind connect.ensure()'s spawn lock: anything at all can start server.py — a
+    stale script, a race, a user in a terminal — and a second engine on the same port means a second
+    Chrome, split state, and a browser nobody closes. Cheap to check, and the failure it prevents
+    (255 browsers from one runaway loop) is expensive."""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
 if __name__=="__main__":
+    if _already_serving(PORT):
+        log("server_duplicate_exit", port=PORT)
+        print(f"an engine is already serving 127.0.0.1:{PORT} — not starting a second one",
+              file=sys.stderr)
+        sys.exit(0)
     log("server_start",port=PORT)
     ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
