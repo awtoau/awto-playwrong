@@ -1,14 +1,14 @@
 """cli.py — the `playwrong` command. One url in, readable page out. Nothing to start first.
 
     playwrong https://awto.au                 # text of the page
-    playwrong https://a.com https://b.com     # several, reusing the SAME warm browser
+    playwrong https://awto.au https://awto.au/x  # several, reusing the SAME warm browser
     playwrong -j 8 url1 url2 ... url20        # 8 at a time, printed as each finishes
     playwrong https://awto.au --links         # keep hrefs, so you can pick the next url
     playwrong https://awto.au --html          # raw markup
     playwrong https://awto.au --shot page.png # also save a screenshot
     playwrong https://awto.au --json          # {text,title,url,challenge} for scripting
-    playwrong --pdf https://site/paper.pdf    # a PDF from behind a bot wall, as text
-    playwrong --profile work https://site     # persistent named profile (logins survive)
+    playwrong --pdf https://awto.au/doc.pdf   # a PDF from behind a bot wall, as text
+    playwrong --profile work https://awto.au  # persistent named profile (logins survive)
     playwrong --tabs                          # who (agent@repo) has which tab open
     playwrong --agent researcher <url>        # label this caller in the browser + --tabs
     playwrong --status                        # is anything running?

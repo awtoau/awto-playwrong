@@ -243,15 +243,15 @@ opened that?* — so every tab carries its owner:
 $ playwrong --tabs
  #  OWNER                            TITLE                    URL
  0  -                                about:blank              about:blank
- 1  claude@awto-vyvanse:41792        Notion Reviews | G2      https://www.g2.com/...
- 2  mcp@awto-playwrong:41830         Web crawler - Wikipedia  https://en.wikipedia.org/...
+ 1  claude@awto-vyvanse:41792        AWTO | Intelligent...    https://awto.au/
+ 2  mcp@awto-playwrong:41830         Capabilities             https://awto.au/capabilities
 ```
 
 The same label is prefixed to the **tab title in the browser**, so the window title and tab strip
 name the owner without you having to ask the API at all:
 
 ```
-⟦claude@awto-vyvanse:41792⟧ Notion Reviews 2026 | G2
+⟦claude@awto-vyvanse:41792⟧ AWTO | Intelligent Control
 ```
 
 It is stripped from every title the API returns, so a capture, a `fetch` result and `--tabs` all show

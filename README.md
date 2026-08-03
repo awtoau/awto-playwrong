@@ -3,7 +3,7 @@
 **Fetch the pages that won't let you fetch them.**
 
 ```sh
-playwrong https://example.com      # the page, as readable text. Nothing to start first.
+playwrong https://awto.au          # the page, as readable text. Nothing to start first.
 ```
 
 One shared, long-lived, headed Chrome — driven over a local port — that clears Cloudflare Turnstile
@@ -23,7 +23,7 @@ HTTP fetching could not.
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (32 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (33 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
@@ -40,12 +40,12 @@ Use the **MCP server** — [docs/MCP.md](docs/MCP.md). After `--register`, brows
 in the tool list and one call does the whole job:
 
 ```
-fetch("https://example.com")   # auto-starts the engine + Chrome, clears Cloudflare,
-                               # returns readable text, closes its own tab
+fetch("https://awto.au")   # auto-starts the engine + Chrome, clears Cloudflare,
+                           # returns readable text, closes its own tab
 ```
 
-Also: `search`, `pdf`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`,
-`tabs`, `close_tab`.
+Also: `prefetch`/`collect` (a list of urls, loaded in parallel, read as each finishes), `search`,
+`pdf`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
 No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
 front of the same engine described below — driving it over HTTP still works exactly as before.
 
@@ -61,9 +61,9 @@ text.
 
 ```sh
 ./playwrong --search "nodriver turnstile"  # DuckDuckGo results (curl gets a CAPTCHA now)
-./playwrong --pdf https://site/paper.pdf  # a PDF from behind a bot wall, as text
-./playwrong --profile work https://site   # persistent named profile: logins survive a restart
-./playwrong https://a.com https://b.com   # several urls, reusing the same warm browser
+./playwrong --pdf https://awto.au/doc.pdf # a PDF from behind a bot wall, as text
+./playwrong --profile work https://awto.au # persistent named profile: logins survive
+./playwrong https://awto.au https://awto.au/capabilities   # several, one warm browser
 ./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
 ./playwrong https://awto.au --html        # raw markup instead of text
 ./playwrong https://awto.au --shot p.png  # also save a screenshot
@@ -85,7 +85,7 @@ running a *second*, isolated browser.
 `solvecf`. It auto-starts the engine too:
 
 ```sh
-python engine/client.py goto https://example.com
+python engine/client.py goto https://awto.au
 python engine/client.py js "document.title"       # promises resolve; objects come back as JSON
 python engine/client.py read --links              # current page as text, hrefs kept
 python engine/client.py shot page.png
@@ -125,8 +125,8 @@ architectural choice, and it's why this repo exists rather than a Playwright wra
 ## Usage (engine)
 ```
 # there is no step 1 — every entry point starts the engine and Chrome if they're down
-./playwrong https://example.com                  # one page as text
-python engine/client.py goto https://example.com
+./playwrong https://awto.au                      # one page as text
+python engine/client.py goto https://awto.au
 python engine/client.py solvecf                  # clear a Turnstile challenge
 python engine/client.py text                     # get the page HTML
 python engine/client.py shot frame.png           # screenshot
@@ -134,7 +134,7 @@ python engine/client.py shot frame.png           # screenshot
 From your own Python, use the same code path the CLI and the MCP server use:
 ```python
 from engine import connect
-page = connect.capture("https://example.com")    # starts engine+Chrome, solves, closes its tab
+page = connect.capture("https://awto.au")        # starts engine+Chrome, solves, closes its tab
 print(page["text"])
 ```
 Launching `engine/server.py` by hand still works if you want it in the foreground — and it needs no
