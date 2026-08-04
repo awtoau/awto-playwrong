@@ -78,18 +78,28 @@ def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20):
     return body
 
 
-def t_pdf(url, max_chars=40000):
-    r = connect.pdf(url)
+def t_pdf(url, path=None, max_chars=40000):
+    r = connect.pdf(url, path=path)
+    # The file is always written, so always say where and what — a caller keeping the document needs
+    # the path, and one checking it got the whole thing needs the page count. Reporting these only in
+    # the failure branches (as this used to) hands back a saved file nobody is told about.
+    saved = f"Saved: {r['path']} ({r['bytes']} bytes"
+    if r.get("pages"):
+        saved += f", {r['pages']} pages"
+    saved += ")"
+    if r.get("final_url") and r["final_url"] != url:
+        saved += f"\nFinal URL after redirects: {r['final_url']}"
     if r.get("warning"):
-        return f"{r['warning']}\n[saved {r['bytes']} bytes to {r['path']}]"
+        return f"{r['warning']}\n{saved}"
+    head = f"# {os.path.basename(r['path'])}\nURL: {url}\n{saved}\n"
     if r.get("text") is None:
-        return (f"Downloaded {r['bytes']} bytes to {r['path']}, but `pdftotext` is not installed so "
-                f"the text can't be extracted here. Install poppler-utils, or read the file "
-                f"yourself — it is a valid PDF and the bot wall has already been cleared.")
+        return (f"{head}\n`pdftotext` is not installed so the text can't be extracted here. Install "
+                f"poppler-utils, or read the file yourself — it is a valid PDF and the bot wall has "
+                f"already been cleared.")
     text, total = r["text"], len(r["text"])
     if max_chars and total > max_chars:
-        text = text[:max_chars] + f"\n\n[truncated: {max_chars} of {total} chars; full file at {r['path']}]"
-    return f"# {os.path.basename(r['path'])}\nURL: {url}\n\n{text}"
+        text = text[:max_chars] + f"\n\n[truncated: {max_chars} of {total} chars; whole file on disk]"
+    return f"{head}\n{text}"
 
 
 def t_prefetch(urls, concurrency=8, timeout=30):
@@ -217,7 +227,7 @@ TOOLS = [
              "walls, bot detection, JS-rendered content, or pages needing a logged-in session. This "
              "is the tool you want 90% of the time — it opens its own tab, navigates, auto-detects "
              "and clears a Cloudflare challenge, extracts the content, and closes the tab, all in "
-             "one call. Do NOT use for PDFs (curl the file and run `pdftotext -layout`)."),
+             "one call. Do NOT use for PDFs — use the `pdf` tool, which handles them properly."),
          schema={"type": "object", "required": ["url"], "properties": {
              "url": {"type": "string", "description": "Absolute URL, including scheme."},
              "mode": _TEXT_MODE,
@@ -230,14 +240,26 @@ TOOLS = [
 
     dict(name="pdf", fn=t_pdf,
          description=(
-             "Get a PDF that plain HTTP can't reach, as text. Use this INSTEAD of `fetch` for PDF "
-             "urls, and instead of curl when the file sits behind a bot wall. It clears the "
-             "challenge in the real browser, downloads the file through that cleared session "
-             "(cookies + matching User-Agent), and extracts the text. For an unprotected PDF, plain "
-             "`curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -` is still fine and cheaper."),
+             "Get a PDF — as text, and as a file kept on disk. Use this for ANY pdf url, in place of "
+             "`fetch` and in place of curl. It clears the challenge in the real browser, downloads "
+             "through that cleared session (cookies + matching User-Agent), saves the file, and "
+             "extracts the text; it reports the path, byte count, page count and post-redirect url. "
+             "Pass `path` to keep the document somewhere permanent (`sources/foo.pdf`) rather than "
+             "scratch. Prefer this over curl even for a pdf that looks unprotected: whether a url is "
+             "protected is not knowable in advance, and the failures are silent — a 200 whose body "
+             "is a login page, or a 45-page datasheet that arrives as 10 pages. Both save without "
+             "error and neither looks wrong. This tool checks the file really is a PDF and tells you "
+             "the page count, so a short or substituted document is visible."),
          schema={"type": "object", "required": ["url"], "properties": {
              "url": {"type": "string", "description": "Direct url to the PDF."},
-             "max_chars": {"type": "integer", "default": 40000}}}),
+             "path": {"type": "string",
+                      "description": "Where to write the file. Relative paths resolve against the "
+                                     "engine's working directory, so prefer an absolute path. "
+                                     "Missing parent directories are created; an existing file at "
+                                     "this path is overwritten. Default: scratch (tmp/)."},
+             "max_chars": {"type": "integer", "default": 40000,
+                           "description": "Truncate the extracted TEXT. The saved file is always "
+                                          "complete."}}}),
 
     dict(name="prefetch", fn=t_prefetch,
          description=(
@@ -364,8 +386,9 @@ INSTRUCTIONS = """playwrong drives ONE shared, long-running, headed Chrome that 
 Turnstile. Reach for it when plain HTTP fetching fails: bot walls, JS-rendered pages, or anything
 needing a persistent session. `fetch` is the one-call answer for a single page. Rules that matter:
 never launch your own browser or kill Chrome (it is shared, and killing it loses the cleared
-Turnstile session); close any tab `goto` opened; PDFs should be curl'd and read with pdftotext, not
-opened here."""
+Turnstile session); close any tab `goto` opened; PDFs go through the `pdf` tool, never `fetch` and
+never curl — it returns the text AND keeps the file, and reports the page count that reveals a
+truncated document."""
 
 
 # ── JSON-RPC / MCP plumbing ─────────────────────────────────────────────────────────────────────

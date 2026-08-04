@@ -8,6 +8,7 @@
     playwrong https://awto.au --shot page.png # also save a screenshot
     playwrong https://awto.au --json          # {text,title,url,challenge} for scripting
     playwrong --pdf https://awto.au/doc.pdf   # a PDF from behind a bot wall, as text
+    playwrong --pdf https://awto.au/doc.pdf -o sources/doc.pdf   # ...and keep the file
     playwrong --profile work https://awto.au  # persistent named profile (logins survive)
     playwrong --tabs                          # who (agent@repo) has which tab open
     playwrong --agent researcher <url>        # label this caller in the browser + --tabs
@@ -56,9 +57,12 @@ def main(argv=None):
                         "real browser is not challenged)")
     p.add_argument("-n", type=int, default=10, metavar="N", help="max search results (default 10)")
     p.add_argument("--pdf", metavar="URL",
-                   help="download a PDF (or any file) THROUGH the cleared session and print its "
-                        "text — works when the file sits behind a bot wall that curl alone can't pass")
-    p.add_argument("-o", "--out", metavar="PATH", help="where --pdf/--shot writes (default tmp/)")
+                   help="download a PDF (or any file) THROUGH the cleared session, keep the file and "
+                        "print its text — works when the file sits behind a bot wall that curl alone "
+                        "can't pass, and reports the page count that reveals a truncated document")
+    p.add_argument("-o", "--out", metavar="PATH",
+                   help="where --pdf/--shot writes (default tmp/). Use it to keep a document: "
+                        "-o sources/doc.pdf")
     p.add_argument("--agent", metavar="NAME",
                    help="how this caller is labelled in tab titles and --tabs (default: guessed "
                         "from the program and the git repo you are in). Same as PLAYWRONG_AGENT.")
@@ -128,7 +132,10 @@ def main(argv=None):
         elif r.get("text") is None:
             print("saved, but pdftotext is not installed so there is no text to print "
                   "(dnf install poppler-utils / apt install poppler-utils)", file=sys.stderr)
-        print(f"[{r['bytes']} bytes -> {r['path']}]", file=sys.stderr)
+        pages = f", {r['pages']} pages" if r.get("pages") else ""
+        print(f"[{r['bytes']} bytes{pages} -> {r['path']}]", file=sys.stderr)
+        if r.get("final_url") and r["final_url"] != a.pdf:
+            print(f"[final url after redirects: {r['final_url']}]", file=sys.stderr)
         return 1 if r.get("warning") else 0
 
     if a.search:

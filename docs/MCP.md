@@ -121,7 +121,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 | Tool | What it's for |
 |---|---|
 | **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
-| **`pdf`** | A PDF that plain HTTP can't reach, as text: clears the wall, downloads through the cleared session (cookies + matching User-Agent), extracts the text. |
+| **`pdf`** | **Any PDF** — as text, and as a file you keep. Clears the wall, downloads through the cleared session (cookies + matching User-Agent), saves the file to `path`, extracts the text, reports bytes + page count + post-redirect url. |
 | **`prefetch`** + **`collect`** | **A list of urls.** Fires them all off (8 tabs by default), returns a job id immediately; `collect` hands you pages as they finish. Don't loop `fetch` — see below. |
 | **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
@@ -169,17 +169,59 @@ for page in connect.fetch_many(urls, concurrency=8):   # a generator: use the fi
     print(page["text"])                                 # rest are still loading
 ```
 
-### Why `pdf` exists
+### Why `pdf` exists — and why not curl
 
 "Don't open PDFs in the browser" is right — Chrome's PDF viewer can't be driven via JS — but it is
 only half the advice. For a PDF **behind a bot wall**, curl alone gets the block page (often written
 to disk as a `.pdf` that won't open), and the browser can't be driven. Neither tool works alone.
 
 `pdf` does the sequence that works: clear the challenge in the real browser → read the cookies →
-fetch the file over plain HTTP with that jar *and the browser's exact User-Agent*. For an
-unprotected PDF, plain `curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -` is still fine and
-cheaper. `connect.download(url, path)` does the same for any file type, and
+fetch the file over plain HTTP with that jar *and the browser's exact User-Agent* → keep the file →
+extract the text. `connect.download(url, path)` does the same for any file type, and
 `connect.session_headers(url)` hands back just the headers if you want to drive the transfer.
+
+**Use it for every PDF, including ones that look unprotected.** This page used to say curl was "fine
+and cheaper" for an unprotected file. That advice was wrong in a way worth spelling out, because
+whether a url is protected is *not knowable before you fetch it*, and all three ways it goes wrong
+are silent:
+
+- **A 200 that is a login page.** A vendor datasheet url returned HTTP **200** whose body was a
+  JavaScript redirect to a support login. Nothing errored; the login page was saved under the
+  datasheet's name. `pdf` checks the magic bytes and says `not a PDF (starts with b'<!DOC')`.
+- **A short document that looks complete.** The file retrieved was **10 pages**; the real datasheet
+  was **45**. The missing pages held the answer, so the absence read as *the part lacking the
+  feature* rather than *the document lacking the section*. `pdf` reports the page count, which is
+  what makes this visible at all.
+- **A chain that needs `-k`.** One host's TLS chain fails verification, so the recipe that "works"
+  becomes `curl -skL` — verification off. A real browser is never asked to make that trade.
+
+The cost difference against curl is real but small. The cost of an undetected wrong document is not.
+
+### Keeping a document: `path`
+
+`pdf` returns text *and* writes the file. Pass `path` to put it somewhere permanent instead of
+scratch — parent directories are created, an existing file is overwritten:
+
+```
+pdf(url="https://awto.au/datasheet.pdf", path="/abs/path/to/sources/datasheet.pdf")
+  -> # datasheet.pdf
+     URL: https://awto.au/datasheet.pdf
+     Saved: /abs/path/to/sources/datasheet.pdf (2411873 bytes, 45 pages)
+     Final URL after redirects: https://cdn.awto.au/docs/datasheet-rev-c.pdf
+
+     <extracted text, truncated at max_chars — the saved file is always whole>
+```
+
+Relative paths resolve against the *engine's* working directory, not the caller's, so pass an
+absolute one. `max_chars` truncates only the text; the file on disk is complete.
+
+The three lines above are what a manifest wants: the **final url after redirects** (which is where
+the bytes actually came from, and differs from what you asked for exactly when something unexpected
+happened), the **byte count**, and the **page count** to check a later copy against. Two of the three
+silent failures above are caught by that page count alone.
+
+From the shell, same thing: `playwrong --pdf <url> -o sources/doc.pdf`. From Python:
+`connect.pdf(url, path=...)` → `{path, bytes, pages, text, content_type, final_url}`.
 
 ### Why `search` exists
 
@@ -331,7 +373,9 @@ browser state:
 | Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
 | Port 8731 taken by something else | Register with `--port 8732`, or export `PH_PORT`. |
 | Turnstile not clearing | Raise `tries`; confirm the browser is headed (it must be) and that you're not running a second competing Chrome. |
-| A PDF url returns junk | Don't fetch PDFs here. `curl -sL <url> -o f.pdf && pdftotext -layout f.pdf -`. The browser's PDF viewer can't be driven reliably. |
+| A PDF url returns junk from `fetch` | Right — the browser's PDF viewer can't be driven. Use the `pdf` tool (not curl): it downloads through the cleared session and extracts the text. |
+| `pdf` says "not a PDF (starts with …)" | The server returned an HTML block or login page. `fetch` the containing page first so the session is fully cleared, then retry. Do **not** fall back to curl — curl saves that same page as a `.pdf` without telling you. |
+| A saved PDF has fewer pages than expected | You got a partial or substituted document. `pdf` prints the page count for exactly this; re-fetch after clearing the wall on the containing page, and record the expected count in your manifest. |
 
 ## Testing changes to this layer
 

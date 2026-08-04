@@ -128,17 +128,19 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 | POST | `/shutdown` | — | `{ok}` — clean stop |
 
 ## Notes for agents
-- **PDFs: don't open them in the browser — but curl alone isn't the answer either.** Chrome's built-in
-  PDF viewer (PDFViewerApplication) can't be driven via JS: page navigation, scrolling and thumbnail
-  clicks all fail. So for an *unprotected* PDF, plain `curl -sL <url> -o f.pdf` + `pdftotext -layout
-  f.pdf -` is right and cheaper than any of this.
-  **For a PDF behind a bot wall, neither tool works alone** — curl gets the block page (often saved
-  as a .pdf that won't open), and the browser can't be driven. The working sequence is: clear the
-  challenge in the browser → read `/cookies` → fetch the file over HTTP with that jar *and the
-  browser's exact User-Agent*. That is implemented, so don't hand-roll it:
-  `playwrong --pdf <url>`, the MCP `pdf` tool, or `connect.pdf(url)` / `connect.download(url, path)`
-  for any file type. `connect.session_headers(url)` returns just the `{Cookie, User-Agent, Referer}`
-  if you want to drive the download yourself.
+- **PDFs: don't open them in the browser, and don't curl them either.** Chrome's built-in PDF viewer
+  (PDFViewerApplication) can't be driven via JS: page navigation, scrolling and thumbnail clicks all
+  fail. And curl gets a bot wall's block page (often saved as a .pdf that won't open) — so for a
+  protected file neither tool works alone.
+  The working sequence is: clear the challenge in the browser → read `/cookies` → fetch the file over
+  HTTP with that jar *and the browser's exact User-Agent*. That is implemented, so don't hand-roll
+  it: `playwrong --pdf <url> -o sources/doc.pdf`, the MCP `pdf` tool, or `connect.pdf(url, path=…)` /
+  `connect.download(url, path)` for any file type. `connect.session_headers(url)` returns just the
+  `{Cookie, User-Agent, Referer}` if you want to drive the download yourself.
+  **Use it even when the url looks unprotected**, because you cannot tell in advance and the failures
+  are silent: a 200 whose body is a login page, or a 45-page datasheet that arrives as 10 pages. Both
+  save without error. `connect.pdf` checks the magic bytes and returns `pages`, so both are visible;
+  it also returns `final_url` (post-redirect) and `bytes` for a manifest. See docs/MCP.md.
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).

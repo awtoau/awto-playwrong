@@ -25,6 +25,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
 LOG = os.path.join(LOGDIR, "mcp-selftest.log")
 TEST_URL = "https://example.com"
+# A tiny, long-stable 1-page PDF published as a test fixture — it exists to be fetched by tools.
+PDF_URL = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
 # Opt-in (--cloudflare) because it hits a third party and depends on their wall still being up.
 # nowsecure.nl is the community's standard bot-detection target — it exists to be probed.
 CF_URL = "https://nowsecure.nl"
@@ -194,6 +196,25 @@ def live_tests(c):
     # url in the output means ad/help links are leaking back in.
     ok("search returns no ads or DDG furniture", "duckduckgo.com" not in body,
        next((ln for ln in body.splitlines() if "duckduckgo.com" in ln), ""))
+
+    # pdf: the file must SURVIVE the call, at the path the caller asked for. Returning only the
+    # extracted text (as this tool once did) means a document can't be kept for later reference, and
+    # that gap is what sent agents back to curl — which is how a login page gets saved under a
+    # datasheet's name. Assert the file, the reported path, and the page count that catches a
+    # truncated download.
+    want = os.path.join(REPO, "tmp", "selftest-pdf", "dummy.pdf")
+    if os.path.exists(want):
+        os.remove(want)                       # else a stale file passes the test on its own
+    r = c.call("pdf", url=PDF_URL, path=want)
+    body = text_of(r)
+    ok("pdf keeps the file at the requested path", os.path.exists(want),
+       f"{os.path.getsize(want) if os.path.exists(want) else 0} bytes at {want}")
+    ok("pdf saved a real PDF, not a block page",
+       os.path.exists(want) and open(want, "rb").read(5) == b"%PDF-")
+    ok("pdf reports where it saved", want in body, body.splitlines()[2] if len(body.splitlines()) > 2 else body[:80])
+    ok("pdf reports the page count", "1 pages" in body or "1 page" in body,
+       next((ln for ln in body.splitlines() if "Saved:" in ln), ""))
+    ok("pdf extracts the text", "Dummy PDF file" in body)
 
     # prefetch/collect: fire a batch, take results as they land. The point is that this is FASTER
     # than looping fetch and that a stalled url cannot hold the rest.

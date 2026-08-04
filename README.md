@@ -61,7 +61,8 @@ text.
 
 ```sh
 ./playwrong --search "nodriver turnstile"  # DuckDuckGo results (curl gets a CAPTCHA now)
-./playwrong --pdf https://awto.au/doc.pdf # a PDF from behind a bot wall, as text
+./playwrong --pdf https://awto.au/doc.pdf # any PDF, as text — never curl one, see docs/MCP.md
+./playwrong --pdf https://awto.au/doc.pdf -o sources/doc.pdf   # ...and keep the file
 ./playwrong --profile work https://awto.au # persistent named profile: logins survive
 ./playwrong https://awto.au https://awto.au/capabilities   # several, one warm browser
 ./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
@@ -79,8 +80,8 @@ text.
 | `-j N`, `--jobs N` | load N urls **in parallel**, printing each as it finishes. A page load is mostly waiting; this overlaps it. |
 | `-s`, `--search Q` | DuckDuckGo results as `title + url` (curl gets a CAPTCHA; a real browser doesn't) |
 | `-n N` | max search results (default 10) |
-| `--pdf URL` | download a PDF **through the cleared session** and print its text |
-| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the cache dir) |
+| `--pdf URL` | download a PDF **through the cleared session**, keep the file, print its text and page count |
+| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the cache dir). `-o sources/doc.pdf` to keep a document |
 | `--links` / `--html` | keep hrefs as `anchor <url>` / return raw markup instead of text |
 | `--max-chars N` | truncate each page (`0` = no limit; default 40000) |
 | `--shot PATH` | also save a PNG. Several urls get `name-0.png`, `name-1.png`. |
@@ -188,7 +189,7 @@ print(page["text"])                              # {text, title, url, challenge}
 | `poll(job)` | counts only: ready / loading / pending / errors / done |
 | `collect(job, wait=, max_chars=)` | take whatever is ready; each page delivered exactly once |
 | `search(query, max_results=)` | DuckDuckGo results as `[{title, url}]` |
-| `pdf(url)` / `download(url, path=)` | a file from behind a bot wall, via the cleared session |
+| `pdf(url, path=)` / `download(url, path=)` | a file, via the cleared session → `{path, bytes, pages, text, final_url}` |
 | `session_headers(url)` | just the `{Cookie, User-Agent, Referer}`, to drive a transfer yourself |
 | `ensure(port=, profile=)` | engine + Chrome up; idempotent, and safe when many processes call it at once |
 | `call(op, **body)` / `op(op, **body)` | any raw engine verb, without / with an auto-start |

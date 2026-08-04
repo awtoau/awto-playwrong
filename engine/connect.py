@@ -588,7 +588,11 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
 def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None):
     """Fetch a file (PDF, zip, image, …) from behind a bot wall and write it to disk.
 
-    Returns {path, bytes, content_type, headers_used}. `path` defaults to tmp/ + the url's basename.
+    Returns {path, bytes, content_type, final_url}. `path` defaults to tmp/ + the url's basename;
+    give one to keep the file somewhere real (`sources/foo.pdf`) instead of scratch.
+
+    `final_url` is the url after redirects. A manifest wants that rather than the url you asked
+    for — they differ exactly when a download went somewhere you did not expect.
     """
     headers = session_headers(url, port=port, on_start=on_start, solve=solve, tries=tries,
                               profile=profile)
@@ -599,6 +603,7 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
         with urllib.request.urlopen(req, timeout=180) as r:   # 3 min: documents can be tens of MB
             data = r.read()
             ctype = r.headers.get("Content-Type", "")
+            final = r.geturl()
     except urllib.error.HTTPError as e:
         raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
     except (urllib.error.URLError, OSError) as e:
@@ -606,9 +611,14 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
     if path is None:
         name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
         path = os.path.join(DATA, name)
-    with open(path, "wb") as f:
+    else:
+        path = os.path.abspath(os.path.expanduser(path))
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)   # sources/ may not exist yet; a missing dir is not
+    with open(path, "wb") as f:                  # a reason to throw away a download that worked
         f.write(data)
-    return {"path": path, "bytes": len(data), "content_type": ctype}
+    return {"path": path, "bytes": len(data), "content_type": ctype, "final_url": final}
 
 
 def pdf_text(path):
@@ -624,9 +634,34 @@ def pdf_text(path):
         return None
 
 
+def pdf_pages(path):
+    """Page count via pdfinfo, or None when poppler-utils isn't installed.
+
+    Worth the extra process: a truncated document is the failure that doesn't announce itself. A
+    45-page datasheet that arrives as 10 pages reads as complete — the missing section looks like a
+    feature the part lacks rather than a document you only half have. Comparing this against what
+    the document should have is the check that catches it.
+    """
+    exe = shutil.which("pdfinfo")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, path], capture_output=True, text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            if line.startswith("Pages:"):
+                return int(line.split(":", 1)[1].strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def pdf(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None):
-    """A PDF, even behind a bot wall: clear the challenge, download through the cleared session, and
-    extract the text. Returns {path, bytes, text, content_type}."""
+    """A PDF, even behind a bot wall: clear the challenge, download through the cleared session,
+    keep the file, and extract the text.
+
+    Returns {path, bytes, pages, text, content_type, final_url}. Pass `path` to keep the file
+    somewhere permanent — the download happens either way, so discarding it is pure loss.
+    """
     out = download(url, path=path, port=port, on_start=on_start, solve=solve, tries=tries,
                    profile=profile)
     head = open(out["path"], "rb").read(5)
@@ -637,7 +672,9 @@ def pdf(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=
         out["warning"] = (f"not a PDF (starts with {head!r}) — the server likely returned an HTML "
                           f"block page. Try fetching the containing page first so the session is "
                           f"fully cleared.")
+        out["pages"] = None
         return out
+    out["pages"] = pdf_pages(out["path"])
     out["text"] = pdf_text(out["path"])
     return out
 
