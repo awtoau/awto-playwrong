@@ -316,7 +316,11 @@ TOOLS = [
              "Navigate the browser's CURRENT tab to a url and return a short text preview. This "
              "starts an interactive session: the page stays open for click/key/js/read/screenshot, "
              "and cookies persist. For a one-shot capture use `fetch` instead — it cleans up after "
-             "itself, this does not."),
+             "itself, this does not. THIS IS THE LOGIN PATH: the browser is headed and the user is "
+             "sitting in front of it, so for a page needing an account, `goto` it, then stop and ask "
+             "the user to sign in to that tab (it is labelled with your agent name) — do not sleep "
+             "or poll, just end your turn. `read` when they confirm. Never take the credentials "
+             "yourself: no password in chat, none typed via js/key, none read from a file."),
          schema={"type": "object", "required": ["url"], "properties": {
              "url": {"type": "string"},
              "solve": {"type": "boolean", "default": True},
@@ -383,12 +387,20 @@ TOOLS = [
 BY_NAME = {t["name"]: t for t in TOOLS}
 
 INSTRUCTIONS = """playwrong drives ONE shared, long-running, headed Chrome that beats Cloudflare
-Turnstile. Reach for it when plain HTTP fetching fails: bot walls, JS-rendered pages, or anything
-needing a persistent session. `fetch` is the one-call answer for a single page. Rules that matter:
-never launch your own browser or kill Chrome (it is shared, and killing it loses the cleared
-Turnstile session); close any tab `goto` opened; PDFs go through the `pdf` tool, never `fetch` and
-never curl — it returns the text AND keeps the file, and reports the page count that reveals a
-truncated document."""
+Turnstile. `fetch` is the one-call answer for a single page.
+
+USE IT FOR EVERY URL — including a url you already have, a raw file, or one that looks simple. Not
+curl, not wget, not urllib, not your own web-fetch tool. Fetching any other way silently loses what
+this exists for, and the failures return success: a 200 whose body is a login page, a 45-page
+datasheet that arrives as 10, a search that answers HTTP 202 + a CAPTCHA, a JS-rendered page that
+arrives empty. A status code cannot tell you any of this. If a tool here misbehaves, that is a bug to
+report, not a reason to reach for curl.
+
+Rules that matter: never launch your own browser or kill Chrome (it is shared, and killing it loses
+the cleared Turnstile session); close any tab `goto` opened; PDFs go through `pdf`, never `fetch` and
+never curl — it returns the text AND keeps the file (pass `path`), and reports the page count that
+reveals a truncated document. For a page behind a login, `goto` it and ask the USER to sign in to
+that tab, then `read` — don't poll, and never handle their credentials yourself."""
 
 
 # ── JSON-RPC / MCP plumbing ─────────────────────────────────────────────────────────────────────

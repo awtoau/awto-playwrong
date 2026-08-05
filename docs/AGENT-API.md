@@ -141,6 +141,19 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   are silent: a 200 whose body is a login page, or a 45-page datasheet that arrives as 10 pages. Both
   save without error. `connect.pdf` checks the magic bytes and returns `pages`, so both are visible;
   it also returns `final_url` (post-redirect) and `bytes` for a manifest. See docs/MCP.md.
+- **Every url comes through this engine** — not curl, wget, urllib or a built-in web-fetch, and that
+  includes a url you already have, a raw file, or one that looks simple. A fetch made any other way
+  loses the only thing this provides, silently: the 200-that-is-a-login-page and the 10-of-45-pages
+  above, plus DuckDuckGo answering HTTP 202 + an image CAPTCHA, and a client-rendered page arriving
+  as an empty shell. All look like success. A tool here misbehaving is a bug to report, not a reason
+  to fall back to curl.
+- **A page behind a login: ask the user, don't route around it.** Chrome is headed and the person is
+  in front of it, so the working move is `/goto` the page, then stop and ask them to sign in to that
+  tab (tabs carry the caller's agent label), then `/text` when they confirm. Don't poll or sleep
+  while you wait — end the turn. Never handle the credentials yourself: not pasted into chat, not
+  typed via `/js`, not read from a file. 2FA, SSO and a CAPTCHA on the login form are theirs too, and
+  they work precisely because the browser is real. Pair with `PH_PROFILE` below so it survives a
+  restart.
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).

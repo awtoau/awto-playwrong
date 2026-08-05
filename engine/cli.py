@@ -61,8 +61,8 @@ def main(argv=None):
                         "print its text — works when the file sits behind a bot wall that curl alone "
                         "can't pass, and reports the page count that reveals a truncated document")
     p.add_argument("-o", "--out", metavar="PATH",
-                   help="where --pdf/--shot writes (default tmp/). Use it to keep a document: "
-                        "-o sources/doc.pdf")
+                   help="where --pdf/--shot writes (default: tmp/, or the XDG cache dir when the "
+                        "checkout isn't writable). Use it to keep a document: -o sources/doc.pdf")
     p.add_argument("--agent", metavar="NAME",
                    help="how this caller is labelled in tab titles and --tabs (default: guessed "
                         "from the program and the git repo you are in). Same as PLAYWRONG_AGENT.")

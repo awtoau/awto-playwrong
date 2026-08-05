@@ -23,7 +23,7 @@ HTTP fetching could not.
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (33 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (38 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
@@ -48,6 +48,17 @@ Also: `prefetch`/`collect` (a list of urls, loaded in parallel, read as each fin
 `pdf`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
 No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
 front of the same engine described below — driving it over HTTP still works exactly as before.
+
+**Send every url through it — including ones you already have, raw files, and urls that look
+simple.** Not curl, not wget, not a built-in web-fetch. Fetching any other way gives up the only
+thing this project provides, and does it silently: a 200 whose body is a login page, a 45-page
+datasheet that arrives as 10, a search answered with HTTP 202 and a CAPTCHA, a JS-rendered page that
+arrives empty. All four look like success. Details and the login workflow:
+[docs/MCP.md](docs/MCP.md#every-url-goes-through-here-no-exceptions).
+
+**A page that needs an account isn't a dead end.** The browser is headed and the user is in front of
+it: `goto` the page, ask them to sign in to that tab, then `read`. Never handle their credentials —
+see [Pages behind a login](docs/MCP.md#pages-behind-a-login--open-the-tab-and-ask-the-user).
 
 ## I just want to view / fetch one web page
 
@@ -81,7 +92,7 @@ text.
 | `-s`, `--search Q` | DuckDuckGo results as `title + url` (curl gets a CAPTCHA; a real browser doesn't) |
 | `-n N` | max search results (default 10) |
 | `--pdf URL` | download a PDF **through the cleared session**, keep the file, print its text and page count |
-| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the cache dir). `-o sources/doc.pdf` to keep a document |
+| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the checkout's `tmp/`, or the XDG cache dir when that isn't writable). `-o sources/doc.pdf` to keep a document |
 | `--links` / `--html` | keep hrefs as `anchor <url>` / return raw markup instead of text |
 | `--max-chars N` | truncate each page (`0` = no limit; default 40000) |
 | `--shot PATH` | also save a PNG. Several urls get `name-0.png`, `name-1.png`. |

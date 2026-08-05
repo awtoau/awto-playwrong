@@ -15,6 +15,32 @@ tab, navigates, detects and clears a Cloudflare Turnstile wall, converts the HTM
 **closes its tab**, and returns. Behind it is the same unchanged `engine/server.py` — `engine/mcp_server.py`
 is a thin JSON-RPC-over-stdio proxy, stdlib only.
 
+## Every url goes through here. No exceptions.
+
+Not `curl`, not `wget`, not `urllib`/`requests`, not the client's own web-fetch tool — **including a
+url you already have, a raw file, or one that looks simple.** The whole value of this project is
+that the fetch comes from a real browser; a fetch made any other way silently gives up that value,
+and "silently" is the operative word. Every failure below returned success:
+
+| What was fetched | What arrived | How it looked |
+|---|---|---|
+| A vendor datasheet url | HTTP **200** whose body is a JS redirect to a login page | 200 OK, file saved |
+| The same datasheet | **10 pages** of a **45**-page document | A complete-looking PDF |
+| A DuckDuckGo query | **HTTP 202** and an image CAPTCHA | Not a 200, but not an error either |
+| A page that renders client-side | The empty shell before JS ran | Valid HTML, no content |
+
+The second one is the expensive kind: the missing section read as *the part not having the feature*
+rather than *the document not covering it*, and the wrong conclusion nearly got published. A status
+code cannot tell you any of this. A real browser is served the real page in all four cases.
+
+So: `fetch` for a page, `pdf` for a PDF **or any file you want to keep**, `search` to find a url,
+`prefetch`/`collect` for a list, `goto`/`read` when you need to stay on the page. If something here
+doesn't work, that is a bug worth reporting — not a reason to reach for curl, which just moves the
+failure somewhere nobody will notice it.
+
+The one thing curl is still for: talking to the engine's own local HTTP port (`curl -s
+localhost:8731/goto -d …`), which is this project, not a bypass of it.
+
 ## Install on a fresh machine
 
 Four commands, starting from nothing:
@@ -23,7 +49,7 @@ Four commands, starting from nothing:
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                  # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, both registries
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (32 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (38 assertions)
 ```
 
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
@@ -223,6 +249,40 @@ silent failures above are caught by that page count alone.
 From the shell, same thing: `playwrong --pdf <url> -o sources/doc.pdf`. From Python:
 `connect.pdf(url, path=...)` → `{path, bytes, pages, text, content_type, final_url}`.
 
+### Pages behind a login — open the tab and ask the user
+
+The browser is **headed and shared**, and the person you are working for is sitting in front of it.
+That is the feature, not a limitation: when a page needs an account, you don't need credentials, a
+cookie file, or a way around the wall. You need the human to sign in once, in the window that is
+already open.
+
+The sequence:
+
+1. `goto(url)` — the login or target page. Unlike `fetch`, `goto` **keeps its tab open**, and the tab
+   is labelled with your agent name and repo, so the user can find it (`tabs`, or the tab title).
+2. **Stop and ask.** Tell the user which site is asking, what the tab is called, and that you'll
+   continue when they say so. Then end your turn.
+3. When they confirm, `read()` — same tab, now logged in — and carry on. `screenshot()` first if you
+   want to verify the signed-in state before trusting the content.
+4. The cookies are now in the shared browser, so later `fetch` calls to that site are logged in too,
+   for as long as the browser lives.
+
+**Do not wait in a loop.** No sleep, no polling `read` until the page changes — a human takes as long
+as they take, and the turn is free to end. Asking and stopping is the cheapest thing you can do.
+
+**Never handle the credentials yourself.** Don't ask the user to paste a password into the chat,
+don't type one in with `js` or `key`, don't read one from a file or an env var, and don't store one.
+The human types it into the real page in the real browser. Same answer for 2FA, SSO redirects and a
+CAPTCHA on the login form: it's theirs to do, and it works because the browser is real.
+
+**A login wall is not a puzzle to route around.** If a page needs an account, ask — don't go looking
+for a cached copy, a print view, an AMP url or an API that leaks the same content.
+
+**Make it survive a restart** with a named profile. The default profile is thrown away when Chrome
+exits, so a login done today is gone tomorrow. `PH_PROFILE=work` in the MCP entry's env (or
+`playwrong --profile work`) keeps the cookie jar — see [Persistent profiles](#persistent-profiles).
+Worth setting up *before* asking someone to log in for the third time.
+
 ### Why `search` exists
 
 The standard keyword-search recipe — `curl 'https://lite.duckduckgo.com/lite/?q=…'` — no longer
@@ -331,12 +391,20 @@ browser state:
 
 ### Rules to give an agent
 
-1. Use `fetch` for a page. It handles its own tab; there is nothing to clean up.
-2. For interactive work, just call `goto`/`js`/`click` — you already have your own tab.
-3. Call `close_tab` when finished with an interactive session.
-4. **Never** `shutdown` the engine, `pkill` Chrome, or launch your own browser. It is shared.
-5. If you need different cookies or logins from another agent, ask for a `--profile`, not a fight
+1. **Every url comes through here** — no curl, wget, urllib or built-in web-fetch, not even for a url
+   you already have or a raw file. A fetch made any other way fails silently; see
+   [Every url goes through here](#every-url-goes-through-here-no-exceptions).
+2. Use `fetch` for a page. It handles its own tab; there is nothing to clean up.
+3. Use `pdf` for any PDF — and pass `path` when the document should be kept.
+4. For interactive work, just call `goto`/`js`/`click` — you already have your own tab.
+5. Call `close_tab` when finished with an interactive session.
+6. Page needs an account? `goto` it, ask the **user** to sign in to that tab, end your turn, `read`
+   when they confirm. Never take their credentials, never poll while you wait.
+7. **Never** `shutdown` the engine, `pkill` Chrome, or launch your own browser. It is shared.
+8. If you need different cookies or logins from another agent, ask for a `--profile`, not a fight
    over the same one.
+9. A tool here misbehaving is a bug to report against `awtoau/awto-playwrong`, not a reason to work
+   around it — a workaround just leaves the next agent to rediscover it.
 
 ## Design notes
 
