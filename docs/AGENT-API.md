@@ -163,13 +163,20 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).
-- **A dead browser heals itself; don't restart the engine for it.** If Chrome exits (crash, or
-  someone closes the window), the next op relaunches it — `_ensure()` checks the process is alive
-  rather than trusting a handle, and an op that dies mid-flight is retried once against the new
-  browser. Cookies and the cleared Turnstile session do NOT survive unless the profile is persistent
-  (`PH_PROFILE`), and tab tags are dropped with the browser they named, so re-open your tabs. Before
-  the fix this state was permanent and invisible: every op returned `ConnectionClosedError` while
-  `/status` said `alive: true` (issue #8). `python scripts/recovery_test.py` is the regression guard.
+- **A dead browser heals itself; don't restart the engine for it.** An op that hits a dropped
+  connection drops the dead handles and retries once, and `_ensure()` re-checks the browser rather
+  than trusting a handle. Two outcomes:
+  - **Socket died, Chrome still running** (issue #6) → **reattach** over `/cdp`. The cleared
+    Turnstile session and every login survive, because it is the same browser.
+  - **Chrome exited** — crash, or someone closed the window → **relaunch**. A still-running browser
+    is stopped first so it is not orphaned. Cookies and the cleared session are lost unless the
+    profile is persistent (`PH_PROFILE`).
+
+  Tab tags are dropped with the browser they named either way, so re-open your tabs. Before the fix
+  this state was permanent and invisible: every op returned `ConnectionClosedError` while `/status`
+  said `alive: true` (issues #6, #7, #8). `python scripts/recovery_test.py` is the regression guard —
+  it covers the closed-window and crash paths; the reattach path can't be forced from outside the
+  engine and is untested.
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
 - **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,

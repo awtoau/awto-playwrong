@@ -196,6 +196,7 @@ class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
+        self._dead = False      # set when an op hits a dropped connection; cleared by _ensure()
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
         self.jobs = {}          # prefetch job id -> {slots, total, delivered}
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
@@ -203,6 +204,10 @@ class ND:
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+    def run_timeout(self, coro, timeout):
+        """run(), but bounded — for the diagnostic paths, which must answer even when the loop is
+        busy with a page load. Raises TimeoutError; the coroutine is left to finish on its own."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
     def gone(self):
         """Has the Chrome we launched exited? Cheap — no CDP round trip on the happy path.
 
@@ -212,20 +217,76 @@ class ND:
         if self.browser is None: return True
         try: return bool(self.browser.stopped)
         except Exception: return True   # can't tell -> assume gone; a spare relaunch beats a wedge
+    def ok(self):
+        """Usable browser: launched, not marked dead by a failed op, process still running."""
+        return self.tab is not None and not self._dead and not self.gone()
+    async def probe(self, timeout=1.0):
+        """One real CDP round trip, or None if the loop was too busy to answer in time.
+
+        The process being alive is not the same as the browser being reachable — in #6 Chrome's
+        /json endpoint kept answering while every target websocket was dead, so a process check
+        alone would still have called that engine healthy. Browser.getVersion is the cheapest thing
+        that proves the socket carries traffic.
+
+        A local CDP round trip is single-digit milliseconds. 1s is ~200x that, chosen so a browser
+        busy with a page load is not declared dead; on expiry we return None ("could not tell")
+        rather than a verdict, because a slow answer means loaded, not broken."""
+        if not self.ok(): return False
+        try:
+            await asyncio.wait_for(self.tab.send(cdp.browser.get_version()), timeout)
+            return True
+        except TimeoutError:
+            return None
+        except Exception as e:
+            log("probe_failed", e=repr(e)[:100])
+            return False
     def chrome_pid(self):
         """PID of the Chrome we launched, or None. Diagnostic — and what lets a test kill exactly
         this browser instead of pgrep-ing for one and hitting somebody's shared session."""
         p = getattr(self.browser, "_process", None) if self.browser is not None else None
         return getattr(p, "pid", None)
     def forget(self, why):
-        """Drop every handle to a browser that is no longer there.
+        """Mark the connection dead, but KEEP the browser handle.
 
-        Tags and owners are TARGET IDS. Kept across a relaunch they name tabs in a browser that no
-        longer exists, and a stale tag resolving to a live tab is the cross-agent page theft tab
-        tagging exists to prevent — so they go with the browser."""
+        Two failures wear the same error. Chrome exited (#8), or Chrome is still running and only
+        the websocket died (#6 — /json still answered while every target socket was dead). The
+        handle is what tells them apart in _ensure(): the second case wants a reattach, and throwing
+        the handle away there would strand a live Chrome that nothing can close.
+
+        Tags and owners go now either way. They are TARGET IDS, and a stale tag resolving into a
+        fresh browser is the cross-agent page theft that tab tagging exists to prevent."""
         log("browser_lost", why=str(why)[:100])
-        self.browser = self.tab = None
+        self._dead = True
+        self.tab = None
         self.tags.clear(); self.owners.clear()
+    async def _reattach(self):
+        """Same Chrome, new connection. Returns True if it worked.
+
+        Preferred over relaunching whenever the process is alive: a relaunch throws away the cleared
+        Turnstile session and every login, which is the whole reason this project holds one browser
+        open. `uc.start(host, port)` attaches instead of spawning — crawl/browser.py has attached to
+        the shared browser this way for a while."""
+        info = getattr(self, "_cdp", None) or {}
+        if not info.get("host"): return False
+        try:
+            self.browser = await uc.start(host=info["host"], port=info["port"])
+            self.tab = await self.browser.get("about:blank")
+            self._dead = False
+            log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
+            return True
+        except Exception as e:
+            log("reattach_failed", e=repr(e)[:100])
+            return False
+    async def _retire(self):
+        """Stop a browser we are about to replace, so it is not orphaned.
+
+        Only reached when the connection is unusable but the process is still up. Skipping this is
+        how you get the pile of headed Chromes cleanup_orphans.py was written for — 12 of them
+        holding 15.7 GB, from one afternoon."""
+        try:
+            if not self.gone(): self.browser.stop()
+        except Exception as e:
+            log("retire_err", e=repr(e)[:80])
     async def _ensure(self):
         """Launch the browser once, however many callers arrive at once — and relaunch it if it died.
 
@@ -235,13 +296,18 @@ class ND:
         nd_started fired 12 times for a single server. The lock makes the launch happen once; the
         re-check inside it is what the fast path outside cannot guarantee.
 
-        The `gone()` half is the other failure: Chrome dies, self.tab still points at it, and every
-        op returns ConnectionClosedError until a human restarts the engine — three times in two days
-        before it was fixed. Issue #8."""
-        if self.tab and not self.gone(): return
+        The recovery half is the other failure: the browser goes away, self.tab still points at it,
+        and every op returns ConnectionClosedError until a human restarts the engine — three times in
+        two days before it was fixed (#8, #6, #7). Reattach if the process is still there, because
+        that keeps the cleared session; relaunch only when there is nothing left to attach to."""
+        if self.ok(): return
         async with self._launch:
-            if self.tab and not self.gone(): return   # someone else launched while we waited
-            if self.tab: self.forget("chrome exited")
+            if self.ok(): return          # someone else fixed it while we waited for the lock
+            if self.browser is not None:
+                if not self.gone() and await self._reattach(): return
+                await self._retire()      # still running but unreachable: stop it, don't strand it
+            self.browser = self.tab = None
+            self._dead = False
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
             self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
             self.tab = await self.browser.get("about:blank")
@@ -780,8 +846,16 @@ class H(BaseHTTPRequestHandler):
         # alive = a browser that is actually there, not one we once launched. It used to report
         # `B.tab is not None`, which stays true forever after the first launch — so /status, and
         # doctor.py reading it, called a dead engine healthy while every op failed. Issue #8.
-        if self.path=="/status":self._j({"server":True,"alive":B.tab is not None and not B.gone(),
-                                         "launched":B.tab is not None,"chrome_pid":B.chrome_pid()})
+        if self.path=="/status":
+            # A real round trip, not an inference. `alive` used to be `B.tab is not None`, true
+            # forever after the first launch — so this endpoint, and doctor.py reading it, certified
+            # a dead engine as healthy (#8). The process check alone is not enough either: in #6
+            # Chrome was still running with a dead socket. probe() answers None when the loop is
+            # merely busy, and then the cheap answer stands, because busy is not broken.
+            try: p = B.run_timeout(B.probe(), 3.0)
+            except Exception: p = None
+            self._j({"server":True,"alive":B.ok() if p is None else bool(p),
+                     "launched":B.tab is not None,"chrome_pid":B.chrome_pid()})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")

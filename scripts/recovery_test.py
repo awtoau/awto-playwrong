@@ -12,6 +12,12 @@ ALWAYS runs against an isolated port, never the shared engine on 8731 — the te
 browser, and the shared one carries everyone's cleared Turnstile session. The pid it kills comes from
 that engine's own /status, so it cannot pick the wrong Chrome.
 
+Two of the three states are covered here: a closed window (Chrome exits with its last tab) and a
+crash (SIGKILL). NOT covered: the process alive with its websockets dead, reported in issue #6.
+Closing targets from outside cannot produce it — Chrome exits with the last one — and nothing else
+reachable from a test kills a socket while sparing the process. That path (`_reattach`, taken when
+`gone()` is false) is exercised in production and not here; treat it as untested code.
+
 Results: tmp/logs/recovery-test.log
 """
 import argparse
@@ -20,6 +26,7 @@ import os
 import signal
 import sys
 import time
+import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -61,6 +68,29 @@ def status(port):
         return {"error": repr(e)[:120]}
 
 
+def devtools(url):
+    """Chrome's own DevTools HTTP endpoint. Local, and the only way to close a target from outside
+    the engine — which is how the #6 failure is reproduced without killing the browser."""
+    with urllib.request.urlopen(url, timeout=5) as r:      # localhost: 5s is already generous
+        body = r.read().decode()
+    try:
+        return json.loads(body)
+    except ValueError:
+        return body
+
+
+def kill_targets(port, cdp):
+    """Close every page target, leaving Chrome running. The engine's tab websocket dies with them —
+    process alive, socket dead, which a returncode check calls healthy."""
+    base = f"http://{cdp['host']}:{cdp['port']}"
+    killed = 0
+    for t in devtools(f"{base}/json"):
+        if t.get("type") == "page":
+            devtools(f"{base}/json/close/{t['id']}")
+            killed += 1
+    return killed
+
+
 def wait_dead(pid):
     """Block until the pid is gone, or DEATH_BUDGET passes. Returns how long it took."""
     t0 = time.monotonic()
@@ -97,19 +127,37 @@ def main():
             say("\nno chrome_pid to kill — cannot run the rest")
             return 1
 
-        # 2. Kill it the way a crash does: no clean close, exactly the 'no close frame received or
-        #    sent' the real failure logged.
+        # 2. Someone closes the window — the likeliest real cause. Closing every page target from
+        #    the DevTools endpoint is what that does, and Chrome exits with its last tab.
+        cdp = connect.call("cdp", port=a.port)
+        n = kill_targets(a.port, cdp)
+        ok("closing the last window ends the browser", n > 0 and wait_dead(pid) is not None,
+           f"{n} target(s) closed, pid {pid} gone")
+        st = status(a.port)
+        ok("status sees the closed browser as dead", st.get("alive") is False, json.dumps(st))
+        r = connect.capture(URL, port=a.port, max_chars=200)
+        ok("fetch recovers from a closed window", "Example Domain" in r["text"])
+        st = status(a.port)
+        ok("no orphan left behind", wait_dead(pid) is not None and st.get("chrome_pid") != pid,
+           f"old pid {pid} gone, now {st.get('chrome_pid')}")
+
+        # 3. A crash: SIGKILL, no clean close — exactly the 'no close frame received or sent' the
+        #    real failure logged. Re-read the pid; step 2 replaced the browser.
+        pid = status(a.port).get("chrome_pid")
+        if not pid:
+            ok("browser is gone", False, "no chrome_pid after recovery")
+            return 1
         os.kill(pid, signal.SIGKILL)
         took = wait_dead(pid)
         ok("browser is gone", took is not None,
            f"pid {pid} died in {took*1000:.0f}ms" if took else f"pid {pid} still alive")
 
-        # 3. The bug: status kept saying alive against exactly this state.
+        # 4. The bug: status kept saying alive against exactly this state.
         st = status(a.port)
         ok("status now reports the browser as dead", st.get("alive") is False, json.dumps(st))
         ok("status still distinguishes 'was launched'", st.get("launched") is True)
 
-        # 4. The fix: the next op relaunches instead of failing forever.
+        # 5. The fix: the next op relaunches instead of failing forever.
         t0 = time.monotonic()
         try:
             r = connect.capture(URL, port=a.port, max_chars=200)
@@ -121,7 +169,7 @@ def main():
             ok("next fetch recovers by itself", False,
                f"{repr(e)[:120]} after {time.monotonic()-t0:.1f}s")
 
-        # 5. And it is a real new browser, not the corpse.
+        # 6. And it is a real new browser, not the corpse.
         st = status(a.port)
         ok("status reports live again", st.get("alive") is True, json.dumps(st))
         ok("it is a different browser process", st.get("chrome_pid") not in (None, pid),
