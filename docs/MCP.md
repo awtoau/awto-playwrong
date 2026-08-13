@@ -438,6 +438,7 @@ browser state:
 | Chrome windows piling up / lots of RAM gone | Orphaned browsers from an engine that died without closing its own. `python scripts/cleanup_orphans.py` reports them, `--kill` closes them. It only ever touches Chrome on a nodriver temp profile (`/tmp/uc_*`) or a playwrong profile, so your own browser can never match. |
 | Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |
 | Every tool errors with "engine did not bind" | Run `python scripts/doctor.py` — nearly always a missing dep or no Chrome. Full engine output is in `tmp/logs/playwrong-engine.log`. |
+| Every tool errors with `ConnectionClosedError` | The browser died under the engine. It now relaunches on the next op by itself, so this should self-clear — if it persists, the relaunch is failing and the error says so. Was issue #8, where the engine wedged instead and `status` reported it healthy. |
 | Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
 | Port 8731 taken by something else | Register with `--port 8732`, or export `PH_PORT`. |
 | Turnstile not clearing | Raise `tries`; confirm the browser is headed (it must be) and that you're not running a second competing Chrome. |
@@ -452,6 +453,8 @@ python scripts/mcp_selftest.py --offline                    # protocol only, no 
 python scripts/mcp_selftest.py                              # + live page, tab-leak assertion
 python scripts/mcp_selftest.py --cloudflare                 # + a real Turnstile wall
 python scripts/mcp_selftest.py --port 8739 --shutdown       # isolated engine, stopped after
+python scripts/recovery_test.py                             # kill the browser, prove it comes back
 ```
 
-Only pass `--shutdown` with an isolated `--port`: the default engine is shared.
+Only pass `--shutdown` with an isolated `--port`: the default engine is shared. `recovery_test.py`
+always uses an isolated port and refuses to run on 8731 — it works by SIGKILLing a browser.

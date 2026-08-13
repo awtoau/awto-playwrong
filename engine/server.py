@@ -180,6 +180,18 @@ def heal_profile(profile_dir):
             log("profile_lock_err", file=name, e=str(e)[:60])
 
 
+def _dead_conn(e):
+    """Is this exception "the browser went away", as opposed to a page-level failure?
+
+    Matched by name and message rather than by class: the same event surfaces as websockets'
+    ConnectionClosedError, as a bare builtin ConnectionError('Connection closed') from nodriver's
+    own send(), and as an OSError when the socket dies harder. Observed message on the real
+    failure: 'no close frame received or sent'."""
+    n, s = type(e).__name__, str(e)
+    return ("ConnectionClosed" in n or n in ("ConnectionError", "ConnectionResetError")
+            or "Connection closed" in s or "no close frame" in s)
+
+
 class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
     def __init__(self):
@@ -191,17 +203,45 @@ class ND:
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+    def gone(self):
+        """Has the Chrome we launched exited? Cheap — no CDP round trip on the happy path.
+
+        `self.tab` is a plain Python object that outlives the browser, so testing it alone answers
+        "did we ever launch", never "is it still there". nodriver's `stopped` reads the child
+        process's returncode, which is the difference between recovering and not."""
+        if self.browser is None: return True
+        try: return bool(self.browser.stopped)
+        except Exception: return True   # can't tell -> assume gone; a spare relaunch beats a wedge
+    def chrome_pid(self):
+        """PID of the Chrome we launched, or None. Diagnostic — and what lets a test kill exactly
+        this browser instead of pgrep-ing for one and hitting somebody's shared session."""
+        p = getattr(self.browser, "_process", None) if self.browser is not None else None
+        return getattr(p, "pid", None)
+    def forget(self, why):
+        """Drop every handle to a browser that is no longer there.
+
+        Tags and owners are TARGET IDS. Kept across a relaunch they name tabs in a browser that no
+        longer exists, and a stale tag resolving to a live tab is the cross-agent page theft tab
+        tagging exists to prevent — so they go with the browser."""
+        log("browser_lost", why=str(why)[:100])
+        self.browser = self.tab = None
+        self.tags.clear(); self.owners.clear()
     async def _ensure(self):
-        """Launch the browser once, however many callers arrive at once.
+        """Launch the browser once, however many callers arrive at once — and relaunch it if it died.
 
         The bare `if self.tab: return` was a double-checked lock with no lock. uc.start() awaits, so
         twelve concurrent first-ops ALL saw self.tab as None and ALL launched a browser: one engine,
         twelve Chromes, eleven of them untracked and therefore unclosable. Measured exactly that —
         nd_started fired 12 times for a single server. The lock makes the launch happen once; the
-        re-check inside it is what the fast path outside cannot guarantee."""
-        if self.tab: return
+        re-check inside it is what the fast path outside cannot guarantee.
+
+        The `gone()` half is the other failure: Chrome dies, self.tab still points at it, and every
+        op returns ConnectionClosedError until a human restarts the engine — three times in two days
+        before it was fixed. Issue #8."""
+        if self.tab and not self.gone(): return
         async with self._launch:
-            if self.tab: return         # someone else launched while we waited for the lock
+            if self.tab and not self.gone(): return   # someone else launched while we waited
+            if self.tab: self.forget("chrome exited")
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
             self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
             self.tab = await self.browser.get("about:blank")
@@ -210,10 +250,13 @@ class ND:
     async def _start(self):
         """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
         primitive /status can't give you on its own. Chrome only launches on the FIRST real op
-        (goto/newtab/etc via _ensure()); /status's "alive" reports whether that's happened yet, but
-        polling /status alone never makes it happen - a caller that only checks status in a loop
-        waits forever. Call this once after confirming the HTTP server itself is reachable, then
-        /status will read alive:true."""
+        (goto/newtab/etc via _ensure()), and polling /status never makes it happen - a caller that
+        only checks status in a loop waits forever. Call this once after confirming the HTTP server
+        itself is reachable, then /status will read alive:true.
+
+        Also the repair path: /status reports a browser that died as alive:false, and this relaunches
+        it. connect._wake() already calls /start whenever alive is false, so a client recovers by
+        doing what it always did."""
         await self._ensure()
         return {"started": True}
     def _publish_cdp(self):
@@ -272,7 +315,9 @@ class ND:
             return
         try:
             await t.evaluate(
-                "(()=>{const m=%r,o=%r;const t=document.title.replace(/^\u27e6[^\u27e7]*\u27e7\s*/,'');"
+                # \\s, not \s: this is a JS regex escape, and as a Python escape it does not exist \u2014
+                # every import warned, and the log was mostly that warning. Issue #9.
+                "(()=>{const m=%r,o=%r;const t=document.title.replace(/^\u27e6[^\u27e7]*\u27e7\\s*/,'');"
                 "document.title=m+o+'\u27e7 '+t;return 1})()" % (OWNER_L, owner))
         except Exception:
             pass
@@ -653,13 +698,25 @@ class ND:
            "jobs":lambda:self._jobstatus(a.get("job")),
            "collect":lambda:self._collect(a.get("job"),a.get("drain",True))}
         if op not in m: return {"error":f"unknown {op}"}
-        try: return self.run(m[op]())
-        except Exception as e:
-            # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or line
-            # is nearly useless when the cause is three frames down in a helper.
-            log("op_err",op=op,e=repr(e)[:120],
-                where="|".join(traceback.format_exc().strip().splitlines()[-3:])[:300])
-            return {"error":repr(e)[:160]}
+        # Two attempts, and only for a dropped browser connection. Chrome can die between _ensure()
+        # and the op — the check there is cheap, not atomic — and the op then fails having done
+        # nothing, so re-running it is safe. Dropping the dead handles first makes attempt 2 relaunch
+        # via _ensure(). Any other error is returned on the first attempt, unretried.
+        for attempt in (1, 2):
+            try: return self.run(m[op]())
+            except Exception as e:
+                dead = _dead_conn(e)
+                # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or
+                # line is nearly useless when the cause is three frames down in a helper.
+                log("op_err",op=op,e=repr(e)[:120],dead_conn=dead,attempt=attempt,
+                    where="|".join(traceback.format_exc().strip().splitlines()[-3:])[:300])
+                if dead and attempt == 1:
+                    self.forget(f"{op}: {type(e).__name__}")
+                    continue
+                if dead:
+                    return {"error": f"browser connection lost and the relaunch did not take: "
+                                     f"{e!r}"[:200]}
+                return {"error":repr(e)[:160]}
 
 B = ND()
 MARKERS={"aim":None,"cursor":None,"path":[],"box":None,"ollama":None}
@@ -720,7 +777,11 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def log_message(self,*a):pass
     def do_GET(self):
-        if self.path=="/status":self._j({"server":True,"alive":B.tab is not None})
+        # alive = a browser that is actually there, not one we once launched. It used to report
+        # `B.tab is not None`, which stays true forever after the first launch — so /status, and
+        # doctor.py reading it, called a dead engine healthy while every op failed. Issue #8.
+        if self.path=="/status":self._j({"server":True,"alive":B.tab is not None and not B.gone(),
+                                         "launched":B.tab is not None,"chrome_pid":B.chrome_pid()})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")

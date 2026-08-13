@@ -20,7 +20,8 @@ any of the three entry points above) starts it; starting it by hand is a fallbac
 ## TL;DR
 ```
 Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
-Check up:  GET  /status              -> {"server": true, "alive": true|false}
+Check up:  GET  /status              -> {"server": true, "alive": true|false,
+                                        "launched": true|false, "chrome_pid": 1234|null}
 Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
 Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = where you LANDED)
            POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
@@ -31,10 +32,15 @@ Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = w
            POST /shutdown {}               -> {ok}
 ```
 
-**`server` vs `alive` — two different things, don't confuse them.** `server: true` means the HTTP
-process is up and answering requests (true the instant it responds at all — if you got JSON back,
-this is true). `alive` means Chrome has actually been launched, which happens **lazily**: nothing
-spawns a browser until the first real op (`start`/`goto`/`newtab`/etc.) asks for one. Polling
+**`server` vs `alive` vs `launched` — three different things, don't confuse them.** `server: true`
+means the HTTP process is up and answering requests (true the instant it responds at all — if you got
+JSON back, this is true). `alive` means Chrome is **there right now**, re-checked per call.
+`launched` means a browser was started at some point, which is what `alive` used to report — it
+stayed true after Chrome died, so `/status` and `doctor.py` called a wedged engine healthy while
+every op failed (issue #8). `chrome_pid` is the browser's pid, or null.
+
+Chrome launches **lazily**: nothing spawns a browser until the first real op
+(`start`/`goto`/`newtab`/etc.) asks for one. Polling
 `/status` in a loop **waiting for `alive` to turn true on its own will hang forever** if nothing
 else ever calls a real op - this is not a bug to work around, it's the intended lazy-launch design
 (no wasted Chrome startup if a caller never ends up driving the browser), but it has caught agents
@@ -115,7 +121,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ## Endpoints (the real contract — nodriver engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/status` | — | `{server: true, alive: bool}` — `server` is always true if this responds at all; `alive` is false until the first real op launches Chrome (see the note above the TL;DR) |
+| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag |
 | POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
 | POST | `/goto` | `{url}` | `{title, url, requested}` — navigates (2s settle). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Storing the requested url records a page you may never have got. |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
@@ -157,6 +163,13 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).
+- **A dead browser heals itself; don't restart the engine for it.** If Chrome exits (crash, or
+  someone closes the window), the next op relaunches it — `_ensure()` checks the process is alive
+  rather than trusting a handle, and an op that dies mid-flight is retried once against the new
+  browser. Cookies and the cleared Turnstile session do NOT survive unless the profile is persistent
+  (`PH_PROFILE`), and tab tags are dropped with the browser they named, so re-open your tabs. Before
+  the fix this state was permanent and invisible: every op returned `ConnectionClosedError` while
+  `/status` said `alive: true` (issue #8). `python scripts/recovery_test.py` is the regression guard.
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
 - **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,
