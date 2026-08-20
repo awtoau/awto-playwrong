@@ -106,9 +106,32 @@ def install_deps():
     return False
 
 
+def write_log_file(path, lines):
+    with open(path, "w", encoding="utf-8") as f:
+        if lines:
+            f.write("\n".join(lines) + "\n")
+        else:
+            f.write("")
+
+
+def _write_windows_cmd_wrapper(dest_dir, src):
+    wrapper = os.path.join(dest_dir, "playwrong.cmd")
+    if os.path.exists(wrapper) or os.path.islink(wrapper):
+        if os.path.realpath(wrapper) == os.path.realpath(src):
+            say(f"already linked: {wrapper}")
+            return True
+        say(f"refusing to overwrite existing {wrapper} (points at {os.path.realpath(wrapper)})")
+        return False
+    cmdline = subprocess.list2cmdline([sys.executable, src])
+    with open(wrapper, "w", encoding="utf-8") as f:
+        f.write("@echo off\r\nsetlocal\r\n" + cmdline + " %*\r\n")
+    say(f"linked {wrapper} -> {src}")
+    return True
+
+
 def link_cli(dest_dir=None):
-    """Symlink the `playwrong` command onto PATH. A symlink (not a copy) so a git pull updates the
-    command too; the shim resolves its own realpath to find the repo, so it works from anywhere."""
+    """Put a `playwrong` launcher on PATH. On POSIX we symlink; on Windows we fall back to a
+    `.cmd` wrapper when symlink creation is blocked by privilege policy."""
     src = os.path.join(REPO, "playwrong")
     dest_dir = os.path.expanduser(dest_dir or "~/.local/bin")
     dest = os.path.join(dest_dir, "playwrong")
@@ -121,7 +144,15 @@ def link_cli(dest_dir=None):
                 return True
             say(f"refusing to overwrite existing {dest} (points at {os.path.realpath(dest)})")
             return False
-        os.symlink(src, dest)
+        if os.name == "nt":
+            try:
+                os.symlink(src, dest)
+            except OSError as e:
+                if getattr(e, "winerror", None) in {5, 1314} or "privilege" in str(e).lower():
+                    return _write_windows_cmd_wrapper(dest_dir, src)
+                raise
+        else:
+            os.symlink(src, dest)
         say(f"linked {dest} -> {src}")
     except OSError as e:
         say(f"could not link into {dest_dir}: {e}")
@@ -320,8 +351,7 @@ def main():
         say("\nNOTE: preflight FAILED above — fix those first or the tools will error at call time.")
     say("\nprove it works:  python scripts/mcp_selftest.py")
 
-    with open(os.path.join(LOGDIR, "install.log"), "w") as f:
-        f.write("\n".join(_log) + "\n")
+    write_log_file(os.path.join(LOGDIR, "install.log"), _log)
     return 0 if healthy else 1
 
 
