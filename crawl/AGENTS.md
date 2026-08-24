@@ -35,7 +35,7 @@ so a shared DB with another project's `page` table will collide.)
 | `--db PATH_or_URL` | SQLite path, or a SQLAlchemy URL (`postgresql+psycopg://…`, `mysql+pymysql://…`) | required |
 | `--store DIR` | on-disk page store (compressed HTML) | `<db>.pages` |
 | `--max N` | max pages **attempted** this run | 200 |
-| `--tabs N` | parallel browser tabs | 8 |
+| `--tabs N` | parallel browser tabs. **Clamped to 32** (`MAX_TABS`) — Chrome is shared with other agents and each worker holds a live tab + CDP session. Raise with `CRAWL_MAX_TABS` only if you own the browser. Values are clamped loudly, never silently. | 8 |
 | `--depth N` | max link depth from a seed | 3 |
 | `--host H` | extra host to allow beyond the seeds' | — |
 | `--no-js` | block Script too (leanest; static sites) | keep JS |

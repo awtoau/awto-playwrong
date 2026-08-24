@@ -309,6 +309,12 @@ async def crawl(cfg):
         d.close()
 
 
+# Hard ceiling on concurrent tabs. Chrome is SHARED with other agents, and each worker holds a
+# live tab plus a CDP session; unbounded --tabs starves them and can take the browser down.
+# 32 is the documented design limit. Override with CRAWL_MAX_TABS only if you own the browser.
+MAX_TABS = int(os.environ.get("CRAWL_MAX_TABS", "32"))
+
+
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
@@ -318,6 +324,14 @@ class Config:
         self.db_dsn = db_dsn
         self.store_root = store_root
         self.max_pages = max_pages
+        # Clamp loudly — a silently reduced concurrency looks like the engine ignoring you.
+        if tabs > MAX_TABS:
+            print(f"  tabs={tabs} exceeds the {MAX_TABS}-tab ceiling (shared browser) "
+                  f"-> running {MAX_TABS}. Set CRAWL_MAX_TABS to raise it.", flush=True)
+            tabs = MAX_TABS
+        elif tabs < 1:
+            print(f"  tabs={tabs} is invalid -> running 1.", flush=True)
+            tabs = 1
         self.tabs = tabs
         self.depth = depth
         self.nav_timeout = nav_timeout
@@ -344,7 +358,8 @@ def _parse_args(argv):
                         "limit). Counts include pages from EARLIER runs against the same db, and "
                         "urls over the cap stay queued rather than being discarded, so raising the "
                         "cap later picks up where this left off.")
-    p.add_argument("--tabs", type=int, default=8, help="Parallel browser tabs")
+    p.add_argument("--tabs", type=int, default=8,
+                   help=f"Parallel browser tabs (1-{MAX_TABS}; clamped, the browser is shared)")
     p.add_argument("--depth", type=int, default=3, help="Max link depth from a seed")
     p.add_argument("--nav-timeout", type=float, default=12.0, help="Per-page nav budget (s)")
     p.add_argument("--stall-ceiling", type=float, default=0.0,
