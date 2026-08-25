@@ -33,8 +33,9 @@ The second one is the expensive kind: the missing section read as *the part not 
 rather than *the document not covering it*, and the wrong conclusion nearly got published. A status
 code cannot tell you any of this. A real browser is served the real page in all four cases.
 
-So: `fetch` for a page, `pdf` for a PDF **or any file you want to keep**, `search` to find a url,
-`prefetch`/`collect` for a list, `goto`/`read` when you need to stay on the page. If something here
+So: `fetch` for a page, `pdf` for a PDF, `download` for **any other file you want to keep**,
+`search` to find a url, `prefetch`/`collect` for a list, `goto`/`read` when you need to stay on the
+page. If something here
 doesn't work, that is a bug worth reporting — not a reason to reach for curl, which just moves the
 failure somewhere nobody will notice it.
 
@@ -49,7 +50,7 @@ Four commands, starting from nothing:
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                  # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, both registries
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (38 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (44 assertions)
 ```
 
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
@@ -148,6 +149,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 |---|---|
 | **`fetch`** | **The 90% tool.** One page -> readable text. Own tab, auto-solve, auto-cleanup. |
 | **`pdf`** | **Any PDF** — as text, and as a file you keep. Clears the wall, downloads through the cleared session (cookies + matching User-Agent), saves the file to `path`, extracts the text, reports bytes + page count + post-redirect url. |
+| **`download`** | **Any non-page file** — firmware, archives, installers. Streams to disk through the cleared session; reports path, bytes, sha256, content-type, post-redirect url. `expect_sha256` verifies against a publisher's value. |
 | **`prefetch`** + **`collect`** | **A list of urls.** Fires them all off (8 tabs by default), returns a job id immediately; `collect` hands you pages as they finish. Don't loop `fetch` — see below. |
 | **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
@@ -248,6 +250,24 @@ silent failures above are caught by that page count alone.
 
 From the shell, same thing: `playwrong --pdf <url> -o sources/doc.pdf`. From Python:
 `connect.pdf(url, path=...)` → `{path, bytes, pages, text, content_type, final_url}`.
+
+**Not a PDF? `download`.** Same contract without the text extraction — firmware images, archives,
+installers, any binary. It streams in 1 MiB chunks rather than reading the body into memory, so a
+750 MB image costs nothing in RSS, and it returns a `sha256` of what actually landed:
+
+```
+download(url="https://awto.au/fw/board-1.4.2.bin", path="/abs/path/to/sources/board-1.4.2.bin",
+         expect_sha256="9f2c…")
+  -> Saved: /abs/path/to/sources/board-1.4.2.bin
+     Bytes: 786,432,000
+     SHA256: 9f2c…
+     Verified against the expected value you passed.
+```
+
+`expect_sha256` is the binary equivalent of `pdf`'s page count: the check that catches a block page
+or a truncated transfer *at the moment it arrives*, instead of when someone tries to flash it. On a
+mismatch it raises and **keeps** the file — the wrong bytes are the evidence for what went wrong.
+From Python: `connect.download(url, path=…, expect_sha256=…, expect_size=…)`.
 
 ### Pages behind a login — open the tab and ask the user
 

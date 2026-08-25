@@ -235,9 +235,32 @@ def live_tests(c):
     ok("collect returns every prefetched page, duplicates included", len(got) == 3,
        f"{len(got)}/3 in {time.monotonic()-t0:.0f}s")
 
+    # download: any non-page file, kept on disk, with a checksum of what actually landed.
+    want = os.path.join(REPO, "tmp", "selftest-dl", "dummy.bin")
+    if os.path.exists(want):
+        os.remove(want)
+    body = text_of(c.call("download", url=PDF_URL, path=want))
+    ok("download keeps the file", os.path.exists(want),
+       f"{os.path.getsize(want) if os.path.exists(want) else 0} bytes")
+    ok("download reports a sha256", "SHA256: " in body and len(body.split("SHA256: ")[1][:64]) == 64)
+    ok("download warns when nothing was verified", "NOT verified" in body)
+    r = c.call("download", url=PDF_URL, path=want, expect_sha256="0" * 64)
+    ok("download rejects a wrong checksum", is_error(r) and "mismatch" in text_of(r),
+       text_of(r)[:90])
+
     c.call("close_tab", close_extra=True)
     r = c.call("tabs")
     ok("close_extra leaves only the base tab", json.loads(text_of(r)).get("count") == 1)
+
+    # Regression guard for #13: close_extra just closed this agent's own tab. Interactive ops used to
+    # keep aiming at the dead tag and raise KeyError: no such tab, every call, forever — the session
+    # was wedged until someone guessed close_extra. They must re-open the tab instead.
+    r = c.call("goto", url=TEST_URL)
+    ok("goto re-opens the agent tab after it is closed", "Example Domain" in text_of(r),
+       text_of(r)[:80])
+    r = c.call("js", expr="document.title")
+    ok("js works on the re-opened tab", "Example Domain" in text_of(r), text_of(r)[:60])
+    c.call("close_tab", close_extra=True)
 
 
 def cloudflare_test(c):

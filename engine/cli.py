@@ -147,7 +147,8 @@ def main(argv=None):
             for i, h in enumerate(hits, 1):
                 print(f"{i:2}. {h['title']}\n    {h['url']}")
         if not hits:
-            print("no results parsed — DuckDuckGo may have changed its markup", file=sys.stderr)
+            # Empty means DDG ran the search and matched nothing; a parse failure raises instead.
+            print(f"no results — the search ran, nothing matched {a.search!r}", file=sys.stderr)
             return 1
         return 0
 

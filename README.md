@@ -23,7 +23,7 @@ HTTP fetching could not.
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (38 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (44 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
@@ -45,7 +45,8 @@ fetch("https://awto.au")   # auto-starts the engine + Chrome, clears Cloudflare,
 ```
 
 Also: `prefetch`/`collect` (a list of urls, loaded in parallel, read as each finishes), `search`,
-`pdf`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`.
+`pdf`, `download`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`,
+`close_tab`.
 No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
 front of the same engine described below — driving it over HTTP still works exactly as before.
 

@@ -45,8 +45,23 @@ def elog(*a):
 
 
 def op(name, **body):
-    """Every engine op goes through here: the engine and Chrome are guaranteed up first."""
-    return connect.op(name, **body)
+    """Every engine op goes through here: the engine and Chrome are guaranteed up first.
+
+    An op aimed at THIS agent's tab is retried once if that tab has gone. A tab can disappear from
+    under a caller — the page closes it, another agent runs close_extra, the browser is relaunched
+    after dying — and the engine then raises KeyError: no such tab. That is correct for a bad
+    reference and wrong for our own tag: the tab is re-openable, and every interactive op stayed
+    wedged until someone guessed the close_extra workaround (issue #13).
+    """
+    global _have_tab
+    try:
+        return connect.op(name, **body)
+    except EngineError as e:
+        if body.get("tab") != _MY_TAB or "no such tab" not in str(e):
+            raise
+        _have_tab = False          # it is gone; my_tab() opens a fresh one under the same tag
+        my_tab()
+        return connect.op(name, **body)
 
 
 # THIS agent's own tab inside the shared browser. Interactive tools (goto/read/js/click/key) drive it
@@ -102,6 +117,23 @@ def t_pdf(url, path=None, max_chars=40000):
     return f"{head}\n{text}"
 
 
+def t_download(url, path=None, expect_sha256=None, expect_size=None):
+    r = connect.download(url, path=path, expect_sha256=expect_sha256, expect_size=expect_size)
+    lines = [f"Saved: {r['path']}",
+             f"Bytes: {r['bytes']:,}",
+             f"SHA256: {r['sha256']}"]
+    if r.get("content_type"):
+        lines.append(f"Content-Type: {r['content_type']}")
+    if r.get("final_url") and r["final_url"] != url:
+        lines.append(f"Final URL after redirects: {r['final_url']}")
+    if expect_sha256 or expect_size:
+        lines.append("Verified against the expected value you passed.")
+    else:
+        lines.append("NOT verified — pass expect_sha256 if the publisher states one. A block page "
+                     "or a truncated transfer saves without error and looks like a real file.")
+    return "\n".join(lines)
+
+
 def t_prefetch(urls, concurrency=8, timeout=30):
     job = connect.prefetch(urls, concurrency=concurrency, timeout=timeout)
     return (f"started job {job}: {len(urls)} urls loading, {concurrency} at a time.\n"
@@ -127,7 +159,13 @@ def t_collect(job, wait=0, max_chars=40000):
 def t_search(query, max_results=10):
     hits = connect.search(query, max_results=max_results)
     if not hits:
-        return "no results parsed — DuckDuckGo may have changed its markup"
+        # An empty result set is a RESULT. This used to say "no results parsed — DuckDuckGo may have
+        # changed its markup", which reads as "the search did not run" and had agents recording "no
+        # such thing exists" for queries that simply matched nothing (#10, #12). A genuine parse
+        # failure now raises from connect.search() instead, and says what arrived.
+        return (f"No results. The search ran; DuckDuckGo matched nothing for: {query}\n"
+                f"This is an empty result set, not a failure. Narrow quoted phrases and stacked OR "
+                f"clauses often match nothing — try fewer quotes or broader terms.")
     return "\n".join(f"{i:2}. {h['title']}\n    {h['url']}" for i, h in enumerate(hits, 1))
 
 
@@ -260,6 +298,28 @@ TOOLS = [
              "max_chars": {"type": "integer", "default": 40000,
                            "description": "Truncate the extracted TEXT. The saved file is always "
                                           "complete."}}}),
+
+    dict(name="download", fn=t_download,
+         description=(
+             "Download ANY file through the cleared browser session and keep it: firmware images, "
+             "archives, installers, release tarballs, anything that is not a page. Use this instead "
+             "of curl/wget for every binary — the same silent failures apply (a 200 whose body is a "
+             "login page saves happily as firmware.bin). Streams to disk in chunks, so a "
+             "hundreds-of-MB file does not go through memory. Reports the path, byte count, sha256, "
+             "content-type and post-redirect url. Pass expect_sha256 (or expect_size) when the "
+             "publisher states one and it is checked for you — that is the binary equivalent of the "
+             "page count on `pdf`. For a PDF prefer `pdf`, which also extracts the text."),
+         schema={"type": "object", "required": ["url"], "properties": {
+             "url": {"type": "string", "description": "Direct url to the file."},
+             "path": {"type": "string",
+                      "description": "Where to write it. Relative paths resolve against the engine's "
+                                     "working directory, so prefer an absolute path. Missing parent "
+                                     "directories are created; an existing file is overwritten. "
+                                     "Default: scratch (tmp/) under the url's basename."},
+             "expect_sha256": {"type": "string",
+                               "description": "Publisher-stated sha256. Mismatch raises, and the "
+                                              "file is kept as evidence."},
+             "expect_size": {"type": "integer", "description": "Expected size in bytes."}}}),
 
     dict(name="prefetch", fn=t_prefetch,
          description=(

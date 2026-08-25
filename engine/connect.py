@@ -15,6 +15,7 @@ Stdlib only, so importing it costs nothing and it can report a broken engine as 
 an ImportError.
 """
 import base64
+import hashlib
 import html as htmlmod
 import itertools
 import json
@@ -483,6 +484,10 @@ _RESULT = re.compile(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)<
 _TAGS = re.compile(r"<[^>]+>")
 # DDG's anomaly/CAPTCHA page, which a real browser also gets under rapid repeat querying.
 DDG_BLOCKED = re.compile(r"bots use DuckDuckGo too|squares containing|anomaly", re.I)
+# DDG's own "we ran your search and it matched nothing" page. Distinguishing this from a parse
+# failure is the whole point: they are opposite facts, and reporting the first as the second told
+# agents "the search did not run" when the truth was "nothing matches" (issues #10, #12).
+DDG_EMPTY = re.compile(r"No results\.|did not match any documents|No results found", re.I)
 
 
 def parse_ddg(html):
@@ -520,14 +525,23 @@ def search(query, max_results=20, port=None, on_start=None, profile=None):
     """
     page = capture(DDG_LITE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
                    port=port, on_start=on_start, profile=profile)
-    hits = parse_ddg(page["text"])[:max_results]
-    if not hits and DDG_BLOCKED.search(page["text"] or ""):
-        # Distinguish "they challenged us" from "their markup changed". Even a real browser gets the
-        # anomaly page under rapid repeat querying, and it is transient — blaming the parser sends
-        # you off debugging code that is fine.
+    html = page["text"] or ""
+    hits = parse_ddg(html)[:max_results]
+    if hits:
+        return hits
+    # Three different empty-handed outcomes, and the caller must be able to tell them apart.
+    if DDG_BLOCKED.search(html):
+        # Even a real browser gets the anomaly page under rapid repeat querying, and it is transient
+        # — blaming the parser sends you off debugging code that is fine.
         raise EngineError("DuckDuckGo served an anti-bot challenge instead of results (usually rate "
                           "limiting from rapid repeat queries) — retry in a minute")
-    return hits
+    if DDG_EMPTY.search(html):
+        return []          # the search RAN and matched nothing. A fact, not a failure.
+    m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+    raise EngineError(
+        f"could not parse DuckDuckGo's response, and it is not their no-results page either — "
+        f"{len(html)} bytes, title {(m.group(1).strip()[:80] if m else 'none')!r}. Their markup has "
+        f"probably changed; parse_ddg() needs updating. The query was NOT answered.")
 
 
 # ── downloads: PDFs and other files behind a bot wall ───────────────────────────────────────────
@@ -585,29 +599,25 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
     return h
 
 
-def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None):
-    """Fetch a file (PDF, zip, image, …) from behind a bot wall and write it to disk.
+def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None,
+             expect_sha256=None, expect_size=None):
+    """Fetch a file (firmware, archive, image, PDF, …) from behind a bot wall and write it to disk.
 
-    Returns {path, bytes, content_type, final_url}. `path` defaults to tmp/ + the url's basename;
-    give one to keep the file somewhere real (`sources/foo.pdf`) instead of scratch.
+    Returns {path, bytes, content_type, final_url, sha256}. `path` defaults to tmp/ + the url's
+    basename; give one to keep the file somewhere real (`sources/fw.bin`) instead of scratch.
 
     `final_url` is the url after redirects. A manifest wants that rather than the url you asked
     for — they differ exactly when a download went somewhere you did not expect.
+
+    expect_sha256 / expect_size: raise if the bytes do not match what a publisher stated. This is
+    the general form of the page-count check on pdf() — the way a silent wrong answer (block page,
+    truncated transfer, wrong artifact) is caught at the moment it arrives rather than later.
     """
     headers = session_headers(url, port=port, on_start=on_start, solve=solve, tries=tries,
                               profile=profile)
     if on_start:
         on_start(f"downloading with the cleared session ({len(headers.get('Cookie',''))} B of cookies)")
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:   # 3 min: documents can be tens of MB
-            data = r.read()
-            ctype = r.headers.get("Content-Type", "")
-            final = r.geturl()
-    except urllib.error.HTTPError as e:
-        raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
-    except (urllib.error.URLError, OSError) as e:
-        raise EngineError(f"download failed: {e}") from e
     if path is None:
         name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
         path = os.path.join(DATA, name)
@@ -616,9 +626,38 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)   # sources/ may not exist yet; a missing dir is not
-    with open(path, "wb") as f:                  # a reason to throw away a download that worked
-        f.write(data)
-    return {"path": path, "bytes": len(data), "content_type": ctype, "final_url": final}
+    digest = hashlib.sha256()                    # a reason to throw away a download that worked
+    total = 0
+    try:
+        # Streamed in 1 MiB chunks, never r.read() into memory: these are firmware images and release
+        # archives, and one 750 MB file read whole is 750 MB of RSS in the calling agent (issue #11).
+        # The timeout is per socket read, not for the whole transfer, so a large file is fine and a
+        # stalled one still fails.
+        with urllib.request.urlopen(req, timeout=180) as r:
+            ctype = r.headers.get("Content-Type", "")
+            final = r.geturl()
+            with open(path, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk); digest.update(chunk); total += len(chunk)
+    except urllib.error.HTTPError as e:
+        raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
+    except (urllib.error.URLError, OSError) as e:
+        raise EngineError(f"download failed: {e}") from e
+    out = {"path": path, "bytes": total, "content_type": ctype, "final_url": final,
+           "sha256": digest.hexdigest()}
+    # Verification against a publisher-stated value, when the caller has one. The file is KEPT on a
+    # mismatch: it is evidence, and deleting the only copy of a wrong answer makes it harder to see
+    # what actually arrived (a login page, a truncated transfer, the wrong artifact).
+    if expect_sha256 and out["sha256"].lower() != expect_sha256.strip().lower():
+        raise EngineError(f"sha256 mismatch for {url}: expected {expect_sha256.strip().lower()}, "
+                          f"got {out['sha256']} ({total} bytes kept at {path})")
+    if expect_size and total != int(expect_size):
+        raise EngineError(f"size mismatch for {url}: expected {expect_size} bytes, got {total} "
+                          f"(kept at {path})")
+    return out
 
 
 def pdf_text(path):
