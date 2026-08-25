@@ -419,7 +419,9 @@ TOOLS = [
              "Evaluate a JavaScript expression in the current page and return its value. The precise "
              "tool: use it to extract one field, fill an input, submit a form, or scroll — instead of "
              "pulling the whole page into context. Example: "
-             "`[...document.querySelectorAll('h2')].map(e=>e.textContent)`."),
+             "`[...document.querySelectorAll('h2')].map(e=>e.textContent)`. Raw evaluation, so "
+             "`document.title` includes the ⟦owner⟧ label this browser puts on shared tabs — use "
+             "`read` or `fetch` if you want the page's own title (#16)."),
          schema={"type": "object", "required": ["expr"], "properties": {
              "expr": {"type": "string", "description": "A JS expression (its value is returned)."}}}),
 
