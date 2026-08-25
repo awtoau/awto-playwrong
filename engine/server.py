@@ -383,6 +383,15 @@ class ND:
         for i, t in enumerate(self.browser.tabs):
             if isinstance(ref, int) and i == ref: return t
             if want and getattr(getattr(t, "target", None), "target_id", None) == want: return t
+        # A KNOWN tag whose target is gone is a stale handle, not a bad reference: the tab was closed
+        # by hand, swept, or crashed. The tag is the agent's stable handle and the tab is the
+        # disposable half, so re-open under the same tag instead of raising. Before this, one closed
+        # tab wedged that agent's every interactive op until it restarted (#13, #14).
+        if isinstance(ref, str) and ref in self.tags:
+            owner = self.owners.pop(self.tags[ref], None)
+            log("tag_stale", tag=ref[:40])
+            del self.tags[ref]
+            return await self._newtab_raw("about:blank", ref, owner)
         raise KeyError(f"no such tab: {ref!r} (tags: {sorted(self.tags)})")
     async def _goto(self, url, tab=None):
         t = await self._tab(tab)
@@ -471,12 +480,9 @@ class ND:
         else:
             await tb.send(cdp.input_.dispatch_key_event(type_="char", text=key))
         return {"ok":1,"key":key}
-    async def _newtab(self, url="about:blank", tag=None, owner=None):
-        """Open a tab and, optionally, TAG it as yours.
-
-        A tag is how one agent keeps its work separate from another's inside a single shared
-        browser: pass it back as `tab` on later ops and they act on your page regardless of what
-        anyone else does to the active tab."""
+    async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
+        """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
+        a re-opened tab straight back to the op that asked for it."""
         await self._ensure()
         t = await self.browser.get(url, new_tab=True)
         self.tab = t
@@ -486,6 +492,16 @@ class ND:
             self.tags[tag] = tid
         if owner:
             self.owners[tid] = owner
+        return t
+
+    async def _newtab(self, url="about:blank", tag=None, owner=None):
+        """Open a tab and, optionally, TAG it as yours.
+
+        A tag is how one agent keeps its work separate from another's inside a single shared
+        browser: pass it back as `tab` on later ops and they act on your page regardless of what
+        anyone else does to the active tab."""
+        t = await self._newtab_raw(url, tag, owner)
+        tid = getattr(getattr(t, "target", None), "target_id", None)
         return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"owner":owner,
                 "target_id":str(tid or "")}
     # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
@@ -509,7 +525,7 @@ class ND:
         """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
         use this to track what they opened and find tabs to close."""
         await self._ensure(); await self._refresh()
-        by_id = {v: k for k, v in self.tags.items()}
+        by_id = {v: k for k, v in self.tags.items() if v}   # skip tombstones: None is not an id
         out=[]
         for i, t in enumerate(self.browser.tabs):
             # url/title come off the TargetInfo, not an evaluate(): it works for BACKGROUND tabs too
@@ -521,6 +537,27 @@ class ND:
                         "active":(t is self.tab),"tag":by_id.get(tid),
                         "owner":self.owners.get(tid),"target_id":str(tid or "")})
         return {"tabs":out,"count":len(out)}
+    def _forget_tags(self, ids):
+        """Tombstone tags whose tab we just closed, and drop those tabs' owners.
+
+        The tag is kept with a None target rather than deleted, because a deleted tag is
+        indistinguishable from one that was never registered — and _tab() has to tell them apart: a
+        known-but-dead tag is re-opened (#14), an unknown one is still a mistake worth raising. The
+        first version of this deleted them, and the regression test caught it immediately: goto on
+        the swept tag failed with `tags: []`.
+
+        Tombstones are capped: a long-lived engine meets a lot of one-shot tags, and there is no
+        reason to remember every agent that ever ran."""
+        ids = {i for i in ids if i}
+        for tag, tid in list(self.tags.items()):
+            if tid in ids:
+                self.tags[tag] = None
+        for tid in ids:
+            self.owners.pop(tid, None)
+        dead = [t for t, v in self.tags.items() if v is None]
+        for tag in dead[:max(0, len(dead) - 128)]:      # dicts keep insertion order: oldest first
+            del self.tags[tag]
+
     async def _await_closed(self, ids):
         """Wait until Chrome has actually destroyed the targets we asked it to close.
 
@@ -569,8 +606,9 @@ class ND:
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
         await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
-        if tag:
-            self.tags.pop(tag, None)
+        # By target id, not just the tag the caller named: closing tab 3 by index also strands
+        # whoever's tag pointed at it, which the tag-only prune missed entirely (#14).
+        self._forget_tags(ids)
         if self.tab not in self.browser.tabs:
             self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":closed,"remaining":len(self.browser.tabs)}
@@ -600,6 +638,7 @@ class ND:
                 await t.close(); n+=1
             except Exception: pass
         await self._await_closed(ids)
+        self._forget_tags(ids)   # else the owners keep handles to tabs this just destroyed (#14)
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
         out={"closed":n,"remaining":len(self.browser.tabs)}
         if skipped:

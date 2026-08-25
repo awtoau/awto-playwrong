@@ -32,6 +32,32 @@ from engine import connect  # noqa: E402
 URLS = ["https://example.com", "https://nowsecure.nl"]
 
 
+def check_stale_tag(port):
+    """An agent's tag must outlive its tab: #14's repro, driven against the engine directly.
+
+    Open a tagged tab, destroy it the way the issue describes (a sweep the agent did not ask for),
+    then use the tag again. It has to work — the tag is the stable handle, the tab is disposable.
+    """
+    fails = []
+    try:
+        connect.call("newtab", port=port, url="about:blank", tag="stale-probe",
+                     owner=f"probe@here:{os.getpid()}")
+        connect.call("closeextra", port=port, force=True)          # takes the tagged tab with it
+        tabs = connect.call("tabs", port=port, method="GET").get("tabs", [])
+        if any(t.get("tag") == "stale-probe" for t in tabs):
+            fails.append("the tagged tab survived the sweep — test setup did not reproduce #14")
+        r = connect.call("goto", port=port, url="https://example.com", tab="stale-probe")
+        if "example.com" not in (r.get("url") or ""):
+            fails.append(f"goto on the stale tag did not land: {r}")
+        print(f"  stale tag: goto after the tab was swept -> {r.get('url','(nothing)')}")
+        connect.call("closetab", port=port, tag="stale-probe")
+    except connect.EngineError as e:
+        fails.append(f"goto on a stale tag still fails: {e}")
+    for f in fails:
+        print(f"  STALE-TAG FAIL: {f}")
+    return fails
+
+
 def check_ownership(port):
     """close_extra must spare a live agent's tab, and still reap one whose owner has exited.
 
@@ -95,7 +121,7 @@ def main():
         lines.append(f"  asked {u:26} -> {got:34} {'OK' if ok else 'WRONG PAGE'}")
     print("\n".join(lines))
 
-    ownership_failures = check_ownership(a.port)
+    ownership_failures = check_ownership(a.port) + check_stale_tag(a.port)
 
     # Every capture opens and closes its own tab, so the engine should be back to just its base tab.
     try:
