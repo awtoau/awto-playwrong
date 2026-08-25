@@ -22,6 +22,8 @@ import urllib.request
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
 PORT = int(os.environ.get("PH_PORT", "8731"))
+# See check_engine_op(): 20s separates "busy" from "broken", it is not a hang budget.
+OP_BUDGET = 20
 
 # nodriver's own runtime deps. Everything else the engine + MCP server touch is stdlib, and nodriver
 # itself is vendored in-tree (vendor/nodriver), so this is the entire dependency surface.
@@ -145,14 +147,109 @@ def check_mcp():
         check("mcp server", "FAIL", str(e).splitlines()[-1], "file is corrupt; re-clone")
 
 
-def check_engine_port():
+def engine_status():
     try:
-        st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=2).read())
+        return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=3).read())
+    except Exception:
+        return None
+
+
+def git(*args):
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", REPO, *args], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def check_engine_code(st):
+    """Is the RUNNING engine the code in this checkout?
+
+    A long-lived engine serves whatever it imported at startup. Nothing used to say so, so a
+    checkout could sit commits ahead of the process on the port while every check reported healthy —
+    the fixes under test simply were not in the running code. This is the check that answers it.
+    """
+    code = (st or {}).get("code") or {}
+    running, head = code.get("sha"), git("rev-parse", "--short", "HEAD")
+    if not running:
+        check("engine code", "WARN", "engine did not report a source version",
+              "restart it: playwrong --stop (the next command relaunches)")
+        return
+    if not head:
+        check("engine code", "PASS", f"running {running} (not a git checkout to compare against)")
+        return
+    if running == head:
+        detail = f"running {running}, matches HEAD"
+        if code.get("dirty"):
+            detail += " — with uncommitted changes at launch"
+        check("engine code", "PASS", detail)
+        return
+    behind = git("rev-list", "--count", f"{running}..{head}")
+    n = f"{behind} commit(s)" if behind else "an unknown number of commits"
+    check("engine code", "WARN", f"running {running}, checkout is at {head} — {n} newer",
+          "playwrong --stop   (the next command relaunches on current code)")
+
+
+def check_engine_op(st):
+    """Drive a real op, not a liveness flag.
+
+    A diagnostic that only asks 'are you alive?' certified a dead engine as healthy for three days
+    (#8), and its successor could still pass while every op failed. So: open a tab, read it, close
+    it — the same path every tool takes.
+    """
+    if not st or not st.get("alive"):
+        check("engine op", "WARN", "browser not up, so no live op was attempted",
+              "any tool call launches it; or: playwrong https://example.com")
+        return
+    # 20s per request. A newtab is ~100ms on an idle engine; ops are serialised on one browser, so
+    # under a running crawl (24 tabs, page loads allowed 90s each) this probe legitimately queues.
+    # Expiry therefore means BUSY, not broken — reported as WARN, because a doctor that cries wolf
+    # during every crawl gets ignored, which fails the same way as one that is optimistic.
+    body = json.dumps({"url": "about:blank", "tag": "doctor-probe"}).encode()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/newtab", data=body,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=OP_BUDGET).read()
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/text",
+                                     data=json.dumps({"tab": "doctor-probe"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        page = json.loads(urllib.request.urlopen(req, timeout=OP_BUDGET).read())
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}/closetab",
+                                     data=json.dumps({"tag": "doctor-probe"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        closed = json.loads(urllib.request.urlopen(req, timeout=OP_BUDGET).read())
+        if page.get("error") or "html" not in page:
+            check("engine op", "FAIL", f"newtab+text did not return a page: {str(page)[:90]}",
+                  "playwrong --stop   (the next command relaunches)")
+        else:
+            check("engine op", "PASS",
+                  f"opened a tab, read {len(page.get('html') or '')} bytes, closed "
+                  f"{closed.get('closed', '?')} — the path every tool uses")
+    except TimeoutError:
+        check("engine op", "WARN", f"engine did not answer within {OP_BUDGET}s — it is busy, not "
+              f"necessarily broken (a crawl holds the browser). Re-run when it is idle.")
+    except Exception as e:
+        check("engine op", "FAIL", f"a real op failed: {repr(e)[:90]}",
+              "playwrong --stop   (the next command relaunches)")
+    finally:
+        try:                      # never leave the probe tab behind, whatever went wrong above
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/closetab",
+                                         data=json.dumps({"tag": "doctor-probe"}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception:
+            pass
+
+
+def check_engine_port():
+    st = engine_status()
+    if st is not None:
         check(f"engine :{PORT}", "PASS",
               f"already running (chrome alive: {st.get('alive')}) — tools will reuse it")
+        check_engine_code(st)
+        check_engine_op(st)
         return
-    except Exception:
-        pass
     s = socket.socket()
     # SO_REUSEADDR because that is what the engine's HTTPServer sets. Without it this probe fails on
     # a port merely sitting in TIME_WAIT after a recent shutdown — reporting "port is taken" and

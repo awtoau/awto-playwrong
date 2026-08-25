@@ -135,6 +135,13 @@ def live_tests(c):
     r = c.call("status")
     say("    status:", text_of(r).replace("\n", " ")[:160])
     ok("status returns JSON", text_of(r).lstrip().startswith("{"))
+    st = json.loads(text_of(r))
+    # The engine stamps the source it is RUNNING. Without it, a long-lived engine serving stale code
+    # is indistinguishable from a current one — which is how a whole afternoon went to testing fixes
+    # that were not in the running process.
+    ok("status reports the code the engine is running",
+       isinstance(st.get("code"), dict) and "sha" in st["code"] and "started" in st["code"],
+       json.dumps(st.get("code")))
 
     say(f"    fetching {TEST_URL} (first call also launches Chrome — this is the slow one)")
     t0 = time.monotonic()

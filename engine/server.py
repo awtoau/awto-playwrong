@@ -77,6 +77,34 @@ def profile_dir():
 PROFILE_DIR = profile_dir()
 
 
+def code_version():
+    """What source this process is RUNNING, stamped once at launch.
+
+    A long-lived engine keeps serving whatever it imported at startup, so a checkout can move
+    commits ahead of the process answering on the port — and nothing said so. That cost an
+    afternoon: every diagnostic reported healthy while the fixes being tested were not in the
+    running code. Returns {sha, dirty, started} — sha is None outside a git checkout (an installed
+    wheel), where `started` is still enough to compare against a file mtime.
+    """
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    sha = dirty = None
+    try:
+        r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            sha = r.stdout.strip()
+            d = subprocess.run(["git", "-C", here, "status", "--porcelain", "--", "."],
+                               capture_output=True, text=True, timeout=5)
+            dirty = bool(d.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"sha": sha, "dirty": dirty, "started": datetime.now(UTC).isoformat(timespec="seconds")}
+
+
+CODE = code_version()
+
+
 def data_dir():
     """Scratch/log directory: the checkout's tmp/ when that is really ours to write to, otherwise an
     XDG cache dir. An INSTALLED package must never write into site-packages — which is exactly what
@@ -959,7 +987,8 @@ class H(BaseHTTPRequestHandler):
             try: p = B.run_timeout(B.probe(), 3.0)
             except Exception: p = None
             self._j({"server":True,"alive":B.ok() if p is None else bool(p),
-                     "launched":B.tab is not None,"chrome_pid":B.chrome_pid()})
+                     "launched":B.tab is not None,"chrome_pid":B.chrome_pid(),
+                     "code":CODE})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")

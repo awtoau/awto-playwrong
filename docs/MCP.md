@@ -50,7 +50,7 @@ Four commands, starting from nothing:
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                  # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, both registries
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (46 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (50 assertions)
 ```
 
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.

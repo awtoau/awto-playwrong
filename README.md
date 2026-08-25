@@ -23,7 +23,7 @@ HTTP fetching could not.
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (46 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (50 assertions)
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose

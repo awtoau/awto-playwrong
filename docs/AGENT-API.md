@@ -21,7 +21,8 @@ any of the three entry points above) starts it; starting it by hand is a fallbac
 ```
 Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
 Check up:  GET  /status              -> {"server": true, "alive": true|false,
-                                        "launched": true|false, "chrome_pid": 1234|null}
+                                        "launched": true|false, "chrome_pid": 1234|null,
+                                        "code": {"sha": "4abc6e6", "dirty": false, "started": "..."}}
 Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
 Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = where you LANDED)
            POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
@@ -121,7 +122,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ## Endpoints (the real contract — nodriver engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag |
+| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live |
 | POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
 | POST | `/goto` | `{url}` | `{title, url, requested}` — navigates (2s settle). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Storing the requested url records a page you may never have got. |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
