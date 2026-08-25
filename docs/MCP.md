@@ -155,7 +155,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
 | `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
 | `read` | Re-read the current page after something changed it. |
-| `js` | Evaluate an expression in the page. The precise tool: pull one field instead of the whole document. Raw, so `document.title` carries the `⟦owner⟧` tab label — `read`/`fetch` strip it (#16). |
+| `js` | Evaluate an expression in the page. The precise tool: pull one field instead of the whole document. |
 | `click` / `key` | Synthetic CDP input at viewport coordinates / a single key. |
 | `solve` | Manual Turnstile clear (`fetch` and `goto` already do it automatically). |
 | `cookies` | The shared browser's cookies, including a cleared `cf_clearance`. |

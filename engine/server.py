@@ -106,6 +106,24 @@ OWNER_L, OWNER_R = "\u27e6", "\u27e7"
 OWNER_TITLE_RE = re.compile(rf"^{OWNER_L}[^{OWNER_R}]*{OWNER_R}\s*")
 
 
+def unlabel(v, owner):
+    """Remove THIS tab's own ⟦owner⟧ label from a value the caller is about to receive.
+
+    Exact rather than pattern-matched: only the one owner string this engine wrote is removed, so a
+    page that uses the bracket pair itself keeps it. Recurses, because a js result is whatever the
+    expression returned — a string, a list of titles, an object with a title field (#16).
+    """
+    if not owner:
+        return v
+    if isinstance(v, str):
+        return v.replace(f"{OWNER_L}{owner}{OWNER_R} ", "")
+    if isinstance(v, list):
+        return [unlabel(x, owner) for x in v]
+    if isinstance(v, dict):
+        return {k: unlabel(x, owner) for k, x in v.items()}
+    return v
+
+
 def strip_owner(title):
     """Titles reported by the API are the page's own. The label is decoration for the human watching
     the window, and must never leak into a capture, a result, or a caller's data."""
@@ -440,8 +458,11 @@ class ND:
         return {"passed":False,"iter":tries}
     async def _text(self, tab=None):
         t = await self._tab(tab)
+        # The html carries the label too, inside <title> — mode="html" handed it straight to the
+        # caller while the `title` field beside it was clean (#16).
         return {"title":strip_owner(await t.evaluate("document.title")),
-                "html":await t.get_content(),"url": await self._href(t)}
+                "html":unlabel(await t.get_content(), self.owner_of(t)),
+                "url": await self._href(t)}
     async def _frame(self, tab=None):
         t = await self._tab(tab)
         # Per-tab filename: two agents screenshotting at once would otherwise overwrite each other's
@@ -660,13 +681,15 @@ class ND:
             # The wrapper always resolves to a string, so anything else means the driver could not
             # evaluate it at all (usually a syntax error in the expression).
             return {"error": f"js could not be evaluated: {str(raw)[:300]}"}
+        owner = self.owner_of(t)
         try:
             val = json.loads(raw)
         except ValueError:
-            return {"result": raw}
+            return {"result": unlabel(raw, owner)}
         if isinstance(val, dict) and "__playwrong_error" in val:
             return {"error": f"js exception: {val['__playwrong_error']}"}
-        return {"result": val}
+        # document.title is the obvious case, but any expression reading a title hits it.
+        return {"result": unlabel(val, owner)}
     # ── prefetch: fire a batch of urls, collect them when they are ready ─────────────────────────
     # A page load is mostly WAITING. Fetching ten urls one at a time serialises ten waits; loading
     # them in N tabs at once overlaps them, and the caller reads results as they land instead of

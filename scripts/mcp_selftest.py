@@ -176,6 +176,17 @@ def live_tests(c):
     r = c.call("js", expr="nope.nope()")
     ok("js exception is reported, not swallowed",
        is_error(r) and "ReferenceError" in text_of(r), text_of(r)[:90])
+    # #16: the engine labels shared tabs "⟦agent@repo:pid⟧ …" in document.title so a human can see
+    # whose page is whose. That decoration is the engine's, not the page's, and must not reach the
+    # caller — it did through js and through mode=html, while the title field beside them was clean.
+    r = c.call("js", expr="document.title")
+    ok("js title has no engine label", "\u27e6" not in text_of(r), text_of(r)[:70])
+    r = c.call("js", expr="[document.title, {t: document.title}]")
+    ok("js strips the label inside nested results", "\u27e6" not in text_of(r), text_of(r)[:70])
+    r = c.call("read", mode="html")
+    ok("html output has no engine label", "\u27e6" not in text_of(r),
+       next((ln for ln in text_of(r).splitlines() if "<title" in ln), "")[:70])
+
     r = c.call("read", mode="text+links")
     ok("read mode=text+links keeps hrefs", "<https://" in text_of(r) or "<http" in text_of(r))
 
