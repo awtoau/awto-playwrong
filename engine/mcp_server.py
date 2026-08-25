@@ -156,17 +156,37 @@ def t_collect(job, wait=0, max_chars=40000):
             + "\n\n———\n\n".join(parts))
 
 
+def _numbered(hits):
+    return "\n".join(f"{i:2}. {h['title']}\n    {h['url']}" for i, h in enumerate(hits, 1))
+
+
 def t_search(query, max_results=10):
     hits = connect.search(query, max_results=max_results)
-    if not hits:
-        # An empty result set is a RESULT. This used to say "no results parsed — DuckDuckGo may have
-        # changed its markup", which reads as "the search did not run" and had agents recording "no
-        # such thing exists" for queries that simply matched nothing (#10, #12). A genuine parse
-        # failure now raises from connect.search() instead, and says what arrived.
-        return (f"No results. The search ran; DuckDuckGo matched nothing for: {query}\n"
-                f"This is an empty result set, not a failure. Narrow quoted phrases and stacked OR "
-                f"clauses often match nothing — try fewer quotes or broader terms.")
-    return "\n".join(f"{i:2}. {h['title']}\n    {h['url']}" for i, h in enumerate(hits, 1))
+    if hits:
+        return _numbered(hits)
+    # An empty result set is a RESULT. This used to say "no results parsed — DuckDuckGo may have
+    # changed its markup", which reads as "the search did not run" and had agents recording "no such
+    # thing exists" for queries that simply matched nothing (#10, #12). A genuine parse failure
+    # raises from connect.search() instead, and says what arrived.
+    head = f"No results. The search ran; DuckDuckGo matched nothing for: {query}"
+    loose = connect.relax(query)
+    if not loose:
+        return (f"{head}\nNothing to relax — no quotes or operators to drop. The terms themselves "
+                f"are what matched nothing; try different or fewer words.")
+    # Run the relaxation here rather than telling the caller to. Zero results is exactly the moment
+    # an agent concludes "this does not exist" and stops, and the retry it should have made is
+    # mechanical. Kept LOUDLY separate: answering a question nobody asked, unlabelled, is the same
+    # silent-wrong-answer failure this project exists to prevent.
+    loose_hits = connect.search(loose, max_results=max_results)
+    if not loose_hits:
+        return (f"{head}\nAlso retried relaxed (quotes and operators dropped): {loose}\n"
+                f"That matched nothing either — the terms are likely not indexed at all, rather "
+                f"than the phrasing being too strict.")
+    return (f"{head}\n\nRetried relaxed (quotes and operators dropped): {loose}\n\n"
+            f"{_numbered(loose_hits)}\n\n"
+            f"⚠ These answer the RELAXED query, NOT yours. Your exact phrase matched nothing — do "
+            f"not record these as exact-phrase hits. Open one with `fetch` to check whether it "
+            f"actually contains what you were looking for.")
 
 
 def t_screenshot(url=None, solve=True):

@@ -235,6 +235,14 @@ def live_tests(c):
     ok("collect returns every prefetched page, duplicates included", len(got) == 3,
        f"{len(got)}/3 in {time.monotonic()-t0:.0f}s")
 
+    # Zero results must read as "ran, matched nothing" — not as a broken parser, which is what sent
+    # two agents to file #10 and #12 against a tool that was working.
+    r = c.call("search", query='"qxjv plinth splunge" OR "zzq wobble frobnicate" hkxq', max_results=3)
+    body = text_of(r)
+    ok("empty result set says the search RAN", "The search ran" in body, body.splitlines()[0][:90])
+    ok("empty result set retries relaxed", "Retried relaxed" in body or "Also retried relaxed" in body,
+       next((ln for ln in body.splitlines() if "elaxed" in ln), "")[:90])
+
     # download: any non-page file, kept on disk, with a checksum of what actually landed.
     want = os.path.join(REPO, "tmp", "selftest-dl", "dummy.bin")
     if os.path.exists(want):

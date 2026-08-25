@@ -50,7 +50,7 @@ Four commands, starting from nothing:
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                  # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, both registries
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (44 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it (46 assertions)
 ```
 
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
@@ -310,6 +310,18 @@ returns results. As of 2026-07-31 DDG answers curl-like clients with **HTTP 202 
 ("Please complete the following challenge… Select all squares containing a duck") on both the `lite`
 and `html` endpoints. It is not an error status, so a script that only checks for HTTP 200 silently
 treats the challenge page as results.
+
+**Zero results is a result, and the tool retries for you.** `search` used to answer an empty result
+set with "no results parsed — DuckDuckGo may have changed its markup". That reads as *the search did
+not run*, and two agents duly reported quoting and `OR` as broken (#10, #12) when their queries had
+simply matched nothing. Now the three empty-handed outcomes are distinct: their anti-bot page raises
+(rate limiting), their no-results page reports that the search **ran** and matched nothing, and an
+unrecognised page raises with the byte count and page title so markup drift reads as markup drift.
+
+On a genuine zero, if the query has quotes or operators to drop, `search` **runs the relaxed query
+itself** and returns those hits under a loud warning that they answer the relaxed query, not yours.
+Zero results is the moment an agent concludes "this does not exist" and stops; the retry it should
+have made is mechanical, so the tool makes it — labelled, never silently substituted.
 
 A real headed Chrome is **not challenged at all** — nothing is solved or bypassed, the browser simply
 looks like a browser. `search` runs the same query through it and unwraps DDG's `/l/?uddg=` redirector

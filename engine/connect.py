@@ -490,6 +490,18 @@ DDG_BLOCKED = re.compile(r"bots use DuckDuckGo too|squares containing|anomaly", 
 DDG_EMPTY = re.compile(r"No results\.|did not match any documents|No results found", re.I)
 
 
+def relax(query):
+    """Drop quotes and boolean operators from a query, or None if that changes nothing.
+
+    The relaxation a human makes by hand after an exact-phrase search misses: `"exact error" OR
+    "other error" foo` -> `exact error other error foo`. Used to answer the zero-result case with
+    something rather than nothing — see t_search() for why the two are kept clearly apart.
+    """
+    out = " ".join(w for w in query.replace('"', " ").replace("'", " ").split()
+                   if w not in ("OR", "AND", "|"))
+    return out if out and out != query.strip() else None
+
+
 def parse_ddg(html):
     """Pull {title, url} out of a DuckDuckGo lite results page, unwrapping the redirector so callers
     get the real destination rather than a duckduckgo.com/l/ link.
