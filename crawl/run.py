@@ -222,8 +222,17 @@ async def _worker(slot, b, queue, cfg, d, stats):
                         pass
                     stats["fail"] += 1
                     print(f"  STALL >{stall_ceiling:.0f}s abandoned {url[:60]}", flush=True)
-            except Exception:
-                pass   # _fetch_one records its own terminal state; never let a crash kill the worker
+            except Exception as e:
+                # _fetch_one records its own terminal state — but only if it RAN. _new_tab() raising
+                # (the browser stopped answering CDP) left the row in 'fetching' forever, and a run
+                # burned its whole frontier that way in 44 minutes while reporting success (#17).
+                # Hand it back as queued so the lease is released immediately rather than waiting to
+                # expire; n_tries is the ceiling that stops this looping.
+                try:
+                    d.scan(url, status="error", note=f"fetch failed: {e!r}"[:180], done=False)
+                except Exception:
+                    pass
+                stats["fail"] += 1
             finally:
                 if blk is not None:
                     try:
@@ -254,9 +263,13 @@ async def crawl(cfg):
     b = None
     try:
         d.init_schema()
-        reclaimed = d.reclaim_stuck()          # recover any rows a previous crashed run left 'fetching'
-        if reclaimed:
-            print(f"reclaimed {reclaimed} stuck 'fetching' rows -> 'queued'", flush=True)
+        # No lease at startup: nothing of OURS can be holding a claim, so every 'fetching' row is
+        # from a run that died. reclaim_stuck() returns counts now, not a bare int.
+        rec = d.reclaim_stuck()
+        if rec["requeued"] or rec["abandoned"]:
+            print(f"reclaimed {rec['requeued']} stuck 'fetching' row(s) -> 'queued'"
+                  + (f", abandoned {rec['abandoned']} past {db.MAX_TRIES} tries"
+                     if rec["abandoned"] else ""), flush=True)
         for s in cfg.seeds:
             d.enqueue(s, 0)
         print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
@@ -269,10 +282,29 @@ async def crawl(cfg):
         # every batch. Without this a broad crawl never stops: one 58-site run stored 800 pages and
         # still had 10,195 urls queued.
         per_host = d.host_counts() if cfg.max_per_host else {}
+        # Lease for a claimed url: 4x the ceiling on a single fetch. A worker holding one longer than
+        # that is not slow, it is gone — the stall guard would have abandoned the page first.
+        lease = (cfg.stall_ceiling if cfg.stall_ceiling else max(45.0, cfg.nav_timeout * 4)) * 4
         while attempted < cfg.max_pages:
+            # Mid-run recovery. reclaim_stuck() used to run only at startup, so a row stranded by a
+            # dead worker stayed stranded for the whole run (#17).
+            rec = d.reclaim_stuck(lease_seconds=lease)
+            if rec["requeued"] or rec["abandoned"]:
+                print(f"  reclaimed {rec['requeued']} stale claim(s), abandoned {rec['abandoned']} "
+                      f"past {db.MAX_TRIES} tries", flush=True)
             batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
                             shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
                             max_per_host=cfg.max_per_host, host_counts=per_host)
+            if not batch:
+                # Empty does not mean finished: it also happens when every remaining row is claimed
+                # but unresolved. Force-expire the leases and look once more before calling it done.
+                rec = d.reclaim_stuck(lease_seconds=0)
+                if rec["requeued"]:
+                    print(f"  work-list looked empty; recovered {rec['requeued']} claimed-but-"
+                          f"unresolved url(s)", flush=True)
+                    batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
+                                    shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
+                                    max_per_host=cfg.max_per_host, host_counts=per_host)
             if not batch:
                 break
             if cfg.max_per_host:
@@ -295,8 +327,23 @@ async def crawl(cfg):
                 print(f"\n{len(at_cap)} host(s) hit --max-per-host={cfg.max_per_host}; their "
                       f"remaining urls are left QUEUED, not discarded: "
                       f"{', '.join(at_cap[:5])}{' …' if len(at_cap) > 5 else ''}", flush=True)
+        resolved = stats["ok"] + stats["fail"]
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
               f"{stats['chars']} text chars\n", flush=True)
+        # A run that claimed far more than it resolved did not finish the work — it drained the
+        # work-list. That used to print exactly like success: "17 ok, 5 fail (39203 attempted)" with
+        # 39,181 rows left in 'fetching' and nothing queued (#17).
+        if resolved < attempted:
+            counts = d.state_counts()
+            print(f"WARNING: {attempted} urls were claimed but only {resolved} produced a result "
+                  f"({attempted - resolved} unaccounted for).", flush=True)
+            print(f"         frontier now: "
+                  f"{', '.join(f'{k}={v}' for k, v in sorted(counts.items()))}", flush=True)
+            if counts.get("fetching"):
+                print(f"         {counts['fetching']} row(s) still claimed — the next run reclaims "
+                      f"them, or: python -m crawl.browser --sweep", flush=True)
+            print("         This run did NOT complete the work-list; treat the numbers above as a "
+                  "partial pass.", flush=True)
         if cfg.rl is not None:
             backed = cfg.rl.snapshot()
             if backed:

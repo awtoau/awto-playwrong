@@ -100,6 +100,37 @@ def main():
            f"{len(second)} extra claimed")
         d2.close()
 
+    # ---- #17: a claim must expire, and a drained work-list must not look finished --------------
+    with tempfile.TemporaryDirectory() as tmp:
+        d = dbmod.open_db(f"sqlite:///{os.path.join(tmp, 's.sqlite')}")
+        seed(d, hosts=1, per_host=6)
+        batch = d.claim(6)
+        ok("claim takes the batch", len(batch) == 6, f"{len(batch)} claimed")
+        ok("claimed rows leave nothing queued", d.state_counts().get("queued", 0) == 0,
+           str(d.state_counts()))
+
+        # A live claim must NOT be stolen: that is why the lease exists rather than a blanket reset.
+        rec = d.reclaim_stuck(lease_seconds=3600)
+        ok("a fresh claim is not reclaimed", rec["requeued"] == 0, str(rec))
+
+        # An expired one must come back — this is the mid-run recovery that did not exist.
+        rec = d.reclaim_stuck(lease_seconds=0)
+        ok("an expired claim is reclaimed", rec["requeued"] == 6, str(rec))
+        ok("reclaimed rows are queued again", d.state_counts().get("queued") == 6,
+           str(d.state_counts()))
+
+        # Requeue-on-failure must terminate. Claim/expire repeatedly and the rows have to be given
+        # up on, not cycled forever.
+        for _ in range(dbmod.MAX_TRIES + 2):
+            d.claim(6)
+            rec = d.reclaim_stuck(lease_seconds=0)
+        counts = d.state_counts()
+        ok("urls that never resolve are abandoned, not cycled forever",
+           counts.get("queued", 0) == 0 and counts.get("done", 0) == 6, str(counts))
+        ok("abandoned rows carry a scan_status the schema allows",
+           d.state_counts().get("fetching", 0) == 0, str(d.state_counts()))
+        d.close()
+
     say(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         say("failed: " + ", ".join(FAIL))

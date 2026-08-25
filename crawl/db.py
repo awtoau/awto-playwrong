@@ -28,11 +28,13 @@ munging, enum-drops-on-sqlite). Drivers are all pure-Python (no-GIL safe): stdli
 SQLAlchemy must be the pure-Python build on no-GIL (its cyextension re-enables the GIL) — see the
 Databases note in python-coding-style.md. This module doesn't enforce that; the venv is set up for it.
 """
+import datetime
 import json
 
 from sqlalchemy import (
     Boolean,
     Column,
+    DateTime,
     Engine,
     Integer,
     MetaData,
@@ -45,6 +47,7 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy import or_ as _sa_or
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -61,6 +64,11 @@ _META = MetaData()
 # ref-free); it just carries it through frontier -> page -> page_asset. Set it via enqueue(link_code=…).
 
 # ── the standard model (one definition, correct DDL on every backend) ───────────────────────────
+# How many times a url may be claimed without producing a terminal state before it is abandoned.
+# 5 leaves room for transient failures (a wedged browser recovers, a site rate-limits) while still
+# terminating: past this the url is the problem, not the weather.
+MAX_TRIES = 5
+
 frontier = Table(
     "frontier", _META,
     Column("url", Text, primary_key=True),
@@ -72,6 +80,11 @@ frontier = Table(
     Column("scan_http_status", Integer),
     Column("scan_note", Text),
     Column("n_tries", Integer, nullable=False, server_default="0"),
+    # When this row was claimed into 'fetching'. Without it a claim has no expiry, so a worker that
+    # dies before recording a terminal state parks the url forever and the work-list silently drains
+    # (issue #17). _ensure_columns() adds it to existing databases; NULL means "claimed by an older
+    # build", which reclaim treats as expired.
+    Column("claimed_at", DateTime),
     Column("sha256", String(64)),
 )
 page = Table(
@@ -345,16 +358,42 @@ class CrawlDB:
             if rows:
                 urls = [r[0] for r in rows]
                 c.execute(update(frontier).where(frontier.c.url.in_(urls))
-                          .values(state="fetching", n_tries=frontier.c.n_tries + 1))
+                          .values(state="fetching", n_tries=frontier.c.n_tries + 1,
+                                  claimed_at=datetime.datetime.now(datetime.UTC)))
             return [(r[0], r[1], r[2]) for r in rows]
 
-    def reclaim_stuck(self):
-        """Return rows stuck in 'fetching' (from a crashed run) back to 'queued'. Call at startup —
-        there's no wall-clock lease, so this is the recovery path for the H3 stuck-frontier hazard."""
+    def reclaim_stuck(self, lease_seconds=None, max_tries=MAX_TRIES):
+        """Return rows stranded in 'fetching' to 'queued'. Returns {requeued, abandoned}.
+
+        lease_seconds=None reclaims EVERY fetching row — the startup case, where no worker of ours
+        can hold one. With a lease it only takes rows claimed longer ago than that, which is what
+        makes it safe to call mid-run, while other workers legitimately hold their claims.
+
+        A row that has burned max_tries claims is marked done/'abandoned' instead of requeued.
+        Without that ceiling, requeueing a url that fails every time is an infinite loop: this is the
+        recovery path for a browser that has stopped answering, and that url will fail again.
+        """
+        now = datetime.datetime.now(datetime.UTC)
+        where = [frontier.c.state == "fetching"]
+        if lease_seconds is not None:
+            cutoff = now - datetime.timedelta(seconds=lease_seconds)
+            # NULL claimed_at = claimed by a build without the lease column; treat as expired.
+            where.append(_sa_or(frontier.c.claimed_at.is_(None), frontier.c.claimed_at < cutoff))
         with self.engine.begin() as c:
-            r = c.execute(update(frontier).where(frontier.c.state == "fetching")
-                          .values(state="queued"))
-            return r.rowcount
+            # 'error', not a new status word: SCAN_STATUSES is enforced by a CHECK constraint, and
+            # a constraint cannot be altered portably on databases that already exist. The note
+            # carries the detail instead.
+            dead = c.execute(update(frontier).where(*where, frontier.c.n_tries >= max_tries)
+                             .values(state="done", scan_status="error",
+                                     scan_note=f"abandoned: {max_tries} claims, no result"))
+            back = c.execute(update(frontier).where(*where).values(state="queued", claimed_at=None))
+            return {"requeued": back.rowcount, "abandoned": dead.rowcount}
+
+    def state_counts(self):
+        """{state: count} over the frontier — what a run needs to say whether it finished or drained."""
+        with self.engine.begin() as c:
+            rows = c.execute(select(frontier.c.state, func.count()).group_by(frontier.c.state)).all()
+        return {s: n for s, n in rows}
 
     def scan(self, url, status, http_status=None, note=None, sha256=None, done=True):
         with self.engine.begin() as c:
