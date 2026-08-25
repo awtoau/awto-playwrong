@@ -76,7 +76,9 @@ def my_tab():
     """The tag of this agent's tab, opened on first use."""
     global _have_tab
     if not _have_tab:
-        op("newtab", url="about:blank", tag=_MY_TAB)
+        # owner=, so `playwrong --tabs` can answer "who opened that one?" for MCP callers too — it
+        # showed "-" for every agent tab before — and so close_extra can tell whose tab is whose.
+        op("newtab", url="about:blank", tag=_MY_TAB, owner=connect.OWNER)
         _have_tab = True
     return _MY_TAB
 
@@ -242,11 +244,11 @@ def t_tabs():
     return json.dumps(op("tabs", method="GET"), indent=2)
 
 
-def t_close_tab(index=None, url=None, close_extra=False):
+def t_close_tab(index=None, url=None, close_extra=False, force=False):
     global _have_tab
     if close_extra:
         _have_tab = False
-        return json.dumps(op("closeextra"))
+        return json.dumps(op("closeextra", owner=connect.OWNER, force=force))
     if index is None and url is None:
         # No target given: close YOUR OWN tab. That is the common case for an agent finishing up,
         # and it can never take out another agent's page by accident.
@@ -450,13 +452,17 @@ TOOLS = [
          schema={"type": "object", "properties": {}}),
 
     dict(name="close_tab", fn=t_close_tab,
-         description=("Close a tab by index or url-substring, or set close_extra to close every tab "
-                      "except the base one (the cleanup button after an aborted run). `fetch` and "
-                      "`screenshot` close their own tabs, so this is only for tabs `goto` opened or "
-                      "tabs another agent leaked. Tab 0 is protected."),
+         description=("Close a tab by index or url-substring, or set close_extra to clean up. "
+                      "`fetch`, `pdf` and `screenshot` close their own tabs, so this is only for "
+                      "tabs `goto` opened. Tab 0 is protected. close_extra closes YOUR tabs plus "
+                      "any left by an agent whose process has exited — other agents' live tabs are "
+                      "left alone and reported back, because this browser is shared and their page "
+                      "is mid-use. Set force only when you mean to close other agents' pages too."),
          schema={"type": "object", "properties": {
              "index": {"type": "integer"}, "url": {"type": "string"},
-             "close_extra": {"type": "boolean", "default": False}}}),
+             "close_extra": {"type": "boolean", "default": False},
+             "force": {"type": "boolean", "default": False,
+                       "description": "With close_extra: also close other agents' live tabs."}}}),
 
     dict(name="status", fn=t_status,
          description=("Is the engine up, is Chrome launched, how many tabs, which port. Diagnostic "

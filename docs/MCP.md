@@ -159,7 +159,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 | `click` / `key` | Synthetic CDP input at viewport coordinates / a single key. |
 | `solve` | Manual Turnstile clear (`fetch` and `goto` already do it automatically). |
 | `cookies` | The shared browser's cookies, including a cleared `cf_clearance`. |
-| `tabs` / `close_tab` | Enumerate tabs; close one, or `close_extra` to clean up after an aborted run. |
+| `tabs` / `close_tab` | Enumerate tabs; close one, or `close_extra` to clean up **your** tabs (and any left by an exited agent). Other agents' live tabs are spared and reported. |
 | `status` | Engine up? Chrome up? How many tabs? Diagnostic only — nothing needs it first. |
 
 `mode` on the text-returning tools: `text` (default), `text+links` (keeps hrefs as `anchor <url>` so
@@ -421,6 +421,27 @@ browser state:
 - **true parallel throughput** beyond what one browser can serialise → several engines, or attach
   your own nodriver via the engine's `/cdp` endpoint and drive many tabs yourself
 
+### Your tabs are yours
+
+The browser is shared, so tab cleanup is scoped by **owner** rather than by "everything that isn't
+tab 0". Every tab carries the `agent@repo:pid` that opened it (visible in `tabs` and `playwrong
+--tabs`), and `close_extra` uses it:
+
+| Tab | `close_extra` |
+|---|---|
+| Yours | closed |
+| Opened by an agent whose **process has exited** | closed — these are the orphans the button exists for |
+| Opened by another agent that is **still running** | **spared**, and reported back in `skipped` |
+| Tab 0, the base tab | never closed |
+
+`force: true` restores the old close-everything behaviour, for a human who genuinely means "clear
+this browser".
+
+This matters more than it sounds: `close_extra` was the documented recovery for a wedged interactive
+session, so an agent following the docs destroyed every other agent's page mid-navigation — the fix
+*was* the collateral damage (#15). Protection is advisory, not enforced: any caller can pass `force`.
+That is the right level, because the failure being prevented is an accident, not an attack.
+
 ### Rules to give an agent
 
 1. **Every url comes through here** — no curl, wget, urllib or built-in web-fetch, not even for a url
@@ -432,10 +453,12 @@ browser state:
 5. Call `close_tab` when finished with an interactive session.
 6. Page needs an account? `goto` it, ask the **user** to sign in to that tab, end your turn, `read`
    when they confirm. Never take their credentials, never poll while you wait.
-7. **Never** `shutdown` the engine, `pkill` Chrome, or launch your own browser. It is shared.
-8. If you need different cookies or logins from another agent, ask for a `--profile`, not a fight
+7. `close_extra` cleans up **your** tabs, not everyone's. If it reports `skipped`, those belong to
+   other agents that are still running — leave them; `force` is for a human clearing the browser.
+8. **Never** `shutdown` the engine, `pkill` Chrome, or launch your own browser. It is shared.
+9. If you need different cookies or logins from another agent, ask for a `--profile`, not a fight
    over the same one.
-9. A tool here misbehaving is a bug to report against `awtoau/awto-playwrong`, not a reason to work
+10. A tool here misbehaving is a bug to report against `awtoau/awto-playwrong`, not a reason to work
    around it — a workaround just leaves the next agent to rediscover it.
 
 ## Design notes

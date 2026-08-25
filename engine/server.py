@@ -240,6 +240,28 @@ class ND:
         except Exception as e:
             log("probe_failed", e=repr(e)[:100])
             return False
+    def owner_of(self, t):
+        """The `agent@repo:pid` that opened this tab, or None if it was opened without a label."""
+        return self.owners.get(getattr(getattr(t, "target", None), "target_id", None))
+    def owner_alive(self, owner):
+        """Is the process behind an owner label still running?
+
+        A dead owner's tabs are the orphans close_extra was written to sweep — the one case where
+        closing somebody else's tab harms nobody. Labels are `agent@repo:pid`; anything that does
+        not end in a pid is treated as alive, because guessing wrong closes a live agent's page."""
+        if not owner or ":" not in owner:
+            return True
+        try:
+            pid = int(owner.rsplit(":", 1)[1])
+        except ValueError:
+            return True
+        try:
+            os.kill(pid, 0)          # signal 0: existence check, sends nothing
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True              # exists, owned by another user
+        return True
     def chrome_pid(self):
         """PID of the Chrome we launched, or None. Diagnostic — and what lets a test kill exactly
         this browser instead of pgrep-ing for one and hitting somebody's shared session."""
@@ -552,19 +574,39 @@ class ND:
         if self.tab not in self.browser.tabs:
             self.tab=self.browser.tabs[0] if self.browser.tabs else None
         return {"closed":closed,"remaining":len(self.browser.tabs)}
-    async def _closeextra(self):
-        """Close ALL tabs except the base tab (index 0) — the panic 'clean up leaked tabs' button. Use
-        after a crashed/aborted crawl left orphan tabs. Never touches the server process."""
+    async def _closeextra(self, owner=None, force=False):
+        """Clean up leaked tabs — YOURS, and those of agents that are gone. Base tab (0) is untouched.
+
+        This used to close every tab except the base one, whoever opened it, which made one agent's
+        tidy-up everyone else's lost page mid-navigation. Worse, it was the documented recovery for a
+        wedged session (#13), so an agent following the docs took out every other agent on the shared
+        browser. Ownership is advisory — force=True still sweeps everything, for the human who
+        genuinely means "clear this browser" — but the default no longer damages bystanders.
+
+        Closed: tabs owned by `owner`, tabs whose owning process has exited, and unlabelled tabs when
+        the caller gives no owner. Skipped tabs are REPORTED with their owner, so a caller seeing a
+        smaller count than it expected learns why instead of guessing."""
         await self._ensure(); await self._refresh()
-        n=0; ids=set()
+        n=0; ids=set(); skipped=[]
         for t in list(self.browser.tabs)[1:]:
+            own = self.owner_of(t)
+            mine = (own == owner) if owner else (own is None)
+            if not (force or mine or not self.owner_alive(own)):
+                skipped.append({"owner": own,
+                                "url": (getattr(getattr(t,"target",None),"url","") or "")[:120]})
+                continue
             try:
                 ids.add(getattr(getattr(t,"target",None),"target_id",None))
                 await t.close(); n+=1
             except Exception: pass
         await self._await_closed(ids)
         self.tab=self.browser.tabs[0] if self.browser.tabs else None
-        return {"closed":n,"remaining":len(self.browser.tabs)}
+        out={"closed":n,"remaining":len(self.browser.tabs)}
+        if skipped:
+            out["skipped"]=skipped
+            out["note"]=(f"{len(skipped)} tab(s) left alone: they belong to other agents that are "
+                         f"still running. Pass force=true only if you mean to close their pages.")
+        return out
     async def _js(self, expr, tab=None):
         """Evaluate in the page, RESOLVING promises.
 
@@ -756,7 +798,7 @@ class ND:
            "tabs":lambda:self._tabs(),
            "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True),
                                             a.get("tag")),
-           "closeextra":lambda:self._closeextra(),
+           "closeextra":lambda:self._closeextra(a.get("owner"), a.get("force", False)),
            "cdp":lambda:self._cdp_info(),
            "prefetch":lambda:self._prefetch(a.get("urls"),a.get("concurrency",8),
                                             a.get("solve",True),a.get("tries",20),

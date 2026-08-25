@@ -160,6 +160,11 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   typed via `/js`, not read from a file. 2FA, SSO and a CAPTCHA on the login form are theirs too, and
   they work precisely because the browser is real. Pair with `PH_PROFILE` below so it survives a
   restart.
+- **Tab cleanup is owner-scoped.** `closeextra {owner, force}` closes the caller's own tabs plus any
+  whose owning process has exited, spares other agents' live tabs and returns them in `skipped`.
+  Pass the `owner` you opened tabs with (`newtab {owner}`) or your tabs look like someone else's;
+  `force: true` closes everything but tab 0, as it always did. Advisory, not enforced — the failure
+  it prevents is an accident (#15).
 - **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
   Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
   (causes orphan-window conflicts).
