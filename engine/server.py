@@ -94,7 +94,12 @@ def code_version():
                            capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
             sha = r.stdout.strip()
-            d = subprocess.run(["git", "-C", here, "status", "--porcelain", "--", "."],
+            # Repo root, not `here`: scoped to engine/ this reported a clean tree while vendor/,
+            # crawl/ and pyproject.toml were all modified — "dirty" has to mean "the checkout differs
+            # from that sha", or it answers a question nobody asked.
+            root = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip() or here
+            d = subprocess.run(["git", "-C", root, "status", "--porcelain"],
                                capture_output=True, text=True, timeout=5)
             dirty = bool(d.stdout.strip())
     except (OSError, subprocess.SubprocessError):

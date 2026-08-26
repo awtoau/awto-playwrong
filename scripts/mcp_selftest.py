@@ -135,13 +135,6 @@ def live_tests(c):
     r = c.call("status")
     say("    status:", text_of(r).replace("\n", " ")[:160])
     ok("status returns JSON", text_of(r).lstrip().startswith("{"))
-    st = json.loads(text_of(r))
-    # The engine stamps the source it is RUNNING. Without it, a long-lived engine serving stale code
-    # is indistinguishable from a current one — which is how a whole afternoon went to testing fixes
-    # that were not in the running process.
-    ok("status reports the code the engine is running",
-       isinstance(st.get("code"), dict) and "sha" in st["code"] and "started" in st["code"],
-       json.dumps(st.get("code")))
 
     say(f"    fetching {TEST_URL} (first call also launches Chrome — this is the slow one)")
     t0 = time.monotonic()
@@ -155,6 +148,15 @@ def live_tests(c):
     r = c.call("tabs")
     tabs = json.loads(text_of(r))
     ok("fetch left no leaked tab", tabs.get("count") == 1, f"{tabs.get('count')} tab(s) open")
+
+    # The engine stamps the source it is RUNNING: a long-lived engine serving stale code is otherwise
+    # indistinguishable from a current one. Checked AFTER the first fetch, because `status` refuses to
+    # auto-start anything — on a cold engine it answers "not running", with no code to report, and
+    # asserting here before the fetch made this pass or fail on whether a previous run left 8739 up.
+    st = json.loads(text_of(c.call("status")))
+    ok("status reports the code the engine is running",
+       isinstance(st.get("code"), dict) and "sha" in st["code"] and "started" in st["code"],
+       json.dumps(st.get("code")))
 
     r = c.call("fetch", url=TEST_URL, mode="html")
     ok("mode=html returns markup", "<html" in text_of(r).lower())

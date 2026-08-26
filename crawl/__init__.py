@@ -28,7 +28,8 @@ def _use_vendored_nodriver():
     """Ensure the PATCHED nodriver wins over any broken copy on the path.
 
     Upstream nodriver 0.50.x has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on import
-    under CPython 3.14t (free-threaded). When this package is installed (wheel/tool), the fixed copy
+    under CPython 3.14+ — every build, not just free-threaded (measured on stable GIL 3.14.7); a
+    comment's bad byte stopped being tolerated in 3.14. When this package is installed, the fixed copy
     ships at crawl/_vendor/nodriver; prepend it to sys.path so `import nodriver` picks it up. In a
     source checkout the sibling `vendor/nodriver` is used instead. No-op if neither exists (a working
     system nodriver is then used as-is)."""

@@ -300,8 +300,9 @@ For development, an editable install in a free-threaded venv works too:
 - **Torn-frame guard** for image/cam grabs (validate JPEG ends FFD9 / PNG ends IEND; retry on
   mid-write).
 - **Clean shutdown over the command port** — never pkill the browser.
-- **Python 3.14t free-threaded** — sync Playwright segfaults; use async / nodriver. Vendored nodriver
-  is patched for it.
+- **Python 3.14t free-threaded** — sync Playwright segfaults; use async / nodriver.
+- **Python 3.14+, any build** — released nodriver won't import (a bare `\xb1` in a comment, which
+  3.14 stopped tolerating). The vendored copy is patched; nothing to install.
 
 ## Licence
 MIT — see [LICENSE](LICENSE).

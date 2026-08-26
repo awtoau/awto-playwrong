@@ -43,10 +43,24 @@ crawl-report = "crawl.report:main"
 Homepage = "https://github.com/awtoau/awto-playwrong"
 
 # ── build: ship crawl/ + assets/ + the PATCHED vendored nodriver ────────────────────────────────
-# Upstream nodriver 0.50.3 has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on import
-# under CPython 3.14t. vendor/nodriver is that release with the one byte fixed. We ship it INSIDE the
-# package (crawl/_vendor/nodriver) and prepend it to sys.path at import time (see crawl/__init__.py),
-# so a tool install carries the fix and no consumer PYTHONPATH juggling is needed.
+# Upstream nodriver 0.50.3 has a non-UTF-8 byte in cdp/network.py: a bare \xb1 (Latin-1 ±) in a
+# comment, which CPython 3.14+ rejects while decoding the file. Through 3.13 an undeclared non-UTF-8
+# byte inside a COMMENT was tolerated; 3.14 rejects it anywhere. Not free-threading-specific —
+# measured failing on stable, GIL-enabled 3.14.7.
+#
+# PROVENANCE: vendor/nodriver is a snapshot of
+#     https://github.com/awto-au/nodriver @ fef9a18f   (fork of ultrafunkamsterdam/nodriver)
+# which is 0.50.3 plus that character re-encoded AND generate_cdp.py given an explicit
+# encoding="utf-8" — the generator is the root cause: it writes with the platform default, so a
+# Windows/cp1252 box re-emits the bad byte on the next regeneration.
+#
+# Re-vendor with: git clone --depth 1 https://github.com/awto-au/nodriver && cp -r nodriver/. vendor/nodriver/
+# Do NOT hand-edit vendor/ — that is how it came to differ from the fork (issue #18).
+#
+# We ship it INSIDE the package (crawl/_vendor/nodriver) and prepend it to sys.path at import time
+# (see crawl/__init__.py), so a tool install carries the fix and no consumer PYTHONPATH juggling is
+# needed. It is prepended, so it also wins over a broken nodriver already installed on the machine.
+# Delete all of this when a fixed nodriver RELEASE ships — see issue #1.
 [tool.hatch.build.targets.wheel]
 packages = ["crawl", "assets", "engine"]   # engine ships too: it provides the `playwrong` command
 
