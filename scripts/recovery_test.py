@@ -12,8 +12,9 @@ ALWAYS runs against an isolated port, never the shared engine on 8731 — the te
 browser, and the shared one carries everyone's cleared Turnstile session. The pid it kills comes from
 that engine's own /status, so it cannot pick the wrong Chrome.
 
-Two of the three states are covered here: a closed window (Chrome exits with its last tab) and a
-crash (SIGKILL). NOT covered: the process alive with its websockets dead, reported in issue #6.
+Three states are covered: a closed window (Chrome exits with its last tab), a browser crash
+(SIGKILL), and the ENGINE process itself being killed — #19, where every later call reported
+"engine op 'newtab' failed: timed out" instead of saying the engine was gone. NOT covered: the process alive with its websockets dead, reported in issue #6.
 Closing targets from outside cannot produce it — Chrome exits with the last one — and nothing else
 reachable from a test kills a socket while sparing the process. That path (`_reattach`, taken when
 `gone()` is false) is exercised in production and not here; treat it as untested code.
@@ -24,6 +25,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -92,11 +94,23 @@ def kill_targets(port, cdp):
 
 
 def wait_dead(pid):
-    """Block until the pid is gone, or DEATH_BUDGET passes. Returns how long it took."""
+    """Block until the pid is gone, or DEATH_BUDGET passes. Returns how long it took.
+
+    A ZOMBIE counts as dead. os.kill(pid, 0) succeeds against one — the process is finished but its
+    exit status has not been collected — so waiting on that alone reported a killed engine as still
+    running for the full budget. What the caller means by "dead" is "not serving", and a zombie is
+    not serving.
+    """
     t0 = time.monotonic()
     while time.monotonic() - t0 < DEATH_BUDGET:
         try:
             os.kill(pid, 0)
+        except OSError:
+            return time.monotonic() - t0
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return time.monotonic() - t0
         except OSError:
             return time.monotonic() - t0
         time.sleep(0.05)      # a local process death, polled ~20x/s
@@ -174,6 +188,37 @@ def main():
         ok("status reports live again", st.get("alive") is True, json.dumps(st))
         ok("it is a different browser process", st.get("chrome_pid") not in (None, pid),
            f"was {pid}, now {st.get('chrome_pid')}")
+        # 7. The ENGINE process itself dies (#19), not just its browser. Every op used to fail
+        #    "engine op 'newtab' failed: timed out" for the rest of the session — an engine-level
+        #    fault reported as a tab-level one, which read as permanent and sent a session off to
+        #    work around the tool.
+        st = status(a.port)
+        epid = None
+        for line in subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                                   text=True).stdout.splitlines():
+            # The port is in the process ENV, not its argv, so the environ check below is what
+            # actually identifies it — this only narrows the candidates.
+            if "engine/server.py" in line and "mcp_server" not in line:
+                cand = int(line.split()[0])
+                try:
+                    env = open(f"/proc/{cand}/environ", "rb").read().decode(errors="replace")
+                except OSError:
+                    continue
+                if f"PH_PORT={a.port}" in env:
+                    epid = cand
+        if epid:
+            os.kill(epid, signal.SIGKILL)
+            ok("engine process killed", wait_dead(epid) is not None, f"pid {epid}")
+            t0 = time.monotonic()
+            try:
+                r = connect.capture(URL, port=a.port, max_chars=200)
+                ok("an op after the engine died restarts it and succeeds",
+                   "Example Domain" in r["text"], f"{time.monotonic()-t0:.1f}s")
+            except connect.EngineError as e:
+                ok("an op after the engine died restarts it and succeeds", False, repr(e)[:140])
+        else:
+            ok("engine process found for the kill test", False, "no engine pid for this port")
+
     finally:
         try:
             connect.call("shutdown", port=a.port, timeout=15.0)

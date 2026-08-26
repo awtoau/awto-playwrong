@@ -465,9 +465,11 @@ TOOLS = [
                        "description": "With close_extra: also close other agents' live tabs."}}}),
 
     dict(name="status", fn=t_status,
-         description=("Is the engine up, is Chrome launched, how many tabs, which port. Diagnostic "
-                      "only — you never need to call this first, every other tool auto-starts the "
-                      "engine."),
+         description=("Is the engine up, is Chrome launched, how many tabs, which port, and which "
+                      "commit of the code the engine is running. You never need it before a normal "
+                      "call — every other tool auto-starts the engine — but it is how you tell a "
+                      "dead or wedged engine from a real failure, and how you check whether a "
+                      "long-lived engine is running older code than the checkout."),
          schema={"type": "object", "properties": {}}),
 ]
 BY_NAME = {t["name"]: t for t in TOOLS}

@@ -250,6 +250,24 @@ def _spawn_lock(port):
     return _Lock()
 
 
+def _transport_kind(e, port, timeout):
+    """Classify a failed request: 'gone' (no engine there) or 'slow' (bound, but silent).
+
+    The distinction is the whole point. `engine op 'newtab' failed: timed out` sent a reader to
+    debug tab creation when the engine process had simply exited — and it read as permanent, so a
+    session gave up on the tool and routed around it (#19). A timeout is also what a death mid-op
+    looks like from here, so a timeout is re-checked against reachability before being believed.
+    """
+    inner = getattr(e, "reason", e)
+    if isinstance(inner, ConnectionRefusedError | ConnectionResetError):
+        return "gone"
+    if isinstance(inner, TimeoutError) or "timed out" in str(e).lower():
+        # Slow or dead? Ask. If nothing answers now, the op did not time out — the engine died
+        # under it, and nothing ran, which is what makes retrying safe.
+        return "slow" if reachable(port, timeout=2.0) else "gone"
+    return None
+
+
 def call(op, port=None, method="POST", timeout=60.0, body=None, **kw):
     """One engine op. Raises EngineError on transport failure or an {"error": ...} payload. Does NOT
     auto-start — use ensure() first, or op() which does both.
@@ -267,7 +285,21 @@ def call(op, port=None, method="POST", timeout=60.0, body=None, **kw):
                                          headers={"Content-Type": "application/json"}, method="POST")
             raw = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError) as e:
-        raise EngineError(f"engine op {op!r} failed: {e}") from e
+        kind = _transport_kind(e, port, timeout)
+        if kind == "gone":
+            err = EngineError(
+                f"the playwrong engine on 127.0.0.1:{base_url(port).rsplit(':', 1)[1]} is not "
+                f"running — it exited, or died during this {op!r}. Any op auto-starts it, so a "
+                f"retry normally just works; `playwrong --status` confirms. (underlying: {e})")
+        elif kind == "slow":
+            err = EngineError(
+                f"engine op {op!r} timed out after {timeout:.0f}s. The process is up and accepted "
+                f"the connection but did not answer, so it is wedged rather than absent: "
+                f"`playwrong --stop` clears it and the next call restarts it. Log: {SERVER_LOG}")
+        else:
+            err = EngineError(f"engine op {op!r} failed: {e}")
+        err.kind = kind
+        raise err from e
     try:
         out = json.loads(raw)
     except ValueError as e:
@@ -278,9 +310,23 @@ def call(op, port=None, method="POST", timeout=60.0, body=None, **kw):
 
 
 def op(name, port=None, on_start=None, **kw):
-    """call() with the engine guaranteed up first. This is what callers should use."""
+    """call() with the engine guaranteed up first. This is what callers should use.
+
+    Retries ONCE if the engine turns out to be gone. ensure() cannot rule that out: the engine can
+    exit in the gap between the check and the request, and then every later call failed the same way
+    for the rest of a session (#19). 'gone' means nothing ran, so re-running is safe — a wedged
+    engine ('slow') is NOT retried, because there the op may well have executed.
+    """
     port = ensure(port, on_start=on_start)
-    return call(name, port=port, **kw)
+    try:
+        return call(name, port=port, **kw)
+    except EngineError as e:
+        if getattr(e, "kind", None) != "gone":
+            raise
+        if on_start:
+            on_start("engine had exited — restarting it")
+        ensure(port, on_start=on_start)
+        return call(name, port=port, **kw)
 
 
 # ── html -> readable text ───────────────────────────────────────────────────────────────────────
