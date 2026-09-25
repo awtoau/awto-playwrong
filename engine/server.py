@@ -206,6 +206,11 @@ def proc_status_mb(key):
     except (OSError, ValueError, IndexError):
         return None
 
+# Chrome recycle triggers (#23). 64 tabs is 2x the crawler's own --tabs cap of 32, so a legitimate
+# crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
+CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
+CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
+
 def _memwatch():
     """Every 60s apply the RSS trigger: idle growth has no op to catch it on. 60s: the leak in #23
     ran at ~5 MB/s at worst, 300 MB between samples."""
@@ -315,6 +320,7 @@ class ND:
         self.jobs = {}          # prefetch job id -> {slots, total, delivered}
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
         self.owners = {}        # target_id -> "agent@repo:pid", shown in the tab title and /tabs
+        self.fetches = 0        # tabs opened since this Chrome launched; see _maybe_recycle()
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
@@ -461,6 +467,10 @@ class ND:
         doing what it always did."""
         await self._ensure()
         return {"started": True}
+    def tab_count(self):
+        """Tabs the browser lists, from the cached target list; no CDP round trip."""
+        try: return len(self.browser.tabs) if self.browser is not None else 0
+        except Exception: return 0
     def _publish_cdp(self):
         """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
         same browser (nodriver.start(host,port) connects to an existing browser) and shard by opening
@@ -597,10 +607,33 @@ class ND:
         else:
             await tb.send(cdp.input_.dispatch_key_event(type_="char", text=key))
         return {"ok":1,"key":key}
+    async def _maybe_recycle(self):
+        """Replace Chrome past CHROME_MAX_TABS open tabs or CHROME_MAX_FETCHES tabs opened (#23).
+
+        Checked BEFORE a tab is opened, so the caller's new tab lands in the fresh browser. Every
+        other agent's tab goes with the old one: their tags are tombstoned, not deleted, so their
+        next op re-opens the tab (#14) instead of failing. The cleared Turnstile session and logins
+        go too unless PH_PROFILE is persistent — hence the loud log line, and the high defaults."""
+        if self.browser is None or self.gone():
+            return
+        n = self.tab_count()
+        if n < CHROME_MAX_TABS and self.fetches < CHROME_MAX_FETCHES:
+            return
+        log("chrome_recycle", why="tabs" if n >= CHROME_MAX_TABS else "fetches", tabs=n,
+            fetches=self.fetches, max_tabs=CHROME_MAX_TABS, max_fetches=CHROME_MAX_FETCHES)
+        await self._retire()
+        self.browser = self.tab = None
+        self._dead = False
+        self.fetches = 0
+        for tag in self.tags: self.tags[tag] = None      # tombstones: re-openable, see _tab()
+        self.owners.clear()
+        await self._ensure()
     async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
         """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
         a re-opened tab straight back to the op that asked for it."""
         await self._ensure()
+        await self._maybe_recycle()
+        self.fetches += 1
         t = await self.browser.get(url, new_tab=True)
         self.tab = t
         await self._refresh()          # the cache may not list the tab we just opened yet
@@ -1109,7 +1142,8 @@ if __name__=="__main__":
         print(f"an engine is already serving 127.0.0.1:{PORT} — not starting a second one",
               file=sys.stderr)
         sys.exit(0)
-    log("server_start",port=PORT,rss_limit_mb=RSS_LIMIT >> 20)
+    log("server_start",port=PORT,rss_limit_mb=RSS_LIMIT >> 20,
+        chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()
     SRV = ThreadingHTTPServer(("127.0.0.1",PORT),H)
     SRV.serve_forever()
