@@ -117,6 +117,11 @@ running a *second*, isolated browser.
 
 `scripts/install.py --link` puts `playwrong` on your PATH so you can drop the `./`.
 
+**The engine runs under a hard memory cap.** It re-execs itself into a systemd user scope with
+`MemoryMax=8G`, no swap and `OOMPolicy=kill`, so a leak kills the engine (which restarts on the next
+call) instead of the host — issue #23 was 39.5 GB and a hard reset. `PH_MEMORY_MAX=16G` raises it,
+`PH_MEMORY_MAX=0` disables it; without a systemd user manager it runs uncapped and `/status` says so.
+
 ### Driving a page, not just reading it
 `engine/client.py` has the interactive verbs — `goto`, `click`, `key`, `js`, `shot`, `tabs`,
 `solvecf`. It auto-starts the engine too:
