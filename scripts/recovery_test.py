@@ -202,6 +202,11 @@ def main():
                 cand = int(line.split()[0])
                 try:
                     env = open(f"/proc/{cand}/environ", "rb").read().decode(errors="replace")
+                except PermissionError:
+                    # The engine's python carries cap_net_bind_service, so the process is
+                    # non-dumpable and /proc/<pid>/environ is closed even to its own user (#23).
+                    env = subprocess.run(["sudo", "-n", "cat", f"/proc/{cand}/environ"],
+                                         capture_output=True).stdout.decode(errors="replace")
                 except OSError:
                     continue
                 if f"PH_PORT={a.port}" in env:
