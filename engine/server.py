@@ -303,6 +303,7 @@ def _memwatch():
         time.sleep(60)
         s = mem_snapshot()
         log("mem", **s)
+        B.loop.call_soon_threadsafe(B._reap_jobs)
         check_rss("watchdog")
 
 def check_rss(where):
@@ -497,11 +498,14 @@ class ND:
         the shared browser this way for a while."""
         info = getattr(self, "_cdp", None) or {}
         if not info.get("host"): return False
+        old = self.browser
         try:
             self.browser = await uc.start(host=info["host"], port=info["port"])
             self.tab = await self.browser.get("about:blank")
             self._dead = False
             log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
+            if old is not None:
+                asyncio.ensure_future(self._release_all(old))   # its Tabs are ghosts now (#23)
             return True
         except Exception as e:
             log("reattach_failed", e=repr(e)[:100])
@@ -558,6 +562,38 @@ class ND:
         """Tabs the browser lists, from the cached target list; no CDP round trip."""
         try: return len(self.browser.tabs) if self.browser is not None else 0
         except Exception: return 0
+    async def _release(self, c):
+        """Close a nodriver connection the browser no longer lists — the leak in #23.
+
+        Every Tab has its own websocket and listener task; nodriver's update_targets() drops a gone
+        target from its list without closing either, and the task pins the Tab, the socket and its
+        last 25 CDP results (whole DOM trees from get_content): ~20 MB per closed tab, 277 ghosts
+        for 3 tabs when measured. A close handshake is one local round trip, single-digit ms; 2s is
+        ~200x that, and on expiry the transport is aborted so the socket goes regardless."""
+        try:
+            c._transactions.clear(); c._tx_by_id.clear()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(c.aclose(), 2.0)
+        except Exception as e:
+            log("release_err", e=repr(e)[:80])
+            try: c.socket.transport.abort()
+            except Exception: pass
+    async def _release_all(self, browser):
+        for c in [browser, *list(getattr(browser, "_targets", ()))]:
+            await self._release(c)
+    def _trim(self):
+        """Drop nodriver's per-connection history of the last 25 CDP results after every op. The
+        engine never reads it, and on a tab that has served get_content() it is 25 DOM trees (#23)."""
+        try:
+            for c in [self.browser, *self.browser._targets]:
+                c._transactions.clear(); c._tx_by_id.clear()
+        except Exception:
+            pass
+    async def _guarded(self, coro):
+        try: return await coro
+        finally: self._trim()
     def _publish_cdp(self):
         """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
         same browser (nodriver.start(host,port) connects to an existing browser) and shard by opening
@@ -708,7 +744,9 @@ class ND:
             return
         log("chrome_recycle", why="tabs" if n >= CHROME_MAX_TABS else "fetches", tabs=n,
             fetches=self.fetches, max_tabs=CHROME_MAX_TABS, max_fetches=CHROME_MAX_FETCHES)
+        old = self.browser
         await self._retire()
+        await self._release_all(old)
         self.browser = self.tab = None
         self._dead = False
         self.fetches = 0
@@ -755,9 +793,16 @@ class ND:
         """browser.tabs is a CACHED list (Browser._targets); nothing refreshes it on its own within a
         request. Without this, a closed tab keeps appearing and urls come back blank — which made tab
         hygiene silently unverifiable (closetab said closed:1, remaining:2, and the caller couldn't
-        tell whether cleanup worked). Call before reading, and after closing."""
+        tell whether cleanup worked). Call before reading, and after closing.
+
+        Whatever the refresh drops from the list is released here, see _release() (#23)."""
+        before = list(getattr(self.browser, "_targets", ()))
         try: await self.browser.update_targets()
-        except Exception as e: log("refresh_err", e=str(e)[:60])
+        except Exception as e: log("refresh_err", e=str(e)[:60]); return
+        kept = {id(c) for c in self.browser._targets}
+        for c in before:
+            if id(c) not in kept:
+                await self._release(c)
     async def _tabs(self):
         """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
         use this to track what they opened and find tabs to close."""
@@ -839,6 +884,7 @@ class ND:
             try:
                 tid = getattr(getattr(t,"target",None),"target_id",None)
                 await t.close()
+                await self._release(t)
                 closed+=1; ids.add(tid)
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
@@ -873,6 +919,7 @@ class ND:
             try:
                 ids.add(getattr(getattr(t,"target",None),"target_id",None))
                 await t.close(); n+=1
+                await self._release(t)
             except Exception: pass
         await self._await_closed(ids)
         self._forget_tags(ids)   # else the owners keep handles to tabs this just destroyed (#14)
@@ -920,7 +967,7 @@ class ND:
         # Slots are keyed by INDEX, not url. Keying by url silently collapsed a batch that contained
         # the same url twice — "asked 3, got 2" — and any caller waiting for all of them then waited
         # forever. Duplicates in a url list are completely ordinary.
-        self.jobs[job] = {"slots": {}, "total": len(urls), "delivered": 0}
+        self.jobs[job] = {"slots": {}, "total": len(urls), "delivered": 0, "t": time.monotonic()}
         self._reap_jobs()
         asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout, owner))
         return {"job": job, "count": len(urls), "concurrency": concurrency, "timeout": timeout}
@@ -935,6 +982,12 @@ class ND:
         done = [j for j, d in self.jobs.items() if d.get("total", 0) <= d.get("delivered", 0)
                 and not d.get("slots")]
         for j in done[:-20]:
+            self.jobs.pop(j, None)
+        # A client that died mid-batch never collects, so its bodies would sit here forever (#23).
+        # 10 min is 20x the default 30s per-url timeout: no live caller waits that long to collect.
+        now = time.monotonic()
+        for j in [j for j, d in self.jobs.items() if now - d.get("t", now) > 600]:
+            log("job_reaped", job=j, slots=len(self.jobs[j].get("slots", {})))
             self.jobs.pop(j, None)
 
     async def _batch(self, job, urls, concurrency, solve, tries, timeout=30, owner=None):
@@ -1004,6 +1057,7 @@ class ND:
                     if t is not None:
                         try: await t.close()
                         except Exception: pass
+                        await self._release(t)
 
         await asyncio.gather(*(one(i, u) for i, u in enumerate(urls)), return_exceptions=True)
         await self._refresh()
@@ -1035,6 +1089,7 @@ class ND:
                     "done": d.get("delivered", 0) >= d["total"]}
         if job:
             d = self.jobs.get(job)
+            if d: d["t"] = time.monotonic()      # polled = someone still wants it
             return summarise(job, d) if d else {"error": f"no such job {job!r}"}
         return {"jobs": [summarise(j, d) for j, d in self.jobs.items()]}
 
@@ -1047,6 +1102,7 @@ class ND:
         d = self.jobs.get(job)
         if not d:
             return {"error": f"no such job {job!r}"}
+        d["t"] = time.monotonic()
         done = {i: v for i, v in d["slots"].items() if v.get("status") in ("ready", "error")}
         if drain:
             for i in done:
@@ -1089,7 +1145,7 @@ class ND:
         # nothing, so re-running it is safe. Dropping the dead handles first makes attempt 2 relaunch
         # via _ensure(). Any other error is returned on the first attempt, unretried.
         for attempt in (1, 2):
-            try: return self.run(m[op]())
+            try: return self.run(self._guarded(m[op]()))
             except Exception as e:
                 dead = _dead_conn(e)
                 # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or
