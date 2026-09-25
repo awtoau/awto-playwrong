@@ -22,7 +22,10 @@ any of the three entry points above) starts it; starting it by hand is a fallbac
 Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
 Check up:  GET  /status              -> {"server": true, "alive": true|false,
                                         "launched": true|false, "chrome_pid": 1234|null,
-                                        "code": {"sha": "4abc6e6", "dirty": false, "started": "..."}}
+                                        "code": {"sha": "4abc6e6", "dirty": false, "started": "..."},
+                                        "pid": 82682, "rss_mb": 310, "swap_mb": 0, "fds": 31,
+                                        "cdp_sockets": 4, "tabs": 3, "threads": 5, "uptime_s": 120,
+                                        "memory_cap": "8192M", "rss_limit_mb": 6144}
 Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
 Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = where you LANDED)
            POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
@@ -122,7 +125,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ## Endpoints (the real contract — nodriver engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live |
+| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}, pid, rss_mb, swap_mb, fds, cdp_sockets, tabs, threads, uptime_s, memory_cap, rss_limit_mb}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live; the memory fields are the engine's own `/proc` reading (#23) |
 | POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
 | POST | `/goto` | `{url}` | `{title, url, requested}` — navigates (2s settle). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Storing the requested url records a page you may never have got. |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
@@ -183,6 +186,14 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   said `alive: true` (issues #6, #7, #8). `python scripts/recovery_test.py` is the regression guard —
   it covers the closed-window and crash paths; the reattach path can't be forced from outside the
   engine and is untested.
+- **Memory is measured, capped and fatal, in that order (#23).** Every `tmp/nd-server.log` line
+  carries `pid=`; every op logs `op_done op= ms= rss_mb=`; a watchdog logs `mem` every 60s with the
+  same fields `/status` reports (`rss_mb`, `fds`, `cdp_sockets`, `tabs`, `threads`). The engine
+  re-execs itself into a systemd user scope (`MemoryMax`, `MemorySwapMax=0`, `OOMPolicy=kill`,
+  default `PH_MEMORY_MAX=8G`, `0` disables) so a leak takes the engine, never the host; `/status`
+  `memory_cap` says what was achieved. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
+  `rss_limit`, stops Chrome and exits 3 — the next call restarts it. `cdp_sockets` is the number to
+  watch: it should track the tab count, and 277 for 3 tabs was the leak.
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
 - **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,

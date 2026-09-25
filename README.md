@@ -148,6 +148,7 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
 | `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume. No browser or network needed. |
 | `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Isolated port only — it refuses to run on 8731. |
+| `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
 | `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
 | `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |

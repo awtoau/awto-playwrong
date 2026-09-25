@@ -180,10 +180,16 @@ JS_WRAP = ("(async () => { try { const v = await (%s);"
            " catch (e) { return JSON.stringify("
            "{__playwrong_error: String((e && e.stack) || e)}); } })()")
 
+PID = os.getpid()
+STARTED = time.monotonic()
+
 def log(a, **k):
+    # pid + rss on every line: the OOM record in #23 named a pid and a size, and nothing in this log
+    # could be tied to either. Timestamp is ISO 8601 with offset (UTC).
     ts = datetime.now(UTC).isoformat(timespec="milliseconds")
     try:
-        open(LOG, "a").write(f"{ts} {a} " + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
+        open(LOG, "a").write(f"{ts} pid={PID} rss_mb={proc_status_mb('VmRSS')} {a} "
+                             + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
     except Exception:
         pass
 
@@ -263,11 +269,40 @@ def enter_memory_cap():
 CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
 CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
 
+def cdp_sockets():
+    """Established TCP connections to Chrome's CDP port, from /proc/net/tcp. The leak in #23 showed
+    here first: 277 sockets for 3 tabs. Counts attached crawl shards too; they are few and known."""
+    port = (getattr(B, "_cdp", None) or {}).get("port")
+    if not port:
+        return 0
+    n = 0
+    try:
+        for line in open("/proc/net/tcp").readlines()[1:]:
+            f = line.split()
+            if f[3] == "01" and int(f[2].split(":")[1], 16) == port:
+                n += 1
+    except (OSError, ValueError, IndexError):
+        return None
+    return n
+
+def mem_snapshot():
+    """What /status and the watchdog report. Three /proc reads, no CDP traffic."""
+    try:
+        fds = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        fds = None
+    return {"pid": PID, "rss_mb": proc_status_mb("VmRSS"), "swap_mb": proc_status_mb("VmSwap"),
+            "fds": fds, "cdp_sockets": cdp_sockets(), "threads": threading.active_count(),
+            "tabs": B.tab_count(), "uptime_s": int(time.monotonic() - STARTED)}
+
 def _memwatch():
-    """Every 60s apply the RSS trigger: idle growth has no op to catch it on. 60s: the leak in #23
-    ran at ~5 MB/s at worst, 300 MB between samples."""
+    """Every 60s: log a `mem` line and apply the RSS trigger (idle growth has no op to catch it on).
+    60s: the leak in #23 ran at ~5 MB/s at worst, 300 MB between samples, while a healthy engine's
+    line stays cheap enough to keep forever."""
     while True:
         time.sleep(60)
+        s = mem_snapshot()
+        log("mem", **s)
         check_rss("watchdog")
 
 def check_rss(where):
@@ -1141,7 +1176,8 @@ class H(BaseHTTPRequestHandler):
             except Exception: p = None
             self._j({"server":True,"alive":B.ok() if p is None else bool(p),
                      "launched":B.tab is not None,"chrome_pid":B.chrome_pid(),
-                     "code":CODE})
+                     "code":CODE, **mem_snapshot(),
+                     "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")
@@ -1167,8 +1203,12 @@ class H(BaseHTTPRequestHandler):
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
         with _INFLIGHT_LOCK: _INFLIGHT[0]+=1
         try:
-            r=B.do(op,a)
-            check_rss(op)                   # the self-restart trigger, applied after every op
+            t0=time.monotonic(); before=proc_status_mb("VmRSS"); r=B.do(op,a)
+            after=check_rss(op)             # the self-restart trigger, applied after every op
+            # One line per op with RSS before and after: the leaking op shows up as the delta (#23).
+            log("op_done",op=op,ms=int((time.monotonic()-t0)*1000),rss_before_mb=before,
+                rss_after_mb=after,delta_mb=(after or 0)-(before or 0),
+                err=isinstance(r,dict) and "error" in r)
             self._j(r)
         finally:
             with _INFLIGHT_LOCK: _INFLIGHT[0]-=1
@@ -1195,7 +1235,7 @@ if __name__=="__main__":
               file=sys.stderr)
         sys.exit(0)
     enter_memory_cap()          # may re-exec this process under a capped systemd scope (#23)
-    log("server_start",port=PORT,rss_limit_mb=RSS_LIMIT >> 20,
+    log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,
         chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()
     SRV = ThreadingHTTPServer(("127.0.0.1",PORT),H)
