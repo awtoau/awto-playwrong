@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -182,6 +183,68 @@ def log(a, **k):
         open(LOG, "a").write(f"{ts} {a} " + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
     except Exception:
         pass
+
+# ── memory: measure, bound, fail loud (#23) ──────────────────────────────────────────────────────
+def parse_size(s):
+    """'8G' / '512M' / '1234' -> bytes; '' or '0' -> None (no cap)."""
+    s = str(s or "").strip().upper()
+    if not s or s == "0":
+        return None
+    mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}.get(s[-1])
+    return int(float(s[:-1]) * mult) if mult else int(s)
+
+# Self-restart threshold, checked after every op and every 60s. A healthy engine sits under 100 MB
+# (63 MB idle at 27 min measured); 2G is 30x that and a quarter of the cgroup cap.
+RSS_LIMIT = parse_size(os.environ.get("PH_RSS_LIMIT", "2G")) or (2 << 30)
+
+def proc_status_mb(key):
+    """One Vm* field of /proc/self/status in MB, or None off Linux."""
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith(key):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+
+def _memwatch():
+    """Every 60s apply the RSS trigger: idle growth has no op to catch it on. 60s: the leak in #23
+    ran at ~5 MB/s at worst, 300 MB between samples."""
+    while True:
+        time.sleep(60)
+        check_rss("watchdog")
+
+def check_rss(where):
+    """The self-restart trigger (#23): over RSS_LIMIT -> retire this engine. Returns the RSS read."""
+    rss = proc_status_mb("VmRSS")
+    if rss and (rss << 20) > RSS_LIMIT:
+        _retire_engine(where=where, rss_mb=rss, limit_mb=RSS_LIMIT >> 20)
+    return rss
+
+SRV = None                      # the ThreadingHTTPServer, once bound
+_INFLIGHT = [0]                 # ops being served right now; guarded by _INFLIGHT_LOCK
+_INFLIGHT_LOCK = threading.Lock()
+_RETIRING = threading.Event()
+
+def _retire_engine(**why):
+    """Stop taking requests, let in-flight ops finish, close Chrome, exit 3. connect.py respawns the
+    engine on the next call, so from a caller's side this is one failed request, not an outage."""
+    if _RETIRING.is_set():
+        return
+    _RETIRING.set()
+    log("rss_limit", action="retire", **why)
+    threading.Thread(target=_retire_worker, daemon=True, name="retire").start()
+
+def _retire_worker():
+    if SRV is not None:
+        SRV.shutdown()          # returns once serve_forever() has stopped accepting (0.5s poll)
+    # In-flight ops: the slowest legitimate one is a goto — connect.py gives it 90s, real pages
+    # take a few seconds. 40s waits out the slow page; on expiry the op is cut and the log says so.
+    deadline = time.monotonic() + 40.0
+    while time.monotonic() < deadline and _INFLIGHT[0] > 0:
+        time.sleep(0.1)
+    if _INFLIGHT[0]:
+        log("retire_cut", inflight=_INFLIGHT[0], waited_s=40)
+    _shutdown(code=3)
 
 def heal_profile(profile_dir):
     """Clear a stale SingletonLock so a persistent profile can be relaunched.
@@ -937,7 +1000,7 @@ if(m.aim){c.strokeStyle='red';c.strokeRect(m.aim[0]*sx-12,m.aim[1]*sy-12,24,24);
 let o=m.ollama||{};inf.innerHTML='model '+(o.model||'-')+'<br>time '+(o.ms||'-')+'ms<br>conf '+(o.confidence||'-')+'<br>'+(o.description||'');}
 setInterval(t,100);t();</script>"""
 
-def _shutdown():
+def _shutdown(code=0):
     """Stop the BROWSER, then exit.
 
     This used to be a bare os._exit(0). The HTTP process died instantly and Chrome — a separate
@@ -957,7 +1020,7 @@ def _shutdown():
             log("browser_stopped")
     except Exception as e:
         log("shutdown_err", e=repr(e)[:120])
-    os._exit(0)
+    os._exit(code)
 
 
 async def _stop_browser():
@@ -1017,7 +1080,13 @@ class H(BaseHTTPRequestHandler):
         op=self.path.strip("/")
         if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
-        self._j(B.do(op,a))
+        with _INFLIGHT_LOCK: _INFLIGHT[0]+=1
+        try:
+            r=B.do(op,a)
+            check_rss(op)                   # the self-restart trigger, applied after every op
+            self._j(r)
+        finally:
+            with _INFLIGHT_LOCK: _INFLIGHT[0]-=1
 
 def _already_serving(port):
     """Is a healthy engine already on this port? Then this process must not become a second one.
@@ -1040,5 +1109,9 @@ if __name__=="__main__":
         print(f"an engine is already serving 127.0.0.1:{PORT} — not starting a second one",
               file=sys.stderr)
         sys.exit(0)
-    log("server_start",port=PORT)
-    ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+    log("server_start",port=PORT,rss_limit_mb=RSS_LIMIT >> 20)
+    threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()
+    SRV = ThreadingHTTPServer(("127.0.0.1",PORT),H)
+    SRV.serve_forever()
+    # Only _retire_engine() ends serve_forever(); its worker does the exit once in-flight ops drain.
+    threading.Event().wait()
