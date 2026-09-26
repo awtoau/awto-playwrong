@@ -193,7 +193,10 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   default `PH_MEMORY_MAX=8G`, `0` disables) so a leak takes the engine, never the host; `/status`
   `memory_cap` says what was achieved. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
   `rss_limit`, stops Chrome and exits 3 — the next call restarts it. `cdp_sockets` is the number to
-  watch: it should track the tab count, and 277 for 3 tabs was the leak.
+  watch: it counts every process's connections to this Chrome, so the engine's own share tracks its
+  tab count (277 for 3 tabs was the leak) and a high count next to a small `fds` means a client
+  attached via `/cdp` is leaking the same way — it runs its own nodriver, so it needs the fixed
+  vendored copy too.
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
 - **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,
