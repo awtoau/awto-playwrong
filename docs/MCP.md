@@ -495,7 +495,7 @@ That is the right level, because the failure being prevented is an accident, not
 | Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |
 | Every tool errors with "engine did not bind" | Run `python scripts/doctor.py` — nearly always a missing dep or no Chrome. Full engine output is in `tmp/logs/playwrong-engine.log`. |
 | Every tool errors with `ConnectionClosedError` | The browser died under the engine. It now relaunches on the next op by itself, so this should self-clear — if it persists, the relaunch is failing and the error says so. Was issue #8, where the engine wedged instead and `status` reported it healthy. |
-| Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. |
+| Server starts, browser never appears | No `DISPLAY` (headed Chrome needs one), or a stale `SingletonLock` in a persistent `PH_PROFILE_DIR` — see AGENT-API.md. The engine adopts the user's own X/Wayland session when spawned without one (ssh, remote editor); with no desktop session at all, launch fails with `no display: …`. |
 | Port 8731 taken by something else | Register with `--port 8732`, or export `PH_PORT`. |
 | Turnstile not clearing | Raise `tries`; confirm the browser is headed (it must be) and that you're not running a second competing Chrome. |
 | A PDF url returns junk from `fetch` | Right — the browser's PDF viewer can't be driven. Use the `pdf` tool (not curl): it downloads through the cleared session and extracts the text. |

@@ -339,6 +339,42 @@ def _retire_worker():
         log("retire_cut", inflight=_INFLIGHT[0], waited_s=40)
     _shutdown(code=3)
 
+def ensure_display(env=None, uid=None, x11_dir="/tmp/.X11-unix", run_dir=None):
+    """Adopt the user's desktop display when spawned without one; headed Chrome cannot start otherwise.
+    An engine spawned from an ssh/remote-editor shell has no DISPLAY, and nodriver then fails with a
+    misleading "running as root / no_sandbox" hint. Returns what was adopted; raises if there is none."""
+    env = os.environ if env is None else env
+    if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
+        return {}
+    uid = os.getuid() if uid is None else uid
+    run_dir = run_dir or f"/run/user/{uid}"
+    got = {}
+    try:
+        socks = sorted((int(n[1:]), n) for n in os.listdir(x11_dir) if re.fullmatch(r"X\d+", n)
+                       and os.stat(os.path.join(x11_dir, n)).st_uid == uid)
+    except OSError:
+        socks = []
+    if socks:
+        got["DISPLAY"] = f":{socks[0][0]}"
+        if not env.get("XAUTHORITY"):
+            try:
+                auth = sorted(n for n in os.listdir(run_dir) if n.startswith(".mutter-Xwaylandauth."))
+            except OSError:
+                auth = []
+            home_auth = os.path.expanduser("~/.Xauthority")
+            if auth:
+                got["XAUTHORITY"] = os.path.join(run_dir, auth[0])
+            elif os.path.exists(home_auth):
+                got["XAUTHORITY"] = home_auth
+    elif os.path.exists(os.path.join(run_dir, "wayland-0")):
+        got["WAYLAND_DISPLAY"] = "wayland-0"
+    if not got:
+        raise RuntimeError(f"no display: headed Chrome needs a desktop session for uid {uid}, and none "
+                           f"was found ({x11_dir}/X*, {run_dir}/wayland-0). Log in to the desktop, "
+                           "or start the engine with DISPLAY set.")
+    env.update(got)
+    return got
+
 def heal_profile(profile_dir):
     """Clear a stale SingletonLock so a persistent profile can be relaunched.
 
@@ -542,6 +578,8 @@ class ND:
             self.browser = self.tab = None
             self._dead = False
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
+            adopted = ensure_display()
+            if adopted: log("display_adopted", **adopted)
             self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
             self.tab = await self.browser.get("about:blank")
             self._publish_cdp()
