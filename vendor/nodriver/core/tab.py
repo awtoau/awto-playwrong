@@ -1093,6 +1093,9 @@ class Tab(Connection):
         """
         if self.target and self.target.target_id:
             await self.send(cdp.target.close_target(target_id=self.target.target_id))
+        # The target is gone; drop our websocket and listener task with it, or they outlive the tab
+        # (awtoau/awto-playwrong#23).
+        await self.aclose()
 
     async def get_window(self) -> Tuple[cdp.browser.WindowID, cdp.browser.Bounds]:
         """

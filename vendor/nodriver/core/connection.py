@@ -36,6 +36,19 @@ TargetType = Union[cdp.target.TargetInfo, cdp.target.TargetID, str]
 logger = logging.getLogger(__name__)
 
 
+def _summary(value):
+    """What a Transaction keeps of its result: scalars (truncated), anything else by type name.
+
+    The history is a debugging aid, but a dom.getDocument tree is megabytes of dataclasses, and 25
+    of them per connection outlived every tab (awtoau/awto-playwrong#23).
+    """
+    if isinstance(value, str):
+        return value if len(value) <= 256 else value[:256] + "..."
+    if value is None or isinstance(value, (int, float, bool, Exception)):
+        return value
+    return f"<{type(value).__name__}>"
+
+
 class ProtocolException(Exception):
     def __init__(self, *args, **kwargs):  # real signature unknown
 
@@ -445,7 +458,7 @@ class Connection:
         try:
             cdp_obj.send(response_message["result"])
         except StopIteration as e:
-            tx.result = e.value
+            tx.result = _summary(e.value)
             return e.value
         except (Exception,) as e:
             tx.result = e

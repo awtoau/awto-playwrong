@@ -513,8 +513,18 @@ class Browser(Connection):
         for ctab in self._targets.copy():
             if ctab.target not in targets:
                 self._targets.remove(ctab)
+                # A dropped connection still owns a websocket and a listener task; unless they are
+                # closed, the task keeps the connection and its transaction history alive forever.
+                # Measured at ~20 MB per closed tab (awtoau/awto-playwrong#23).
+                asyncio.ensure_future(self._close_dropped(ctab))
 
         await asyncio.sleep(0)
+
+    async def _close_dropped(self, conn: Connection):
+        try:
+            await conn.aclose()
+        except Exception as e:
+            logger.debug("closing dropped connection %s failed: %s", conn, e)
 
     def __iter__(self):
         self._i = self.tabs.index(self.main_tab)
