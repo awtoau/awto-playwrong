@@ -12,8 +12,9 @@ ALWAYS runs against an isolated port, never the shared engine on 8731 — the te
 browser, and the shared one carries everyone's cleared Turnstile session. The pid it kills comes from
 that engine's own /status, so it cannot pick the wrong Chrome.
 
-Three states are covered: a closed window (Chrome exits with its last tab), a browser crash
-(SIGKILL), and the ENGINE process itself being killed — #19, where every later call reported
+Four states are covered: the engine's current tab closed from outside while Chrome lives (#22), a
+closed window (Chrome exits with its last tab), a browser crash (SIGKILL), and the ENGINE process
+itself being killed — #19, where every later call reported
 "engine op 'newtab' failed: timed out" instead of saying the engine was gone. NOT covered: the process alive with its websockets dead, reported in issue #6.
 Closing targets from outside cannot produce it — Chrome exits with the last one — and nothing else
 reachable from a test kills a socket while sparing the process. That path (`_reattach`, taken when
@@ -140,6 +141,32 @@ def main():
         if not pid:
             say("\nno chrome_pid to kill — cannot run the rest")
             return 1
+
+        # 1b. The engine's CURRENT tab disappears while Chrome lives on (#22): closed from outside,
+        #     or a hung page's target torn down. Every untagged op then failed "Session with given
+        #     id not found" forever and /status said alive:false, while the browser was fine.
+        tag = "recovery-22"
+        connect.call("newtab", port=a.port, url="about:blank", tag=tag)    # keeps Chrome up
+        cur = [t for t in connect.call("tabs", port=a.port, method="GET")["tabs"] if t["active"]]
+        cdp = connect.call("cdp", port=a.port)
+        if cur:
+            devtools(f"http://{cdp['host']}:{cdp['port']}/json/close/{cur[0]['target_id']}")
+            time.sleep(0.5)          # Chrome tears a target down in ms; 0.5s is plenty, not a wait
+        ok("current tab closed from outside", bool(cur), f"{cur[0]['target_id'] if cur else '-'}")
+        st = status(a.port)
+        ok("status stays alive after losing the current tab", st.get("alive") is True, json.dumps(st))
+        try:
+            r = connect.call("js", port=a.port, expr="1+1")
+            ok("untagged op recovers onto a live tab", r.get("result") == 2, json.dumps(r))
+        except connect.EngineError as e:
+            ok("untagged op recovers onto a live tab", False, str(e)[:140])
+        try:
+            connect.call("closetab", port=a.port, tag=tag)
+            r = connect.call("js", port=a.port, expr="2+2")
+            ok("untagged op still works after the tagged tab closes", r.get("result") == 4,
+               json.dumps(r))
+        except connect.EngineError as e:
+            ok("untagged op still works after the tagged tab closes", False, str(e)[:140])
 
         # 2. Someone closes the window — the likeliest real cause. Closing every page target from
         #    the DevTools endpoint is what that does, and Chrome exits with its last tab.

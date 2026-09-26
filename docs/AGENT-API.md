@@ -291,6 +291,12 @@ browsers, run multiple servers on different `PH_PORT`s — but within one server
 `solve`). Omit it and you get the engine's active tab, which is fine for a single caller. Pass a tag
 and the op acts on YOUR page no matter what anyone else is doing:
 
+- A tagged `newtab` does not become the active tab; only an untagged one does. If the active tab
+  vanishes (closed from outside, or a hung page's target torn down), the next untagged op moves to
+  a live untagged tab, or a fresh `about:blank`, and retries once. The log line is `tab_repointed`.
+  Before #22 that state was permanent: `/status` said `alive: false` while Chrome was fine.
+
+
 ```python
 connect.call("newtab", tag="agent-7", url="about:blank")
 connect.call("goto", url="https://example.com", tab="agent-7")

@@ -436,6 +436,13 @@ def _dead_conn(e):
             or "Connection closed" in s or "no close frame" in s)
 
 
+def _lost_target(e):
+    """Is this "the TAB went away" with Chrome still fine (#22)? -32001 when our session outlived the
+    target, -32602 when nodriver tries to re-attach to it. Page-level: re-point, never forget()."""
+    s = str(e)
+    return "Session with given id not found" in s or "No target with given id" in s
+
+
 class ND:
     """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
     def __init__(self):
@@ -478,7 +485,8 @@ class ND:
         rather than a verdict, because a slow answer means loaded, not broken."""
         if not self.ok(): return False
         try:
-            await asyncio.wait_for(self.tab.send(cdp.browser.get_version()), timeout)
+            # Through the BROWSER connection: browser health must not depend on one tab existing (#22).
+            await asyncio.wait_for(self.browser.send(cdp.browser.get_version()), timeout)
             return True
         except TimeoutError:
             return None
@@ -817,6 +825,21 @@ class ND:
         for tag in self.tags: self.tags[tag] = None      # tombstones: re-openable, see _tab()
         self.owners.clear()
         await self._ensure()
+    async def _repoint(self, why):
+        """Make self.tab a live, untagged page again after the current tab vanished (#22): the first
+        untagged page Chrome still has, else a fresh about:blank. Chrome itself is fine here, so
+        this never forget()s the browser, and the session and every tagged tab survive."""
+        await self._refresh()
+        tagged = {v for v in self.tags.values() if v}
+        for t in self.browser.tabs:
+            if getattr(getattr(t, "target", None), "target_id", None) not in tagged:
+                self.tab = t
+                break
+        else:
+            self.tab = await self.browser.get("about:blank", new_tab=True)
+            await self._refresh()
+        log("tab_repointed", why=why,
+            target=getattr(getattr(self.tab, "target", None), "target_id", None))
     async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
         """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
         a re-opened tab straight back to the op that asked for it."""
@@ -824,7 +847,10 @@ class ND:
         await self._maybe_recycle()
         self.fetches += 1
         t = await self.browser.get(url, new_tab=True)
-        self.tab = t
+        if not tag:
+            # A tagged tab is its owner's, driven by tag. Making it current too meant its closing
+            # took every untagged op down with it (#22).
+            self.tab = t
         await self._refresh()          # the cache may not list the tab we just opened yet
         tid = getattr(getattr(t, "target", None), "target_id", None)
         if tag:
@@ -957,7 +983,7 @@ class ND:
         # whoever's tag pointed at it, which the tag-only prune missed entirely (#14).
         self._forget_tags(ids)
         if self.tab not in self.browser.tabs:
-            self.tab=self.browser.tabs[0] if self.browser.tabs else None
+            await self._repoint("closetab")     # not tabs[0]: that may be another agent's tab
         return {"closed":closed,"remaining":len(self.browser.tabs)}
     async def _closeextra(self, owner=None, force=False):
         """Clean up leaked tabs — YOURS, and those of agents that are gone. Base tab (0) is untouched.
@@ -1219,6 +1245,12 @@ class ND:
                 if dead and attempt == 1:
                     self.forget(f"{op}: {type(e).__name__}")
                     continue
+                if attempt == 1 and a.get("tab") is None and _lost_target(e):
+                    try:
+                        self.run(self._repoint(f"{op}: {str(e)[:60]}"))
+                        continue
+                    except Exception as e2:
+                        log("repoint_failed", op=op, e=repr(e2)[:120])
                 if dead:
                     return {"error": f"browser connection lost and the relaunch did not take: "
                                      f"{e!r}"[:200]}
