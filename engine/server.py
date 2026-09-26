@@ -21,14 +21,14 @@ import html
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
 import traceback
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import memcap  # engine/memcap.py; server.py runs as a script, so its dir is on sys.path
 
 
 def _use_vendored_nodriver():
@@ -196,15 +196,8 @@ def log(a, **k):
 
 # ── memory: measure, bound, fail loud (#23) ──────────────────────────────────────────────────────
 MEMORY_MAX = os.environ.get("PH_MEMORY_MAX", "8G")     # cgroup cap for python + Chrome; "0" = none
-MEMORY_CAP = "unknown"                                   # what enter_memory_cap() achieved, for /status
-
-def parse_size(s):
-    """'8G' / '512M' / '1234' -> bytes; '' or '0' -> None (no cap)."""
-    s = str(s or "").strip().upper()
-    if not s or s == "0":
-        return None
-    mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}.get(s[-1])
-    return int(float(s[:-1]) * mult) if mult else int(s)
+MEMORY_CAP = "unknown"                                   # what memcap.enter() achieved, for /status
+parse_size = memcap.parse_size
 
 # Self-restart threshold, checked after every op and every 60s. A healthy engine sits under 100 MB
 # (63 MB idle at 27 min measured); 2G is 30x that and a quarter of the cgroup cap.
@@ -218,52 +211,6 @@ def proc_status_mb(key):
                 return int(line.split()[1]) // 1024
     except (OSError, ValueError, IndexError):
         return None
-
-def cgroup_memory_max():
-    """Our own cgroup's memory.max in bytes; None when unlimited or unknown."""
-    try:
-        path = open("/proc/self/cgroup").read().split("::", 1)[1].strip()
-        v = open(f"/sys/fs/cgroup{path}/memory.max").read().strip()
-        return None if v == "max" else int(v)
-    except (OSError, IndexError, ValueError):
-        return None
-
-def enter_memory_cap():
-    """Re-exec under a systemd scope with a hard memory cap, so a leak kills the engine, not the host.
-
-    - MemorySwapMax=0 is the half that matters: MemoryMax alone makes the cgroup swap instead of
-      die, which was the hour of thrash before the OOM in #23.
-    - OOMPolicy=kill takes the whole scope (Chrome included) when the kernel kills anything in it.
-    - Preflighted with a no-op: a host without a user manager runs uncapped and says so in the log
-      and /status, rather than failing to start. PH_MEMORY_MAX=0 disables."""
-    global MEMORY_CAP
-    want = parse_size(MEMORY_MAX)
-    if want is None:
-        MEMORY_CAP = "off (PH_MEMORY_MAX=0)"; return
-    have = cgroup_memory_max()
-    if have is not None and have <= want:
-        MEMORY_CAP = f"{have >> 20}M"; return
-    if os.environ.get("PH_MEMORY_CAP_TRIED"):
-        MEMORY_CAP = "none (systemd-run ran but applied no cap)"
-        log("memory_cap_failed", want=MEMORY_MAX, cgroup_max=have); return
-    if not shutil.which("systemd-run"):
-        MEMORY_CAP = "none (no systemd-run)"
-        log("memory_cap_unavailable", why="no systemd-run on PATH"); return
-    base = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={want}",
-            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=kill"]
-    try:
-        # Creating a scope is one D-Bus round trip to the user manager, ~50ms measured. 5s is
-        # 100x; on expiry we run uncapped and log it — a stuck manager must not turn start into hang.
-        r = subprocess.run([*base, "true"], capture_output=True, text=True, timeout=5)
-        why = r.stderr.strip()[:120] if r.returncode else None
-    except (OSError, subprocess.SubprocessError) as e:
-        why = repr(e)[:120]
-    if why is not None:
-        MEMORY_CAP = "none (systemd-run refused)"
-        log("memory_cap_unavailable", why=why); return
-    log("memory_cap_exec", max=MEMORY_MAX)
-    os.execvpe("systemd-run", [*base, sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]],
-               {**os.environ, "PH_MEMORY_CAP_TRIED": "1"})
 
 # Chrome recycle triggers (#23). 64 tabs is 2x the crawler's own --tabs cap of 32, so a legitimate
 # crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
@@ -1388,7 +1335,8 @@ if __name__=="__main__":
         print(f"an engine is already serving 127.0.0.1:{PORT} — not starting a second one",
               file=sys.stderr)
         sys.exit(0)
-    enter_memory_cap()          # may re-exec this process under a capped systemd scope (#23)
+    # May re-exec this process under a capped systemd scope; see engine/memcap.py (#23).
+    MEMORY_CAP = memcap.enter("engine", MEMORY_MAX, log)
     log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,
         chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()

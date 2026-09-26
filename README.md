@@ -122,6 +122,9 @@ running a *second*, isolated browser.
 `MemoryMax=8G`, no swap and `OOMPolicy=kill`, so a leak kills the engine (which restarts on the next
 call) instead of the host — issue #23 was 39.5 GB and a hard reset. `PH_MEMORY_MAX=16G` raises it,
 `PH_MEMORY_MAX=0` disables it; without a systemd user manager it runs uncapped and `/status` says so.
+`python -m crawl.run` gets the same treatment in a scope of its own, `PH_CRAWL_MEMORY_MAX` (default
+4G), because it attaches with its own nodriver (#26). An engine that a crawl spawns still gets its
+own 8G scope, so the two never share a cap.
 
 ### Driving a page, not just reading it
 `engine/client.py` has the interactive verbs — `goto`, `click`, `key`, `js`, `shot`, `tabs`,

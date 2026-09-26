@@ -436,6 +436,13 @@ def _parse_args(argv):
 
 def main(argv=None):
     a = _parse_args(argv if argv is not None else sys.argv[1:])
+    if argv is None:
+        # Same hard cap as the engine: an attacher runs its own nodriver, and in #23 one reached
+        # 4.5 GB uncapped (#26). May re-exec this process; PH_CRAWL_MEMORY_MAX=0 disables.
+        from engine import memcap
+        cap = memcap.enter("crawl", os.environ.get("PH_CRAWL_MEMORY_MAX", "4G"),
+                           lambda ev, **k: print(f"[memcap] {ev} {k}", file=sys.stderr, flush=True))
+        print(f"[memcap] crawl memory cap: {cap}", file=sys.stderr, flush=True)
     is_url = "://" in a.db
     store_root = a.store or ("crawl_pages" if is_url
                              else a.db.rsplit("/", 1)[-1].split("?")[0] + ".pages")
