@@ -147,7 +147,7 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup. `--cloudflare` adds a real Turnstile wall. |
 | `scripts/stress_test.py` | the edge cases: duplicate and bad urls, empty batches, double collect, missing tabs, a batch running while someone else drives, malformed requests. |
 | `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
-| `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume. No browser or network needed. |
+| `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume; `--exclude` drops matching links. No browser or network needed. |
 | `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
 | `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Isolated port only — it refuses to run on 8731. |
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline. The regression guard for #23, where every closed tab left ~20 MB behind. |
@@ -253,6 +253,8 @@ Point-and-go (one command rips a site + prints its shape):
 python -m crawl.run --seed https://example.com/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
 python -m crawl.report --db site.sqlite            # re-print the report later
 ```
+`--exclude REGEX` (repeatable) keeps matching discovered links out of the queue — forum post anchors,
+redirects, member pages, calendars.
 `--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
 agent guide and `schema.sql` for the relational model.
 

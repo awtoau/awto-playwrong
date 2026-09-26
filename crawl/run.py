@@ -23,6 +23,7 @@ image pass can pick them up. Run `python -m crawl.report --db …` any time to r
 import argparse
 import asyncio
 import os
+import re
 import sys
 import time
 from urllib.parse import urlsplit
@@ -116,7 +117,7 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
         for iu, alt, kind in images:
             d.link_page_asset(sp.sha256, iu[:2000], alt=(alt or "")[:500], kind=kind, link_code=link_code)
         for lu in links:
-            if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth:
+            if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth and not cfg.excluded(lu):
                 d.enqueue(lu, depth + 1, discovered_from=url, link_code=link_code)
         d.scan(url, status="ok", http_status=doc_status["code"], sha256=sp.sha256); terminal = True
         ms = int((time.monotonic() - t0) * 1000)
@@ -366,7 +367,7 @@ class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
                  rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0,
-                 max_per_host=0):
+                 max_per_host=0, exclude=None):
         self.seeds = list(seeds)
         self.db_dsn = db_dsn
         self.store_root = store_root
@@ -392,6 +393,11 @@ class Config:
         self.host_diverse = host_diverse
         self.max_per_host = max_per_host     # 0 = unlimited
         self.rl = ratelimit.RateLimiter(base_delay=rate_delay) if rate_delay and rate_delay > 0 else None
+        # discovered links matching any of these are never queued (seeds are not filtered)
+        self.exclude = [re.compile(p) for p in (exclude or [])]
+
+    def excluded(self, url):
+        return any(p.search(url) for p in self.exclude)
 
 
 def _parse_args(argv):
@@ -415,6 +421,9 @@ def _parse_args(argv):
                         "abandon means the next fresh tab starts sooner (aggressive mode; e.g. 25).")
     p.add_argument("--port", type=int, default=int(os.environ.get("PH_PORT", "8731")))
     p.add_argument("--host", action="append", help="Extra host to allow (repeatable)")
+    p.add_argument("--exclude", action="append", metavar="REGEX",
+                   help="Never queue a discovered link whose URL matches REGEX (re.search; "
+                        "repeatable). For forum/calendar traps: post anchors, redirects, member pages.")
     p.add_argument("--no-js", action="store_true", help="Block Script too (leanest; static sites)")
     p.add_argument("--rate-delay", type=float, default=1.5,
                    help="Min seconds between fetches to the SAME host (per-host politeness + 429 backoff). 0 disables.")
@@ -436,7 +445,8 @@ def main(argv=None):
                  tabs=a.tabs, depth=a.depth, nav_timeout=a.nav_timeout,
                  port=a.port, hosts=hosts, keep_js=not a.no_js,
                  rate_delay=a.rate_delay, shuffle=not a.no_shuffle,
-                 host_diverse=not a.no_host_diverse, stall_ceiling=a.stall_ceiling)
+                 host_diverse=not a.no_host_diverse, stall_ceiling=a.stall_ceiling,
+                 exclude=a.exclude)
     asyncio.run(crawl(cfg))
 
 

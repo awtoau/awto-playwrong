@@ -131,6 +131,17 @@ def main():
            d.state_counts().get("fetching", 0) == 0, str(d.state_counts()))
         d.close()
 
+    # ---- --exclude: forum traps (post anchors, redirects) never queued; real pages still are ------
+    from crawl.run import Config, _parse_args
+    a = _parse_args(["--seed", "https://f.test/", "--db", "x.sqlite",
+                     "--exclude", r"/threads/[^/]+/post-\d+", "--exclude", r"/(goto|members)/"])
+    cfg = Config(seeds=a.seed, db_dsn=a.db, store_root="x", exclude=a.exclude)
+    ok("--exclude drops a post anchor", cfg.excluded("https://f.test/threads/t.1/post-99"))
+    ok("--exclude drops a redirect", cfg.excluded("https://f.test/goto/post?id=3"))
+    ok("--exclude keeps the thread page", not cfg.excluded("https://f.test/threads/t.1/page-2"))
+    ok("no --exclude excludes nothing",
+       not Config(seeds=a.seed, db_dsn=a.db, store_root="x").excluded("https://f.test/goto/x"))
+
     say(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         say("failed: " + ", ".join(FAIL))
