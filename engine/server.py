@@ -17,6 +17,7 @@ sys.path itself, so no PYTHONPATH is required. To run it in the foreground anywa
 """
 import asyncio
 import base64
+import html
 import json
 import os
 import re
@@ -678,14 +679,39 @@ class ND:
             del self.tags[ref]
             return await self._newtab_raw("about:blank", ref, owner)
         raise KeyError(f"no such tab: {ref!r} (tags: {sorted(self.tags)})")
-    async def _goto(self, url, tab=None):
+    async def _goto(self, url, tab=None, no_js=False):
         t = await self._tab(tab)
+        if no_js:
+            try:
+                await t.send(cdp.emulation.set_script_execution_disabled(value=True))
+            except Exception:
+                pass
+        else:
+            try:
+                await t.send(cdp.emulation.set_script_execution_disabled(value=False))
+            except Exception:
+                pass
         await t.get(url); await t.sleep(2)
-        await self._label(t)
+        if not no_js:
+            await self._label(t)
+            try:
+                title = strip_owner(await t.evaluate("document.title"))
+            except Exception:
+                title = await self._title_from_html(t)
+        else:
+            title = await self._title_from_html(t)
         # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
         # two differ, and a caller that stores the requested url records a page it never got.
-        return {"title": strip_owner(await t.evaluate("document.title")),
+        return {"title": title,
                 "url": await self._href(t), "requested": url}
+
+    async def _title_from_html(self, t):
+        try:
+            content = await t.get_content()
+            m = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
+            return strip_owner(html.unescape(m.group(1)).strip()) if m else ""
+        except Exception:
+            return ""
     async def _label(self, t):
         """Prefix this tab's title with its owner, best effort.
 
@@ -1158,7 +1184,7 @@ class ND:
         m={"start":lambda:self._start(),
            # every driving op takes an optional `tab` (a tag, or an index) so concurrent callers
            # never have to rely on which tab happens to be active
-           "goto":lambda:self._goto(a["url"],a.get("tab")),
+           "goto":lambda:self._goto(a["url"],a.get("tab"),a.get("no_js",False)),
            "solve":lambda:self._solve(a.get("tries",20),a.get("tab")),
            "text":lambda:self._text(a.get("tab")),"shot":lambda:self._shot(a.get("tab")),
            "clearcookies":lambda:self._clearcookies(),
@@ -1196,7 +1222,9 @@ class ND:
                 if dead:
                     return {"error": f"browser connection lost and the relaunch did not take: "
                                      f"{e!r}"[:200]}
-                return {"error":repr(e)[:160]}
+                # 160 cut the Chrome launch failure off mid-sentence ("One of ..."), losing the
+                # only part that named a cause (#21). 600 holds a multi-line launch error whole.
+                return {"error":repr(e)[:600]}
 
 B = ND()
 MARKERS={"aim":None,"cursor":None,"path":[],"box":None,"ollama":None}

@@ -87,8 +87,8 @@ def my_tab():
 # Each tool is a thin shim over engine/connect.py, which is also what the `playwrong` CLI uses — one
 # implementation of "start the engine, drive it, clean up", not two that drift apart.
 
-def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20):
-    r = capture(url, mode=mode, solve=solve, max_chars=max_chars, tries=tries)
+def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20, no_js=False):
+    r = capture(url, mode=mode, solve=solve, max_chars=max_chars, tries=tries, no_js=no_js)
     body = r["text"]
     if r.get("challenge"):
         body += f"\n\n[cloudflare challenge: {r['challenge']}]"
@@ -200,9 +200,9 @@ def t_screenshot(url=None, solve=True):
             {"type": "image", "data": r["b64"], "mimeType": "image/png"}]
 
 
-def t_goto(url, solve=True, mode="text", max_chars=8000):
+def t_goto(url, solve=True, mode="text", max_chars=8000, no_js=False):
     tab = my_tab()
-    op("goto", url=url, tab=tab, timeout=90.0)
+    op("goto", url=url, tab=tab, no_js=no_js, timeout=90.0)
     page = op("text", tab=tab)
     note = ""
     if solve and is_challenge(page):
@@ -293,6 +293,8 @@ TOOLS = [
              "mode": _TEXT_MODE,
              "solve": {"type": "boolean", "default": True,
                        "description": "Auto-clear a Cloudflare challenge if one is detected."},
+             "no_js": {"type": "boolean", "default": False,
+                       "description": "Disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH)."},
              "max_chars": {"type": "integer", "default": 40000,
                            "description": "Truncate the body at this many characters."},
              "tries": {"type": "integer", "default": 20,
@@ -406,6 +408,8 @@ TOOLS = [
          schema={"type": "object", "required": ["url"], "properties": {
              "url": {"type": "string"},
              "solve": {"type": "boolean", "default": True},
+             "no_js": {"type": "boolean", "default": False,
+                       "description": "Disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH)."},
              "mode": _TEXT_MODE,
              "max_chars": {"type": "integer", "default": 8000}}}),
 

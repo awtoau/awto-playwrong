@@ -78,6 +78,8 @@ def main(argv=None):
                    help="truncate each page (0 = no limit; default 40000)")
     p.add_argument("--shot", metavar="PATH", help="also save a PNG screenshot of each page")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    p.add_argument("--no-js", action="store_true",
+                   help="disable JavaScript execution to bypass client-side paywall script truncation (e.g. The Age, SMH)")
     p.add_argument("--no-solve", action="store_true", help="don't auto-clear Cloudflare challenges")
     p.add_argument("--tries", type=int, default=20, help="max challenge-solve iterations")
     p.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
@@ -201,7 +203,7 @@ def main(argv=None):
         try:
             r = connect.capture(url, mode=fmt, solve=not a.no_solve, max_chars=a.max_chars,
                                 tries=a.tries, port=a.port, shot=bool(a.shot), on_start=note,
-                                profile=a.profile)
+                                profile=a.profile, no_js=a.no_js)
         except connect.EngineError as e:
             failed += 1
             print(f"{url}: {e}", file=sys.stderr)

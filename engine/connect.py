@@ -450,7 +450,7 @@ def _settled_text(port, page=None, tab=None):
 
 
 def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, shot=False,
-            on_start=None, profile=None):
+            on_start=None, profile=None, no_js=False):
     """Everything needed to get one page, in one call: start the engine and Chrome if they are down,
     open OUR OWN tab, navigate, clear a Cloudflare challenge if one appears, extract, close the tab.
 
@@ -465,13 +465,13 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
         idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
         final_url, out = None, {}
         try:
-            landed = call("goto", port=port, url=url, tab=tag, timeout=90.0)
+            landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
             # Chrome's first-run/profile page can occupy a brand-new tab, so the navigation lands
             # somewhere internal and we would return THAT page's text as if it were the url asked
             # for — a silently wrong answer, seen once on the very first launch of a fresh profile.
             # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
             if str(landed.get("url", "")).startswith(("chrome://", "about:")):
-                call("goto", port=port, url=url, tab=tag, timeout=90.0)
+                call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
             page = _settled_text(port, tab=tag)
             challenge = None
             if solve and is_challenge(page):

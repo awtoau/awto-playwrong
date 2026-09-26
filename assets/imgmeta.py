@@ -8,10 +8,14 @@ import io
 from dataclasses import dataclass, field
 
 try:
-    import imagehash
     from PIL import Image
-except Exception:                                   # Pillow optional — degrade gracefully
-    Image = imagehash = None
+except Exception:
+    Image = None
+
+try:
+    import imagehash
+except Exception:
+    imagehash = None
 
 # Drop C0 control chars (except tab/nl/cr) + NUL so EXIF strings are safe for Postgres text/jsonb —
 # odd EXIF blobs carry raw binary that otherwise crashes the insert.

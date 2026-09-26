@@ -96,6 +96,7 @@ text.
 | `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the checkout's `tmp/`, or the XDG cache dir when that isn't writable). `-o sources/doc.pdf` to keep a document |
 | `--links` / `--html` | keep hrefs as `anchor <url>` / return raw markup instead of text |
 | `--max-chars N` | truncate each page (`0` = no limit; default 40000) |
+| `--no-js` | disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH) |
 | `--shot PATH` | also save a PNG. Several urls get `name-0.png`, `name-1.png`. |
 | `--json` | machine-readable output instead of text |
 | `--no-solve` | don't auto-clear Cloudflare challenges |
@@ -155,6 +156,7 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
 | `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |
 | `scripts/install.py` | deps, the `playwrong` command on PATH, and both MCP registries. |
+| `scripts/crawl_theage.py` | crawl The Age website end-to-end (articles & photos) with `--no-js` paywall bypass and asset storage. |
 
 ## Why this exists
 Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**
