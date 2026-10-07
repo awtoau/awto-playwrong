@@ -269,6 +269,13 @@ or a truncated transfer *at the moment it arrives*, instead of when someone trie
 mismatch it raises and **keeps** the file — the wrong bytes are the evidence for what went wrong.
 From Python: `connect.download(url, path=…, expect_sha256=…, expect_size=…)`.
 
+**Browser fallback (`pdf` and `download`).** Some CDNs stall or refuse the plain-HTTP replay even
+with the cleared cookies + UA (st.com, #30).
+- Triggers on a read timeout (30 s between reads), a connection error, or HTTP 403/429/503.
+- Re-fetches with the page's own `fetch()` from a same-origin tab and streams it out in 4 MiB chunks.
+- Result gains `via: "browser"` and `http_error`; otherwise `via: "http"`.
+- Costs: the whole body sits in the tab's memory until copied out; adds the 30 s timeout first.
+
 ### Pages behind a login — open the tab and ask the user
 
 The browser is **headed and shared**, and the person you are working for is sitting in front of it.

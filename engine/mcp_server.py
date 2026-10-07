@@ -106,6 +106,8 @@ def t_pdf(url, path=None, max_chars=40000):
     saved += ")"
     if r.get("final_url") and r["final_url"] != url:
         saved += f"\nFinal URL after redirects: {r['final_url']}"
+    if r.get("via") == "browser":
+        saved += f"\nDownloaded inside the browser tab (plain HTTP refused: {r.get('http_error')})"
     if r.get("warning"):
         return f"{r['warning']}\n{saved}"
     head = f"# {os.path.basename(r['path'])}\nURL: {url}\n{saved}\n"
@@ -128,6 +130,8 @@ def t_download(url, path=None, expect_sha256=None, expect_size=None):
         lines.append(f"Content-Type: {r['content_type']}")
     if r.get("final_url") and r["final_url"] != url:
         lines.append(f"Final URL after redirects: {r['final_url']}")
+    if r.get("via") == "browser":
+        lines.append(f"Downloaded inside the browser tab (plain HTTP refused: {r.get('http_error')})")
     if expect_sha256 or expect_size:
         lines.append("Verified against the expected value you passed.")
     else:

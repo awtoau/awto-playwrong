@@ -657,6 +657,67 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
     return h
 
 
+# Raw bytes per js round-trip; base64 makes the JSON reply ~5.6 MB, well within CDP's limits.
+BROWSER_CHUNK = 4 << 20
+# HTTP statuses a CDN uses to turn away a non-browser client; worth retrying from inside the page.
+BOT_BLOCK_STATUSES = (403, 429, 503)
+
+
+def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=20, profile=None,
+                         timeout=300.0):
+    """Fetch `url` with the page's own fetch() from a same-origin tab and stream it to `path`.
+
+    - For CDNs that stall or block urllib even with the cleared cookies + UA (st.com, issue #30).
+    - The whole body sits in the tab's memory until copied out in BROWSER_CHUNK slices.
+    - timeout bounds the in-page fetch of the whole body; a stalled transfer fails, not hangs.
+    Returns (bytes, content_type, final_url, sha256).
+    """
+    port = ensure(port, on_start=on_start, profile=profile)
+    digest, total = hashlib.sha256(), 0
+    with _lock:
+        tag = f"{SESSION}-{next(_seq)}"
+        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
+        final_url = None
+        try:
+            call("goto", port=port, url=_origin(url), tab=tag, timeout=90.0)
+            if solve and is_challenge(call("text", port=port, tab=tag)):
+                if on_start:
+                    on_start("clearing a Cloudflare challenge")
+                call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
+            final_url = call("text", port=port, tab=tag).get("url")
+            ms = int(timeout * 1000)
+            head = call("js", port=port, tab=tag, timeout=timeout + 10.0, expr=(
+                "(async () => { const c = new AbortController();"
+                f" const t = setTimeout(() => c.abort(), {ms});"
+                f" const r = await fetch({json.dumps(url)}, {{credentials: 'include', signal: c.signal}});"
+                " const b = new Uint8Array(await r.arrayBuffer()); clearTimeout(t);"
+                " window.__playwrong_dl = b;"
+                " return {status: r.status, ok: r.ok, size: b.length, url: r.url,"
+                " type: r.headers.get('content-type') || ''}; })()")).get("result") or {}
+            if not head.get("ok"):
+                raise EngineError(f"download failed in the browser too: HTTP {head.get('status')} "
+                                  f"for {url}")
+            with open(path, "wb") as f:
+                for off in range(0, head["size"], BROWSER_CHUNK):
+                    b64 = call("js", port=port, tab=tag, timeout=30.0, expr=(
+                        f"(() => {{ const s = window.__playwrong_dl.subarray({off}, {off + BROWSER_CHUNK});"
+                        " let bin = ''; for (let i = 0; i < s.length; i += 0x8000)"
+                        " bin += String.fromCharCode.apply(null, s.subarray(i, i + 0x8000));"
+                        " return btoa(bin); })()")).get("result") or ""
+                    chunk = base64.b64decode(b64)
+                    f.write(chunk); digest.update(chunk); total += len(chunk)
+            if total != head["size"]:
+                raise EngineError(f"browser download truncated: {total} of {head['size']} bytes "
+                                  f"copied out for {url}")
+        finally:
+            try:
+                call("js", port=port, tab=tag, expr="delete window.__playwrong_dl")
+            except EngineError:
+                pass
+            _close_tab(idx, final_url, port, tag=tag)
+    return total, head.get("type", ""), head.get("url") or url, digest.hexdigest()
+
+
 def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None,
              expect_sha256=None, expect_size=None):
     """Fetch a file (firmware, archive, image, PDF, …) from behind a bot wall and write it to disk.
@@ -686,12 +747,12 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
             os.makedirs(parent, exist_ok=True)   # sources/ may not exist yet; a missing dir is not
     digest = hashlib.sha256()                    # a reason to throw away a download that worked
     total = 0
+    refused = None
     try:
-        # Streamed in 1 MiB chunks, never r.read() into memory: these are firmware images and release
-        # archives, and one 750 MB file read whole is 750 MB of RSS in the calling agent (issue #11).
-        # The timeout is per socket read, not for the whole transfer, so a large file is fine and a
-        # stalled one still fails.
-        with urllib.request.urlopen(req, timeout=180) as r:
+        # Streamed in 1 MiB chunks, never r.read() into memory: one 750 MB file read whole is 750 MB
+        # of RSS in the calling agent (issue #11).
+        # 30 s is per socket read: a healthy transfer never pauses that long; a CDN tarpit does (#30).
+        with urllib.request.urlopen(req, timeout=30) as r:
             ctype = r.headers.get("Content-Type", "")
             final = r.geturl()
             with open(path, "wb") as f:
@@ -701,11 +762,25 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
                         break
                     f.write(chunk); digest.update(chunk); total += len(chunk)
     except urllib.error.HTTPError as e:
-        raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
+        if e.code not in BOT_BLOCK_STATUSES:
+            raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
+        refused = f"HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
-        raise EngineError(f"download failed: {e}") from e
+        refused = str(e)
+    via = "http"
+    if refused:
+        # The CDN turned away urllib despite the cleared session; the browser's own stack gets through.
+        if on_start:
+            on_start(f"plain HTTP refused ({refused}); downloading inside the browser tab")
+        total, ctype, final, sha = _download_in_browser(url, path, port=port, on_start=on_start,
+                                                        solve=solve, tries=tries, profile=profile)
+        via = "browser"
+    else:
+        sha = digest.hexdigest()
     out = {"path": path, "bytes": total, "content_type": ctype, "final_url": final,
-           "sha256": digest.hexdigest()}
+           "sha256": sha, "via": via}
+    if refused:
+        out["http_error"] = refused
     # Verification against a publisher-stated value, when the caller has one. The file is KEPT on a
     # mismatch: it is evidence, and deleting the only copy of a wrong answer makes it harder to see
     # what actually arrived (a login page, a truncated transfer, the wrong artifact).
