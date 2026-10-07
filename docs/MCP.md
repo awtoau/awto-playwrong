@@ -271,10 +271,11 @@ From Python: `connect.download(url, path=…, expect_sha256=…, expect_size=…
 
 **Browser fallback (`pdf` and `download`).** Some CDNs stall or refuse the plain-HTTP replay even
 with the cleared cookies + UA (st.com, #30).
-- Triggers on a read timeout (30 s between reads), a connection error, or HTTP 403/429/503.
+- Triggers on a socket timeout (`HTTP_READ_TIMEOUT`, 1 s per connect/read), a connection error, or HTTP 403/429/503.
 - Re-fetches with the page's own `fetch()` from a same-origin tab and streams it out in 4 MiB chunks.
 - Result gains `via: "browser"` and `http_error`; otherwise `via: "http"`.
-- Costs: the whole body sits in the tab's memory until copied out; adds the 30 s timeout first.
+- Costs: the whole body sits in the tab's memory until copied out; adds the 1 s timeout first.
+- Seen stalling plain HTTP (2026-10-07): st.com, analog.com.
 
 ### Pages behind a login — open the tab and ask the user
 

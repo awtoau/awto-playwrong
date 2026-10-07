@@ -661,6 +661,8 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
 BROWSER_CHUNK = 4 << 20
 # HTTP statuses a CDN uses to turn away a non-browser client; worth retrying from inside the page.
 BOT_BLOCK_STATUSES = (403, 429, 503)
+# Seconds per urllib socket op (connect, TTFB, each read). Derivation + measurements: issue #30.
+HTTP_READ_TIMEOUT = 1.0
 
 
 def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=20, profile=None,
@@ -751,8 +753,8 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
     try:
         # Streamed in 1 MiB chunks, never r.read() into memory: one 750 MB file read whole is 750 MB
         # of RSS in the calling agent (issue #11).
-        # 30 s is per socket read: a healthy transfer never pauses that long; a CDN tarpit does (#30).
-        with urllib.request.urlopen(req, timeout=30) as r:
+        # Per socket op: ~1.25x a far server's worst single op; expiry -> browser fallback (#30).
+        with urllib.request.urlopen(req, timeout=HTTP_READ_TIMEOUT) as r:
             ctype = r.headers.get("Content-Type", "")
             final = r.geturl()
             with open(path, "wb") as f:
