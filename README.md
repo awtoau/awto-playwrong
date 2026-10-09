@@ -147,7 +147,8 @@ Every one of these runs standalone and prints a pass/fail tally.
 | Script | What it proves |
 |---|---|
 | `scripts/doctor.py` | preflight: Python, deps, vendored nodriver, Chrome, display, port. Prints the exact fix command for anything missing. |
-| `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup. `--cloudflare` adds a real Turnstile wall. |
+| `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup, and a local server that hangs up mid-download (must resume or fail by name, #31). `--cloudflare` adds a real Turnstile wall. |
+| `scripts/download_latency.py` | measures time-to-headers and the longest gap between socket reads on real downloads: the numbers `download()`'s per-read timeout is derived from (#30). `--runs N`. |
 | `scripts/stress_test.py` | the edge cases: duplicate and bad urls, empty batches, double collect, missing tabs, a batch running while someone else drives, malformed requests. |
 | `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
 | `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume; `--exclude` drops matching links. No browser or network needed. |

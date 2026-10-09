@@ -259,7 +259,7 @@ installers, any binary. It streams in 1 MiB chunks rather than reading the body 
 download(url="https://awto.au/fw/board-1.4.2.bin", path="/abs/path/to/sources/board-1.4.2.bin",
          expect_sha256="9f2c…")
   -> Saved: /abs/path/to/sources/board-1.4.2.bin
-     Bytes: 786,432,000
+     Bytes: 786,432,000 (matches Content-Length)
      SHA256: 9f2c…
      Verified against the expected value you passed.
 ```
@@ -269,9 +269,17 @@ or a truncated transfer *at the moment it arrives*, instead of when someone trie
 mismatch it raises and **keeps** the file — the wrong bytes are the evidence for what went wrong.
 From Python: `connect.download(url, path=…, expect_sha256=…, expect_size=…)`.
 
+**Short transfers (#31).** A server closing before the body is complete used to save the partial
+file as success; Python's `http.client` doesn't raise on it.
+- Bytes received are checked against `Content-Length`; result carries `expected_bytes`.
+- Short with `Accept-Ranges: bytes` → resumes with `Range`, up to `RESUME_TRIES` (8); result `resumed: N`.
+- Still short, or chunked body cut off → browser fallback (Chrome enforces the length itself).
+- Both fail → raises `short transfer: <got> of <expected> bytes …`; the partial moves to `<path>.partial`, so nothing sits at the requested path.
+- No `Content-Length` and no chunked framing → completeness can't be checked; the output says so.
+
 **Browser fallback (`pdf` and `download`).** Some CDNs stall or refuse the plain-HTTP replay even
 with the cleared cookies + UA (st.com, #30).
-- Triggers on a socket timeout (`HTTP_READ_TIMEOUT`, 1 s per connect/read), a connection error, or HTTP 403/429/503.
+- Triggers on a socket timeout (`HTTP_READ_TIMEOUT`, 1 s per connect/read), a connection error, HTTP 403/429/503, or a short transfer resume couldn't finish.
 - Re-fetches with the page's own `fetch()` from a same-origin tab and streams it out in 4 MiB chunks.
 - Result gains `via: "browser"` and `http_error`; otherwise `via: "http"`.
 - Costs: the whole body sits in the tab's memory until copied out; adds the 1 s timeout first.

@@ -14,10 +14,13 @@ default engine is SHARED, and stopping it kills other agents' cleared Turnstile 
 Results: tmp/logs/mcp-selftest.log
 """
 import argparse
+import hashlib
+import http.server
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -291,6 +294,91 @@ def live_tests(c):
     c.call("close_tab", close_extra=True)
 
 
+# Short-transfer fixtures (#31): a server that hangs up early must never read as a finished download.
+DL_SIZE = 10 << 20            # advertised body
+DL_CUT = 2 << 20              # where the "broken mirror" hangs up — the size #31 saw
+DL_BODY = hashlib.sha256(b"playwrong-31").digest() * (DL_SIZE // 32)
+
+
+class _ShortServer(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, headers):
+        self.send_response(code)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = True
+
+    def do_GET(self):
+        rng = self.headers.get("Range", "")
+        n = str(DL_SIZE)
+        if self.path == "/whole.bin":
+            self._send(200, DL_BODY, {"Content-Length": n})
+        elif self.path == "/trunc.bin":
+            self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n})
+        elif self.path == "/resume.bin" and rng.startswith("bytes="):
+            start = int(rng[6:].split("-")[0])
+            self._send(206, DL_BODY[start:], {"Content-Length": str(DL_SIZE - start),
+                                              "Accept-Ranges": "bytes",
+                                              "Content-Range": f"bytes {start}-{DL_SIZE-1}/{n}"})
+        elif self.path == "/resume.bin":
+            self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n, "Accept-Ranges": "bytes"})
+        elif self.path == "/chunked.bin":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for off in range(0, DL_CUT, 1 << 16):
+                self.wfile.write(b"%x\r\n" % (1 << 16) + DL_BODY[off:off + (1 << 16)] + b"\r\n")
+            self.wfile.flush()                # no terminating 0-chunk: the transfer is cut off
+            self.close_connection = True
+        else:
+            self._send(200, b"<html><title>dl fixture</title></html>",
+                       {"Content-Type": "text/html", "Content-Length": "38"})
+
+
+def short_transfer_tests(c):
+    """#31: a server closing before Content-Length must resume, fall back, or fail by name."""
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ShortServer)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    want_sha = hashlib.sha256(DL_BODY).hexdigest()
+    d = os.path.join(REPO, "tmp", "selftest-short")
+    os.makedirs(d, exist_ok=True)
+    try:
+        for name, good in (("whole", True), ("resume", True), ("trunc", False), ("chunked", False)):
+            path = os.path.join(d, f"{name}.bin")
+            for p in (path, path + ".partial"):
+                if os.path.exists(p):
+                    os.remove(p)
+            r = c.call("download", url=f"{base}/{name}.bin", path=path)
+            body = text_of(r)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if good:
+                ok(f"download {name}: whole file arrives", not is_error(r) and size == DL_SIZE
+                   and f"SHA256: {want_sha}" in body, f"{size} bytes; {body[:120]!r}")
+                ok(f"download {name}: says the length was checked", "Content-Length" in body,
+                   next((ln for ln in body.splitlines() if "Bytes" in ln), ""))
+                if name == "resume":
+                    ok("download resume: resumed with Range, not the browser",
+                       "Resumed 1 time" in body and "browser" not in body, body[-120:])
+            else:
+                ok(f"download {name}: short transfer is an error", is_error(r), body[:160])
+                ok(f"download {name}: error names the short transfer",
+                   is_error(r) and "short transfer" in body and f"{DL_CUT:,}" in body, body[:200])
+                ok(f"download {name}: nothing left at the requested path", not os.path.exists(path),
+                   f"{size} bytes at {path}")
+                ok(f"download {name}: partial kept as evidence", os.path.exists(path + ".partial"))
+    finally:
+        srv.shutdown()
+        c.call("close_tab", close_extra=True)
+
+
 def cloudflare_test(c):
     """The whole reason playwrong exists: one call gets a page that plain HTTP cannot."""
     say(f"    fetching {CF_URL} — a real Turnstile wall (slow: the solve loop clicks and waits)")
@@ -331,6 +419,7 @@ def main():
             say("\n(--offline: skipped the live browser tests)")
         else:
             live_tests(c)
+            short_transfer_tests(c)
             if a.cloudflare:
                 cloudflare_test(c)
     finally:

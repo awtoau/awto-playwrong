@@ -123,9 +123,17 @@ def t_pdf(url, path=None, max_chars=40000):
 
 def t_download(url, path=None, expect_sha256=None, expect_size=None):
     r = connect.download(url, path=path, expect_sha256=expect_sha256, expect_size=expect_size)
+    if r.get("expected_bytes") is not None:
+        checked = "matches Content-Length"
+    elif r.get("via") == "browser":
+        checked = "fetched in the browser, which enforces Content-Length"
+    else:
+        checked = "server sent no Content-Length, so completeness is unchecked"
     lines = [f"Saved: {r['path']}",
-             f"Bytes: {r['bytes']:,}",
+             f"Bytes: {r['bytes']:,} ({checked})",
              f"SHA256: {r['sha256']}"]
+    if r.get("resumed"):
+        lines.append(f"Resumed {r['resumed']} time(s) after the server closed the connection early")
     if r.get("content_type"):
         lines.append(f"Content-Type: {r['content_type']}")
     if r.get("final_url") and r["final_url"] != url:

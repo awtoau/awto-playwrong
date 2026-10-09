@@ -17,6 +17,7 @@ an ImportError.
 import base64
 import hashlib
 import html as htmlmod
+import http.client
 import itertools
 import json
 import os
@@ -663,6 +664,9 @@ BROWSER_CHUNK = 4 << 20
 BOT_BLOCK_STATUSES = (403, 429, 503)
 # Seconds per urllib socket op (connect, TTFB, each read). Derivation + measurements: issue #30.
 HTTP_READ_TIMEOUT = 1.0
+# Range re-requests after a server hangs up before Content-Length (#31). Each must add bytes, so this
+# only bounds a server that drops every connection; past it -> browser fallback.
+RESUME_TRIES = 8
 
 
 def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=20, profile=None,
@@ -720,6 +724,62 @@ def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=
     return total, head.get("type", ""), head.get("url") or url, digest.hexdigest()
 
 
+class _CutOff(Exception):
+    """The body ended early in a way Content-Length can't express (chunked, no length)."""
+
+
+def _http_download(url, headers, path, digest):
+    """Stream `url` to `path` over urllib, resuming with Range when the server hangs up early.
+
+    - http.client's read(amt) returns b"" on an early close instead of raising (#31), so the
+      length is checked here. Returns (total, ctype, final_url, expected_or_None, resumed).
+    """
+    total, resumed, f = 0, 0, None
+    try:
+        # Per socket op: ~1.25x a far server's worst single op; expiry -> browser fallback (#30).
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=HTTP_READ_TIMEOUT) as r:
+            ctype, final = r.headers.get("Content-Type", ""), r.geturl()
+            cl = r.headers.get("Content-Length", "")
+            expected = int(cl) if cl.isdigit() else None
+            resumable = expected is not None and r.headers.get("Accept-Ranges", "") == "bytes"
+            f = open(path, "wb")
+            total, cut = _copy(r, f, digest, total)
+        if cut and expected is None:
+            raise _CutOff(f"body ended after {total:,} bytes ({cut})")
+        while resumable and total < expected and resumed < RESUME_TRIES:
+            req = urllib.request.Request(url, headers={**headers, "Range": f"bytes={total}-"})
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_READ_TIMEOUT) as r:
+                    if r.status != 206 or not r.headers.get("Content-Range", "").startswith(
+                            f"bytes {total}-"):
+                        break                    # Range ignored: appending would corrupt the file
+                    before = total
+                    total, _ = _copy(r, f, digest, total)
+            except (urllib.error.URLError, OSError):
+                break
+            resumed += 1
+            if total == before:
+                break
+        return total, ctype, final, expected, resumed
+    finally:
+        if f:
+            f.close()
+
+
+def _copy(r, f, digest, total):
+    """Copy one response body in 1 MiB reads, never r.read() whole (issue #11). Returns (total, cut);
+    cut names why the body stopped early, or is None."""
+    try:
+        while chunk := r.read(1 << 20):
+            f.write(chunk); digest.update(chunk); total += len(chunk)
+    except http.client.IncompleteRead:
+        return total, "chunked encoding cut off before its final chunk"
+    except OSError as e:
+        return total, f"connection lost: {e}"
+    return total, None
+
+
 def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None,
              expect_sha256=None, expect_size=None):
     """Fetch a file (firmware, archive, image, PDF, …) from behind a bot wall and write it to disk.
@@ -738,7 +798,6 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
                               profile=profile)
     if on_start:
         on_start(f"downloading with the cleared session ({len(headers.get('Cookie',''))} B of cookies)")
-    req = urllib.request.Request(url, headers=headers)
     if path is None:
         name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
         path = os.path.join(DATA, name)
@@ -748,21 +807,13 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
         if parent:
             os.makedirs(parent, exist_ok=True)   # sources/ may not exist yet; a missing dir is not
     digest = hashlib.sha256()                    # a reason to throw away a download that worked
-    total = 0
-    refused = None
+    total, expected, resumed, refused = 0, None, 0, None
     try:
-        # Streamed in 1 MiB chunks, never r.read() into memory: one 750 MB file read whole is 750 MB
-        # of RSS in the calling agent (issue #11).
-        # Per socket op: ~1.25x a far server's worst single op; expiry -> browser fallback (#30).
-        with urllib.request.urlopen(req, timeout=HTTP_READ_TIMEOUT) as r:
-            ctype = r.headers.get("Content-Type", "")
-            final = r.geturl()
-            with open(path, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk); digest.update(chunk); total += len(chunk)
+        total, ctype, final, expected, resumed = _http_download(url, headers, path, digest)
+        if expected is not None and total < expected:
+            refused = f"short transfer: {total:,} of {expected:,} bytes over plain HTTP"
+    except _CutOff as e:
+        refused = f"short transfer: {e}"
     except urllib.error.HTTPError as e:
         if e.code not in BOT_BLOCK_STATUSES:
             raise EngineError(f"download failed: HTTP {e.code} {e.reason} for {url}") from e
@@ -774,13 +825,21 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
         # The CDN turned away urllib despite the cleared session; the browser's own stack gets through.
         if on_start:
             on_start(f"plain HTTP refused ({refused}); downloading inside the browser tab")
-        total, ctype, final, sha = _download_in_browser(url, path, port=port, on_start=on_start,
-                                                        solve=solve, tries=tries, profile=profile)
-        via = "browser"
+        try:
+            total, ctype, final, sha = _download_in_browser(url, path, port=port, on_start=on_start,
+                                                            solve=solve, tries=tries, profile=profile)
+        except EngineError as e:
+            if refused.startswith("short transfer") and os.path.exists(path):
+                # Off the requested path: a later "does sources/fw.bin exist?" must not see it.
+                os.replace(path, path + ".partial")
+                raise EngineError(f"{refused} for {url}; the browser fetch failed too ({e}). "
+                                  f"Partial file kept at {path}.partial") from e
+            raise
+        via, expected = "browser", None
     else:
         sha = digest.hexdigest()
     out = {"path": path, "bytes": total, "content_type": ctype, "final_url": final,
-           "sha256": sha, "via": via}
+           "sha256": sha, "via": via, "expected_bytes": expected, "resumed": resumed}
     if refused:
         out["http_error"] = refused
     # Verification against a publisher-stated value, when the caller has one. The file is KEPT on a
