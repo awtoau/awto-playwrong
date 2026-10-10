@@ -12,13 +12,12 @@ ALWAYS runs against an isolated port, never the shared engine on 8731 — the te
 browser, and the shared one carries everyone's cleared Turnstile session. The pid it kills comes from
 that engine's own /status, so it cannot pick the wrong Chrome.
 
-Four states are covered: the engine's current tab closed from outside while Chrome lives (#22), a
-closed window (Chrome exits with its last tab), a browser crash (SIGKILL), and the ENGINE process
-itself being killed — #19, where every later call reported
-"engine op 'newtab' failed: timed out" instead of saying the engine was gone. NOT covered: the process alive with its websockets dead, reported in issue #6.
-Closing targets from outside cannot produce it — Chrome exits with the last one — and nothing else
-reachable from a test kills a socket while sparing the process. That path (`_reattach`, taken when
-`gone()` is false) is exercised in production and not here; treat it as untested code.
+States covered:
+- the engine's current tab closed from outside while Chrome lives (#22)
+- websocket dead, process alive (#6) -> `_reattach`; must keep the same Chrome, not orphan it (#33).
+  Forced via the `_test_forget` op, which the engine only accepts with PH_TEST_HOOKS=1 (set here).
+- a closed window (Chrome exits with its last tab), and a browser crash (SIGKILL)
+- the ENGINE process itself killed (#19): later calls must say the engine is gone, not "timed out"
 
 Results: tmp/logs/recovery-test.log
 """
@@ -128,6 +127,7 @@ def main():
 
     os.makedirs(LOGDIR, exist_ok=True)
     _fh = open(LOG, "w")
+    os.environ["PH_TEST_HOOKS"] = "1"        # inherited by the engine this test starts (case 1c)
     say(f"recovery test — engine :{a.port}, killing its browser and expecting it back\n")
 
     try:
@@ -167,6 +167,23 @@ def main():
                json.dumps(r))
         except connect.EngineError as e:
             ok("untagged op still works after the tagged tab closes", False, str(e)[:140])
+
+        # 1c. Socket dead, process alive (#6) -> _reattach. The attached handle owned no process, so
+        #     gone() read True and the NEXT op launched a second Chrome, orphaning this one (#33).
+        pid = status(a.port).get("chrome_pid")
+        try:
+            connect.call("_test_forget", port=a.port)
+            hooked = True
+        except connect.EngineError as e:
+            hooked = False
+            ok("test hook available (engine started with PH_TEST_HOOKS=1)", False, str(e)[:140])
+        if hooked:
+            for i in (1, 2):                 # 1 reattaches; 2 is where the relaunch used to happen
+                r = connect.capture(URL, port=a.port, max_chars=200)
+                ok(f"fetch {i} after a reattach works", "Example Domain" in r["text"])
+            st = status(a.port)
+            ok("reattach keeps the same Chrome", st.get("chrome_pid") == pid and
+               st.get("alive") is True, f"was {pid}, now {st.get('chrome_pid')}")
 
         # 2. Someone closes the window — the likeliest real cause. Closing every page target from
         #    the DevTools endpoint is what that does, and Chrome exits with its last tab.
@@ -248,6 +265,16 @@ def main():
                    "Example Domain" in r["text"], f"{time.monotonic()-t0:.1f}s")
             except connect.EngineError as e:
                 ok("an op after the engine died restarts it and succeeds", False, repr(e)[:140])
+            # A SIGKILLed engine can't close its Chrome. This test made that orphan, so it closes it;
+            # every run used to leave one behind.
+            orphan = st.get("chrome_pid")
+            if orphan:
+                try:
+                    os.kill(orphan, signal.SIGTERM)
+                except OSError:
+                    pass
+                ok("the killed engine's Chrome is closed", wait_dead(orphan) is not None,
+                   f"pid {orphan}")
         else:
             ok("engine process found for the kill test", False, "no engine pid for this port")
 

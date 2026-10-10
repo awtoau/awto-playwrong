@@ -495,7 +495,13 @@ class ND:
         if not info.get("host"): return False
         old = self.browser
         try:
-            self.browser = await uc.start(host=info["host"], port=info["port"])
+            new = await uc.start(host=info["host"], port=info["port"])
+            # An attached handle owns no process, so gone() read True and the next op launched a
+            # second Chrome, orphaning this one (#33). Carry ours over.
+            if old is not None and getattr(new, "_process", None) is None:
+                new._process = getattr(old, "_process", None)
+                new._process_pid = getattr(old, "_process_pid", None)
+            self.browser = new
             self.tab = await self.browser.get("about:blank")
             self._dead = False
             log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
@@ -1325,6 +1331,10 @@ class H(BaseHTTPRequestHandler):
         op=self.path.strip("/")
         if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
+        if op=="_test_forget" and os.environ.get("PH_TEST_HOOKS")=="1":
+            # recovery_test.py only: the websocket-dead-process-alive state (#6) nothing else can make.
+            B.loop.call_soon_threadsafe(B.forget, "test hook"); B.run(asyncio.sleep(0))
+            self._j({"ok":1}); return
         with _INFLIGHT_LOCK: _INFLIGHT[0]+=1
         try:
             t0=time.monotonic(); before=proc_status_mb("VmRSS"); r=B.do(op,a)

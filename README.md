@@ -153,7 +153,7 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
 | `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume; `--exclude` drops matching links. No browser or network needed. |
 | `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
-| `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Isolated port only — it refuses to run on 8731. |
+| `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Also forces a reattach (`PH_TEST_HOOKS=1`) and checks it keeps the same Chrome (#33). Isolated port only — it refuses to run on 8731. |
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline. The regression guard for #23, where every closed tab left ~20 MB behind. |
 | `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
 | `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
