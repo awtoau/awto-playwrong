@@ -125,7 +125,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ## Endpoints (the real contract — nodriver engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}, pid, rss_mb, swap_mb, fds, cdp_sockets, tabs, threads, uptime_s, memory_cap, rss_limit_mb}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live; the memory fields are the engine's own `/proc` reading (#23) |
+| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}, pid, rss_mb, swap_mb, fds, cdp_sockets, tabs, threads, uptime_s, scope_current_mb, scope_peak_mb, scope_unreclaimable_mb, scope_max_mb, scope_oom_kills, memory_cap, rss_limit_mb}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live; the memory fields are the engine's own `/proc` reading (#23) |
 | POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
 | POST | `/goto` | `{url, no_js?}` | `{title, url, requested, ready_state}` — navigates (2s settle, then up to `LOAD_WAIT` for `ready_state` `complete`; anything else means the page was still loading, #32; `null` under `no_js`). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Set `no_js=true` to disable JS execution in Chrome (e.g. to bypass client-side paywall script truncation). Storing the requested url records a page you may never have got. |
 | POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
@@ -189,9 +189,19 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 - **Memory is measured, capped and fatal, in that order (#23).** Every `tmp/nd-server.log` line
   carries `pid=`; every op logs `op_done op= ms= rss_mb=`; a watchdog logs `mem` every 60s with the
   same fields `/status` reports (`rss_mb`, `fds`, `cdp_sockets`, `tabs`, `threads`). The engine
-  re-execs itself into a systemd user scope (`MemoryMax`, `MemorySwapMax=0`, `OOMPolicy=kill`,
-  default `PH_MEMORY_MAX=8G`, `0` disables) so a leak takes the engine, never the host; `/status`
-  `memory_cap` says what was achieved. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
+  re-execs itself into a systemd user scope (`MemoryMax`, `MemorySwapMax=0`, `OOMPolicy=continue`,
+  default `PH_MEMORY_MAX=8G`, `0` disables) so a leak never takes the host; `/status`
+  `memory_cap` says what was achieved.
+- **Out of memory loses one tab, not the engine (#28).**
+  - `OOMPolicy=continue` (`memory.oom.group=0`): the kernel kills its top scorer, a renderer.
+  - Ops on that tab then raise `TabCrashed` ("this tab's renderer was killed …") instead of hanging;
+    `close_tab` still works. Logged as `renderer_crashed`.
+  - `newtab`/`prefetch` raise `MemoryHighWater` above `PH_MEMORY_HIGH_WATER` (0.85) of the cap, counting
+    unreclaimable memory (anon + shmem + kernel − reclaimable slab).
+  - The `mem` line adds `scope_*_mb`, `scope_oom_kills` and `top_renderers=pid:MB`; `tab_mem` lines give
+    each connected tab's JS heap + array buffers.
+  - Chrome's browser process moves itself into its own uncapped `app-com.google.Chrome-<pid>.scope`;
+    renderers, GPU and utilities stay under the cap. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
   `rss_limit`, stops Chrome and exits 3 — the next call restarts it. `cdp_sockets` is the number to
   watch: it counts every process's connections to this Chrome, so the engine's own share tracks its
   tab count (277 for 3 tabs was the leak) and a high count next to a small `fds` means a client

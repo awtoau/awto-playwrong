@@ -216,6 +216,58 @@ def proc_status_mb(key):
 # crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
 CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
 CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
+# New tabs are refused above this share of the cap held as unreclaimable memory, so a caller backs
+# off before the kernel has to kill a renderer (#28).
+HIGH_WATER = float(os.environ.get("PH_MEMORY_HIGH_WATER", "0.85"))
+# Per-tab heap query in the 60 s mem line: a local CDP round trip is ms; a tab busy in JS answers
+# late, and 1 s is past that. On expiry the tab is logged heap_mb=None ("busy"), not waited on.
+HEAP_QUERY_TIMEOUT = 1.0
+
+# How long a dropped tab socket waits for the matching Target.targetCrashed before it is treated as
+# the browser dying: a local CDP event lands in ms, 0.25 s is far past that and still short.
+CRASH_EVENT_WAIT = 0.25
+
+class TabCrashed(RuntimeError):
+    """An op aimed at a tab whose renderer process is gone (#28)."""
+
+class MemoryHighWater(RuntimeError):
+    """A new tab was refused because the engine's scope is near its memory cap (#28)."""
+
+def scope_mb():
+    """The engine scope's memory in MB, from its cgroup files: current/peak/unreclaimable/max."""
+    m = memcap.cgroup_memory()
+    out = {f"scope_{k}_mb": (v >> 20 if v is not None else None) for k, v in m.items()}
+    return {**out, "scope_oom_kills": memcap.oom_kills()}
+
+def top_renderers(n=3):
+    """The n largest Chrome renderers in this scope as "pid:MB", from /proc; no CDP traffic."""
+    out = []
+    try:
+        pids = open(f"{memcap._cgroup_dir()}/cgroup.procs").read().split()
+    except (OSError, TypeError):
+        return ""
+    for pid in pids:
+        try:
+            if b"--type=renderer" not in open(f"/proc/{pid}/cmdline", "rb").read():
+                continue
+            for line in open(f"/proc/{pid}/status"):
+                if line.startswith("VmRSS"):
+                    out.append((int(line.split()[1]) >> 10, pid))
+        except (OSError, ValueError):
+            continue
+    return ",".join(f"{pid}:{mb}" for mb, pid in sorted(out, reverse=True)[:n])
+
+def check_headroom(what):
+    """Raise MemoryHighWater when unreclaimable memory is over HIGH_WATER of the cap."""
+    m = memcap.cgroup_memory()
+    if m.get("max") and m["unreclaimable"] > HIGH_WATER * m["max"]:
+        used, cap = m["unreclaimable"] >> 20, m["max"] >> 20
+        log("high_water", refused=what, unreclaimable_mb=used, max_mb=cap, high_water=HIGH_WATER)
+        raise MemoryHighWater(
+            f"engine memory high-water: {used} MB unreclaimable of the {cap} MB cap "
+            f"(over {HIGH_WATER:.0%}), so {what} was refused. Close tabs you no longer need, "
+            f"or retry once other work finishes.")
+
 # Seconds past the 2 s settle to wait for readyState "complete": ~1.25x the worst seen (#32).
 # Expiry flags the capture partial, never silent; longer would tax every page whose load never fires.
 LOAD_WAIT = 5.0
@@ -244,7 +296,7 @@ def mem_snapshot():
         fds = None
     return {"pid": PID, "rss_mb": proc_status_mb("VmRSS"), "swap_mb": proc_status_mb("VmSwap"),
             "fds": fds, "cdp_sockets": cdp_sockets(), "threads": threading.active_count(),
-            "tabs": B.tab_count(), "uptime_s": int(time.monotonic() - STARTED)}
+            "tabs": B.tab_count(), "uptime_s": int(time.monotonic() - STARTED), **scope_mb()}
 
 def _memwatch():
     """Every 60s: log a `mem` line and apply the RSS trigger (idle growth has no op to catch it on).
@@ -253,7 +305,12 @@ def _memwatch():
     while True:
         time.sleep(60)
         s = mem_snapshot()
-        log("mem", **s)
+        log("mem", **s, top_renderers=top_renderers())
+        try:
+            for h in B.run_timeout(B._tab_heaps(), HEAP_QUERY_TIMEOUT + 1.0):
+                log("tab_mem", **h)
+        except Exception as e:
+            log("tab_mem_err", e=repr(e)[:80])
         B.loop.call_soon_threadsafe(B._reap_jobs)
         check_rss("watchdog")
 
@@ -398,6 +455,7 @@ class ND:
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
         self._dead = False      # set when an op hits a dropped connection; cleared by _ensure()
+        self.crashed = {}       # target_id -> crash status, from Target.targetCrashed (#28)
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
         self.jobs = {}          # prefetch job id -> {slots, total, delivered}
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
@@ -503,6 +561,7 @@ class ND:
                 new._process_pid = getattr(old, "_process_pid", None)
             self.browser = new
             self.tab = await self.browser.get("about:blank")
+            await self._watch_crashes()
             self._dead = False
             log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
             if old is not None:
@@ -545,9 +604,23 @@ class ND:
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
             adopted = ensure_display()
             if adopted: log("display_adopted", **adopted)
-            self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
+            kills = memcap.oom_kills()
+            try:
+                self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
+            except Exception as e:
+                # nodriver blames root/sandbox for any launch failure; under the cap the usual
+                # cause is the kernel killing Chrome's processes, which memory.events records (#28).
+                after = memcap.oom_kills()
+                if kills is not None and after is not None and after > kills:
+                    raise RuntimeError(
+                        f"Chrome could not start: the kernel OOM-killed {after - kills} of its "
+                        f"processes under the engine's {MEMORY_CAP} memory cap. Raise PH_MEMORY_MAX "
+                        f"(it is set when the engine starts).") from e
+                raise
             self.tab = await self.browser.get("about:blank")
             self._publish_cdp()
+            self.crashed.clear()
+            await self._watch_crashes()
             log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
     async def _start(self):
         """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
@@ -611,7 +684,66 @@ class ND:
     async def _cdp_info(self):
         await self._ensure()
         return getattr(self,"_cdp",{"error":"not published"})
+    async def _watch_crashes(self):
+        """Hear renderer crashes on the browser connection, so a killed tab fails by name (#28).
+        Without this, an op on a tab whose renderer the kernel OOM-killed hung until the client
+        timed out, which reads as a wedged engine."""
+        try:
+            self.browser.add_handler(cdp.target.TargetCrashed, self._on_crash)   # Browser is the
+            await self.browser.send(cdp.target.set_discover_targets(discover=True))  # connection
+        except Exception as e:
+            log("crash_watch_err", e=repr(e)[:100])
+    def _on_crash(self, ev, conn=None):
+        self.crashed[ev.target_id] = ev.status
+        log("renderer_crashed", target=ev.target_id[:8], status=ev.status, code=ev.error_code,
+            owner=self.owners.get(ev.target_id), memory_cap=MEMORY_CAP, **scope_mb())
+        err = self._crash_error(ev.target_id)
+        async def dead_send(*a, **k):
+            raise err
+        for t in list(self.browser.tabs if self.browser else []):
+            if getattr(getattr(t, "target", None), "target_id", None) == ev.target_id:
+                t.send = dead_send            # later commands: they would wait on the dead renderer
+                try:
+                    t._fail_pending_futures(err)   # commands already in flight
+                except Exception as e:
+                    log("crash_fail_pending_err", e=repr(e)[:80])
+    async def _crash_for(self, ref):
+        """TabCrashed if the tab `ref` names has crashed, else None. A dying renderer also closes its
+        tab's socket, which must not read as the BROWSER dying: forget() would drop every agent's
+        tags. The crash event can land just after the socket error; CRASH_EVENT_WAIT covers that."""
+        tid = (self.tags.get(ref) if isinstance(ref, str) else
+               getattr(getattr(self.tab, "target", None), "target_id", None))
+        t0 = time.monotonic()
+        while tid and time.monotonic() - t0 < CRASH_EVENT_WAIT:
+            if tid in self.crashed:
+                return self._crash_error(tid)
+            await asyncio.sleep(0.02)
+        return None
+    async def _close_tab_obj(self, t):
+        """Tab.close(), except for a crashed tab: its own session routes to the dead renderer and
+        never answers, so close it through the browser connection (#28)."""
+        tid = getattr(getattr(t, "target", None), "target_id", None)
+        if tid not in self.crashed:
+            return await t.close()
+        await self.browser.send(cdp.target.close_target(target_id=tid))
+        try:
+            await asyncio.wait_for(t.aclose(), 1.0)       # a local socket close is ms
+        except Exception as e:
+            log("crashed_tab_aclose_err", e=repr(e)[:80])
+        self.crashed.pop(tid, None)
+    def _crash_error(self, tid):
+        return TabCrashed(
+            f"this tab's renderer was killed ({self.crashed.get(tid)}), so its page is gone. Under "
+            f"the engine's {MEMORY_CAP} memory cap that usually means the page ran out of memory; "
+            f"other tabs are unaffected. Close it (close_tab) and open a new one.")
     async def _tab(self, ref=None):
+        """_resolve_tab(), refusing a tab whose renderer crashed (#28)."""
+        t = await self._resolve_tab(ref)
+        tid = getattr(getattr(t, "target", None), "target_id", None)
+        if tid in self.crashed:
+            raise self._crash_error(tid)
+        return t
+    async def _resolve_tab(self, ref=None):
         """Resolve a tab reference to a live Tab.
 
         THIS is what makes one browser safe for many agents. Every op used to act on self.tab — the
@@ -813,10 +945,30 @@ class ND:
             await self._refresh()
         log("tab_repointed", why=why,
             target=getattr(getattr(self.tab, "target", None), "target_id", None))
+    async def _tab_heaps(self):
+        """Per-tab JS heap + array-buffer MB for the mem log (#28), queried concurrently."""
+        if self.browser is None:
+            return []
+        async def heap_mb(t):
+            if getattr(t, "socket", None) is None:
+                return "unconnected"          # querying would open a socket per tab: the #23 leak
+            try:
+                _, total, _, backing = await asyncio.wait_for(
+                    t.send(cdp.runtime.get_heap_usage()), HEAP_QUERY_TIMEOUT)
+                return int(total + backing) >> 20
+            except Exception:
+                return None                   # busy, crashed, or not a page; logged as such
+        async def one(t):
+            tid = getattr(getattr(t, "target", None), "target_id", None)
+            return {"target": (tid or "")[:8], "owner": self.owners.get(tid),
+                    "heap_mb": await heap_mb(t),
+                    "url": (getattr(getattr(t, "target", None), "url", "") or "")[:60]}
+        return await asyncio.gather(*(one(t) for t in list(self.browser.tabs)))
     async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
         """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
         a re-opened tab straight back to the op that asked for it."""
         await self._ensure()
+        check_headroom("a new tab")
         await self._maybe_recycle()
         self.fetches += 1
         t = await self.browser.get(url, new_tab=True)
@@ -946,9 +1098,9 @@ class ND:
         for i, t in targets:
             try:
                 tid = getattr(getattr(t,"target",None),"target_id",None)
-                await t.close()
+                await self._close_tab_obj(t)
                 await self._release(t)
-                closed+=1; ids.add(tid)
+                closed+=1; ids.add(tid); self.crashed.pop(tid, None)
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
         await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
@@ -981,7 +1133,7 @@ class ND:
                 continue
             try:
                 ids.add(getattr(getattr(t,"target",None),"target_id",None))
-                await t.close(); n+=1
+                await self._close_tab_obj(t); n+=1
                 await self._release(t)
             except Exception: pass
         await self._await_closed(ids)
@@ -1068,6 +1220,7 @@ class ND:
         slots = self.jobs[job]["slots"]
 
         async def load(i, url, tabs):
+            check_headroom("a prefetch tab")
             t = await self.browser.get("about:blank", new_tab=True)
             tabs[i] = t                         # recorded so a timeout can still close it
             tid = getattr(getattr(t, "target", None), "target_id", None)
@@ -1121,7 +1274,7 @@ class ND:
                 finally:
                     t = tabs.get(i)
                     if t is not None:
-                        try: await t.close()
+                        try: await self._close_tab_obj(t)
                         except Exception: pass
                         await self._release(t)
 
@@ -1214,6 +1367,10 @@ class ND:
             try: return self.run(self._guarded(m[op]()))
             except Exception as e:
                 dead = _dead_conn(e)
+                if dead:
+                    crash = self.run(self._crash_for(a.get("tab")))
+                    if crash is not None:
+                        dead, e = False, crash
                 # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or
                 # line is nearly useless when the cause is three frames down in a helper.
                 log("op_err",op=op,e=repr(e)[:120],dead_conn=dead,attempt=attempt,
@@ -1369,7 +1526,7 @@ if __name__=="__main__":
               file=sys.stderr)
         sys.exit(0)
     # May re-exec this process under a capped systemd scope; see engine/memcap.py (#23).
-    MEMORY_CAP = memcap.enter("engine", MEMORY_MAX, log)
+    MEMORY_CAP = memcap.enter("engine", MEMORY_MAX, log, oom_policy="continue")
     log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,
         chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()

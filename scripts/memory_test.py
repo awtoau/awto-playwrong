@@ -24,8 +24,12 @@ set so low that one tab cycle trips it:
                                                # the next call is served by a new pid
     python scripts/memory_test.py --recycle    # PH_CHROME_MAX_FETCHES=3: chrome_recycle logged,
                                                # a different chrome_pid, the caller's tab still works
-    python scripts/memory_test.py --cap        # PH_MEMORY_MAX=200M: the kernel kills the scope
-                                               # (Chrome alone exceeds it), the next call respawns
+    python scripts/memory_test.py --cap        # PH_MEMORY_MAX=200M: Chrome can't fit; the kernel
+                                               # kills inside the scope, the engine stays up and
+                                               # the launch error names the cap
+    python scripts/memory_test.py --shed       # PH_MEMORY_MAX=1500M + a tab allocating ~1 GB/s:
+                                               # the kernel kills that renderer only (#28)
+    python scripts/memory_test.py --high-water # PH_MEMORY_HIGH_WATER=0.01: newtab is refused by name
 
 Results: tmp/logs/memory-test.log
 """
@@ -47,6 +51,16 @@ LOG = os.path.join(LOGDIR, "memory-test.log")
 # A page with a few thousand DOM nodes, served from the url itself so the test needs no network.
 # get_content() on it pulls a DOM.getDocument tree of that size — the payload that leaked in #23.
 PAGE = "data:text/html," + urllib.parse.quote("<title>memtest</title>" + "<p>node</p>" * 2000)
+
+# Allocates ~52 MB of array buffer every 50 ms (~1 GB/s), touching every page so it is RSS. Array
+# buffers sit outside V8's heap limit, so the cgroup cap is reached first.
+HOG = "data:text/html," + urllib.parse.quote(
+    "<title>memhog</title><script>const a=[];setInterval(()=>{const b=new Float64Array(6.5e6);"
+    "b.fill(1);a.push(b)},50)</script>")
+SHED_CAP = "1500M"
+# Hog headroom: <= 1.5 GB at ~1 GB/s = 1.5 s, x1.25 ~ 2 s; 3 s also covers the op round trips.
+# On expiry the test fails naming the budget.
+SHED_BUDGET = 3.0
 
 # Thresholds. Before the fix one cycle on this page leaked ~10 MB and one CDP socket; after it the
 # socket count is flat and RSS moves by allocator noise. 1 MB per cycle is 10x below the leak and
@@ -220,7 +234,7 @@ def guard_recycle(port):
 
 
 def guard_cap(port):
-    """Step 3 of #23: the cgroup cap kills the scope when Chrome + python exceed it."""
+    """#23's cgroup cap, under #28's policy: the kernel kills inside the scope, the engine survives."""
     if not connect.reachable(port):
         # ensure() would raise when Chrome dies mid-launch; spawn and wait for the port instead.
         saved = os.environ.get("PH_MEMORY_MAX")
@@ -237,19 +251,102 @@ def guard_cap(port):
     ok("engine reports the cap", s.get("memory_cap") == "200M", str(s.get("memory_cap")))
     try:
         connect.call("start", port=port, timeout=120.0)      # Chrome alone exceeds 200M
-        cycle(port, 0)
-        say("  ops completed under the cap")
+        err = ""
     except connect.EngineError as e:
-        say(f"  op under the cap: {str(e)[:100]}")
-    gone = wait_gone(port, pid, 30.0)
-    ok("scope was killed by the cap", gone, f"pid {pid}" + ("" if gone else " survived 30s"))
+        err = str(e)
+    ok("Chrome's launch failure names the memory cap", "memory cap" in err, err[:200])
+    s2 = status(port)
+    ok("engine stays up under the cap (#28: kill one process, not the scope)",
+       s2.get("pid") == pid, f"pid {pid} -> {s2.get('pid')}")
+    ok("status counts the kernel's kills", (s2.get("scope_oom_kills") or 0) > 0,
+       f"scope_oom_kills={s2.get('scope_oom_kills')}")
     r = subprocess.run(["sudo", "-n", "journalctl", "-k", "--since", "-3min", "--no-pager",
                         "-o", "short-iso", "--grep", "Memory cgroup out of memory|oom-kill"],
                        capture_output=True, text=True)
     kern = [x for x in r.stdout.splitlines() if "oom" in x.lower()]
     say("  kernel: " + (kern[-1][:160] if kern else "no oom line readable (journalctl needs sudo -n)"))
-    s2 = status_after_respawn(port)
-    ok("next call respawns an engine", s2.get("pid") not in (None, pid), f"pid {pid} -> {s2.get('pid')}")
+
+
+def scope_file(pid, name):
+    """A cgroup file of the scope `pid` runs in, or None."""
+    try:
+        path = open(f"/proc/{pid}/cgroup").read().split("::", 1)[1].strip()
+        return open(f"/sys/fs/cgroup{path}/{name}").read().strip()
+    except (OSError, IndexError):
+        return None
+
+
+def guard_shed(port):
+    """#28: one tab blowing the cap loses that tab only; the engine and other tabs survive."""
+    s = fresh_engine(port, PH_MEMORY_MAX=SHED_CAP, PH_MEMORY_HIGH_WATER="0.99")
+    pid = s["pid"]
+    ok("engine scope kills one process, not the group", scope_file(pid, "memory.oom.group") == "0",
+       f"memory.oom.group={scope_file(pid, 'memory.oom.group')}")
+    ok("status reports scope memory", s.get("scope_max_mb") == 1500,
+       f"scope_current_mb={s.get('scope_current_mb')} scope_max_mb={s.get('scope_max_mb')}")
+    connect.call("newtab", port=port, url="about:blank", tag="shed-bystander", owner="memory_test")
+    connect.call("goto", port=port, url=PAGE, tab="shed-bystander")
+    connect.call("newtab", port=port, url=HOG, tag="shed-hog", owner="memory_test")
+    t0, err = time.monotonic(), None
+    while time.monotonic() - t0 < SHED_BUDGET:
+        try:
+            connect.call("js", port=port, expr="1", tab="shed-hog", timeout=SHED_BUDGET)
+        except connect.EngineError as e:
+            err = str(e)
+            break
+        time.sleep(0.1)   # the hog grows ~100 MB per poll
+    dt = time.monotonic() - t0
+    say(f"  op on the hog tab after {dt:.1f}s: {err!r}"[:300])
+    ok("an op on the killed tab fails, not hangs", err is not None and "timed out" not in err,
+       f"{dt:.1f}s of a {SHED_BUDGET}s budget")
+    ok("the error names the killed renderer", err is not None and "renderer" in err.lower(),
+       (err or "")[:160])
+    t1 = time.monotonic()
+    try:
+        r = connect.call("closetab", port=port, tag="shed-hog", timeout=10.0)
+        ok("the killed tab can be closed", r.get("closed") == 1,
+           f"{r} in {time.monotonic() - t1:.1f}s")
+    except connect.EngineError as e:
+        ok("the killed tab can be closed", False, str(e)[:160])
+    s2 = status(port)
+    ok("engine survived", s2.get("pid") == pid and s2.get("alive") is True,
+       f"pid {pid} -> {s2.get('pid')}, alive={s2.get('alive')}")
+    try:
+        r = connect.call("js", port=port, expr="document.title", tab="shed-bystander")
+        ok("the other tab still works", r.get("result") == "memtest", str(r)[:80])
+    except connect.EngineError as e:
+        ok("the other tab still works", False, str(e)[:160])
+    try:
+        connect.call("newtab", port=port, url="about:blank", tag="shed-after", owner="memory_test")
+        r = connect.call("goto", port=port, url=PAGE, tab="shed-after")
+        ok("a new tab works after the kill", r.get("title") == "memtest", str(r)[:80])
+    except connect.EngineError as e:
+        ok("a new tab works after the kill", False, str(e)[:160])
+    # Prefetch tabs are closed by the engine itself, in a finally that used to hang on a dead renderer.
+    job = connect.call("prefetch", port=port, urls=[HOG], concurrency=1, timeout=10)["job"]
+    t1, got = time.monotonic(), []
+    while time.monotonic() - t1 < 15 and not got:    # prefetch timeout 10 s, x1.25 + a poll
+        got = connect.call("collect", port=port, job=job).get("results", [])
+        time.sleep(0.25)
+    err = (got[0].get("error") or "") if got else ""
+    ok("a prefetch tab that blows the cap reports the crash", "renderer" in err.lower(),
+       f"{time.monotonic() - t1:.1f}s: {err[:120] or got}")
+    r = subprocess.run(["sudo", "-n", "journalctl", "-k", "--since", "-2min", "--no-pager",
+                        "-o", "short-iso", "--grep", "oom-kill|Killed process"],
+                       capture_output=True, text=True)
+    kern = [x for x in r.stdout.splitlines() if "killed process" in x.lower()]
+    say("  kernel: " + (kern[-1][:200] if kern else "no oom line readable (journalctl needs sudo -n)"))
+
+
+def guard_high_water(port):
+    """#28: past the high-water mark a new tab is refused with an error naming usage and cap."""
+    s = fresh_engine(port, PH_MEMORY_HIGH_WATER="0.01")
+    try:
+        connect.call("newtab", port=port, url="about:blank", tag="hw", owner="memory_test")
+        ok("newtab is refused past the high-water mark", False, "newtab succeeded")
+    except connect.EngineError as e:
+        ok("newtab is refused past the high-water mark", "high-water" in str(e), str(e)[:200])
+    ok("engine still serving", status(port).get("pid") == s["pid"])
 
 
 def status_after_respawn(port):
@@ -271,19 +368,30 @@ def main():
     ap.add_argument("--retire", action="store_true", help="exercise the RSS self-restart only")
     ap.add_argument("--recycle", action="store_true", help="exercise the Chrome recycle only")
     ap.add_argument("--cap", action="store_true", help="exercise the cgroup memory cap only")
+    ap.add_argument("--shed", action="store_true",
+                    help="a tab exceeding the cap loses only itself (#28)")
+    ap.add_argument("--high-water", action="store_true",
+                    help="newtab past PH_MEMORY_HIGH_WATER is refused by name (#28)")
     a = ap.parse_args()
     if a.port == connect.default_port():
         sys.exit(f"refusing to run against the shared engine on :{a.port}; pass --port")
     os.makedirs(LOGDIR, exist_ok=True)
     _fh = open(LOG, "w")
     say(f"memory_test port={a.port} cycles={a.cycles} {time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
-    if a.retire or a.recycle or a.cap:
+    if a.retire or a.recycle or a.cap or a.shed or a.high_water:
         if a.retire:
             guard_retire(a.port)
         if a.recycle:
             guard_recycle(a.port)
         if a.cap:
             guard_cap(a.port)
+        for flag, fn in ((a.shed, guard_shed), (a.high_water, guard_high_water)):
+            if flag:
+                if connect.reachable(a.port):    # each mode needs its own spawn-time limits
+                    prev = status(a.port).get("pid")
+                    connect.call("shutdown", port=a.port)
+                    wait_gone(a.port, prev, 50.0)
+                fn(a.port)
         if not a.keep:
             try:
                 connect.call("shutdown", port=a.port)

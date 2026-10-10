@@ -119,8 +119,9 @@ running a *second*, isolated browser.
 `scripts/install.py --link` puts `playwrong` on your PATH so you can drop the `./`.
 
 **The engine runs under a hard memory cap.** It re-execs itself into a systemd user scope with
-`MemoryMax=8G`, no swap and `OOMPolicy=kill`, so a leak kills the engine (which restarts on the next
-call) instead of the host — issue #23 was 39.5 GB and a hard reset. `PH_MEMORY_MAX=16G` raises it,
+`MemoryMax=8G`, no swap and `OOMPolicy=continue`, so running out kills the biggest renderer (one tab,
+which then fails by name) instead of the host or every client — #23 was 39.5 GB and a hard reset, #28
+was one OOM taking every tab. New tabs are refused above 85 % of the cap (`PH_MEMORY_HIGH_WATER`). `PH_MEMORY_MAX=16G` raises it,
 `PH_MEMORY_MAX=0` disables it; without a systemd user manager it runs uncapped and `/status` says so.
 `python -m crawl.run` gets the same treatment in a scope of its own, `PH_CRAWL_MEMORY_MAX` (default
 4G), because it attaches with its own nodriver (#26). An engine that a crawl spawns still gets its
@@ -154,7 +155,7 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume; `--exclude` drops matching links. No browser or network needed. |
 | `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
 | `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Also forces a reattach (`PH_TEST_HOOKS=1`) and checks it keeps the same Chrome (#33). Isolated port only — it refuses to run on 8731. |
-| `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline. The regression guard for #23, where every closed tab left ~20 MB behind. |
+| `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
 | `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
 | `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |

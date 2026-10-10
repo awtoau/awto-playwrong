@@ -4,12 +4,14 @@ Used by the engine (engine/server.py) and by crawl.run, which attaches to the sh
 own nodriver and leaked the same way (#23, #26). Stdlib only.
 
 - The process re-execs itself as `systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0
-  -p OOMPolicy=kill <same argv>`.
+  -p OOMPolicy=<oom_policy> <same argv>`.
 - MemorySwapMax=0 is the half that matters: MemoryMax alone makes the cgroup swap instead of die,
   which was the hour of thrash before the host OOM in #23.
 - Each ROLE gets its own scope. The marker env var names the role, so an engine spawned by a capped
   crawl re-execs into a scope of its own instead of sharing the crawl's cap and dying with it.
 - No systemd user manager -> runs uncapped and says so; it never refuses to start.
+- oom_policy: "kill" (default) kills the whole scope on one OOM; the engine passes "continue", so the
+  kernel kills only its top scorer, a renderer, and the other tabs survive (#28).
 """
 import os
 import shutil
@@ -28,17 +30,59 @@ def parse_size(s):
     return int(float(s[:-1]) * mult) if mult else int(s)
 
 
-def cgroup_memory_max():
-    """This process's cgroup memory.max in bytes; None when unlimited or unknown."""
+def _cgroup_dir():
     try:
-        path = open("/proc/self/cgroup").read().split("::", 1)[1].strip()
-        v = open(f"/sys/fs/cgroup{path}/memory.max").read().strip()
-        return None if v == "max" else int(v)
-    except (OSError, IndexError, ValueError):
+        return "/sys/fs/cgroup" + open("/proc/self/cgroup").read().split("::", 1)[1].strip()
+    except (OSError, IndexError):
         return None
 
 
-def enter(role, size, log=lambda *a, **k: None):
+def cgroup_memory_max():
+    """This process's cgroup memory.max in bytes; None when unlimited or unknown."""
+    try:
+        v = open(f"{_cgroup_dir()}/memory.max").read().strip()
+        return None if v == "max" else int(v)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def cgroup_memory():
+    """This scope's memory in bytes: current, peak, max (None = unlimited) and unreclaimable.
+
+    - unreclaimable = anon + shmem + kernel - slab_reclaimable. With MemorySwapMax=0 the kernel
+      can't free any of it, so it is what the OOM killer counts; page cache is not.
+    - {} when the cgroup files can't be read (no cgroup v2, not Linux)."""
+    d = _cgroup_dir()
+    if not d:
+        return {}
+    try:
+        stat = dict(line.split() for line in open(f"{d}/memory.stat"))
+        out = {"current": int(open(f"{d}/memory.current").read()),
+               "max": cgroup_memory_max(),
+               "unreclaimable": int(stat["anon"]) + int(stat["shmem"]) + int(stat["kernel"])
+                                - int(stat.get("slab_reclaimable", 0))}
+    except (OSError, ValueError, KeyError):
+        return {}
+    try:
+        out["peak"] = int(open(f"{d}/memory.peak").read())
+    except (OSError, ValueError):
+        out["peak"] = None            # memory.peak is kernel 5.19+
+    return out
+
+
+def oom_kills():
+    """Processes the kernel has OOM-killed in this scope (memory.events oom_kill); None if unknown."""
+    try:
+        for line in open(f"{_cgroup_dir()}/memory.events"):
+            k, v = line.split()
+            if k == "oom_kill":
+                return int(v)
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def enter(role, size, log=lambda *a, **k: None, oom_policy="kill"):
     """Re-exec under a capped scope for `role` unless already there. Returns a one-line summary of
     the cap in force (for /status and logs). `size` like '8G'; '0' or '' disables."""
     want = parse_size(size)
@@ -54,7 +98,7 @@ def enter(role, size, log=lambda *a, **k: None):
         log("memory_cap_unavailable", role=role, why="no systemd-run on PATH")
         return "none (no systemd-run)"
     base = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={want}",
-            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=kill"]
+            "-p", "MemorySwapMax=0", "-p", f"OOMPolicy={oom_policy}"]
     try:
         # Creating a scope is one D-Bus round trip to the user manager, ~50ms measured. 5s is
         # 100x; on expiry we run uncapped and log it — a stuck manager must not turn start into hang.
