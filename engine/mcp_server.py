@@ -176,13 +176,18 @@ def _numbered(hits):
 
 def t_search(query, max_results=10):
     hits = connect.search(query, max_results=max_results)
+    brave = getattr(hits, "engine", "duckduckgo") == "brave"
+    note = ("DuckDuckGo blocked this search; these results are from Brave Search, which loosens "
+            "queries. Check a result contains your exact terms before relying on it.\n\n"
+            if brave else "")
     if hits:
-        return _numbered(hits)
+        return note + _numbered(hits)
     # An empty result set is a RESULT. This used to say "no results parsed — DuckDuckGo may have
     # changed its markup", which reads as "the search did not run" and had agents recording "no such
     # thing exists" for queries that simply matched nothing (#10, #12). A genuine parse failure
     # raises from connect.search() instead, and says what arrived.
-    head = f"No results. The search ran; DuckDuckGo matched nothing for: {query}"
+    head = (f"No results. The search ran; {'Brave Search' if brave else 'DuckDuckGo'} matched "
+            f"nothing for: {query}")
     loose = connect.relax(query)
     if not loose:
         return (f"{head}\nNothing to relax — no quotes or operators to drop. The terms themselves "

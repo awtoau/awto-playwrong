@@ -348,7 +348,8 @@ class _ShortServer(http.server.BaseHTTPRequestHandler):
         elif self.path == "/resume.bin":
             self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n, "Accept-Ranges": "bytes"})
         elif self.path == "/mentions.html":       # #37: a page ABOUT bot checks is not one
-            b = b"<title>About bots</title><p>Sites ask you to verify you are human.</p>"
+            b = (b"<title>About bots</title><p>Sites ask you to verify you are human with "
+                 b"Cloudflare Turnstile.</p>")
             self._send(200, b, {"Content-Type": "text/html", "Content-Length": str(len(b))})
         elif self.path == "/slow.txt":
             self.send_response(200)

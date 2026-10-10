@@ -417,16 +417,18 @@ CHALLENGE = ("just a moment", "verify you are human", "checking your browser",
              "cf-chl", "challenge-platform")
 
 
-# Cloudflare's own challenge markup. The phrase alone is not enough: a page ABOUT Cloudflare (the
-# nodriver PyPI page) says "verify you are human" and ran the whole solve loop (#37).
-CF_MARKUP = ("challenges.cloudflare.com", "cf-chl", "challenge-platform", "turnstile")
+# Cloudflare's challenge MARKUP, as attributes: words are not enough. Pages ABOUT Cloudflare (the
+# nodriver PyPI page, search results on Turnstile) say "verify you are human" and "turnstile" in
+# their text, and each ran the whole solve loop (#37).
+CF_MARKUP = re.compile(r"""(src|action)=["'][^"']*(challenges\.cloudflare\.com|/cdn-cgi/challenge-"""
+                       r"""platform/)|id=["']cf-chl|name=["']cf-turnstile-response""", re.I)
 
 
 def is_challenge(page):
     t = (page.get("title") or "").lower()
-    h = (page.get("html") or "").lower()
+    h = page.get("html") or ""
     return any(k in t for k in CHALLENGE) or (
-        "verify you are human" in h and any(k in h for k in CF_MARKUP))
+        "verify you are human" in h.lower() and CF_MARKUP.search(h) is not None)
 
 
 def solve_timeout(tries):
@@ -588,41 +590,118 @@ def parse_ddg(html):
     return out
 
 
-def search(query, max_results=20, port=None, on_start=None, profile=None):
-    """DuckDuckGo results, through the real browser.
+BRAVE = "https://search.brave.com/search?q={}"
+_BRAVE_BLOCK = re.compile(r'<div class="snippet[^"]*"[^>]*data-type="web"(.*?)(?=<div class="snippet[^"]*"'
+                          r'[^>]*data-type=|</main>)', re.S | re.I)
+_BRAVE_LINK = re.compile(r'<a href="(https?://[^"]+)"', re.I)
+_BRAVE_TITLE = re.compile(r'<div class="title[^"]*"[^>]*title="([^"]*)"', re.I)
+# One DDG retry after a block, spaced so it is not the same burst. Whether it ever succeeds is what
+# the search log measures (#34); drop the retry if it never does.
+SEARCH_RETRY_WAIT = 2.0
+SEARCH_LOG = os.path.join(LOGDIR, "search.log")
 
-    DDG now answers curl with an image CAPTCHA ("select all squares containing a duck") on both the
-    lite and html endpoints — HTTP 202 and a challenge page instead of results, which silently breaks
-    the usual `curl lite.duckduckgo.com/lite/?q=` recipe. A real headed Chrome is not challenged at
-    all: nothing is being solved or bypassed here, the browser simply looks like a browser.
-    """
+
+class Hits(list):
+    """search() results; `.engine` says which engine answered ("duckduckgo" or "brave")."""
+    engine = "duckduckgo"
+
+
+def parse_brave(html):
+    """{title, url} from a Brave Search results page: one per `data-type="web"` snippet."""
+    out, seen = [], set()
+    for block in _BRAVE_BLOCK.findall(html or ""):
+        a, t = _BRAVE_LINK.search(block), _BRAVE_TITLE.search(block)
+        if not a:
+            continue
+        url = htmlmod.unescape(a.group(1))
+        if urllib.parse.urlparse(url).netloc.lower().endswith("brave.com") or url in seen:
+            continue
+        seen.add(url)
+        out.append({"title": " ".join(htmlmod.unescape(t.group(1) if t else url).split()),
+                    "url": url})
+    return out
+
+
+def _log_search(engine, query, outcome, n=0):
+    """One JSON line per engine attempt, so how often DDG blocks is a number, not a guess (#34)."""
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(SEARCH_LOG, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engine": engine,
+                                "outcome": outcome, "n": n, "owner": OWNER, "q": query[:200]}) + "\n")
+    except OSError:
+        pass
+
+
+def _ddg(query, max_results, port, on_start, profile):
+    """("results"|"empty"|"blocked", hits). Raises when the page is none of those."""
     page = capture(DDG_LITE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
                    port=port, on_start=on_start, profile=profile)
     html = page["text"] or ""
     hits = parse_ddg(html)[:max_results]
     if hits:
-        return hits
-    # Three different empty-handed outcomes, and the caller must be able to tell them apart.
+        return "results", hits
     if DDG_BLOCKED.search(html):
-        # Headed: rate limiting from rapid repeat queries, transient. Headless: DDG blocks it outright
-        # (2026-10-10, #34), so "retry in a minute" would never work. Blaming the parser is wrong too.
-        try:
-            headless = call("status", port=port, method="GET", timeout=5.0).get("headless")
-        except EngineError:
-            headless = None
-        if headless:
-            raise EngineError("DuckDuckGo served an anti-bot challenge: this engine runs headless "
-                              "(PH_HEADLESS=1), which DuckDuckGo blocks. Search through a headed "
-                              "engine; retrying will not help.")
-        raise EngineError("DuckDuckGo served an anti-bot challenge instead of results (usually rate "
-                          "limiting from rapid repeat queries) — retry in a minute")
+        return "blocked", []
     if DDG_EMPTY.search(html):
-        return []          # the search RAN and matched nothing. A fact, not a failure.
+        return "empty", []          # the search RAN and matched nothing. A fact, not a failure.
     m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+    _log_search("duckduckgo", query, "parse_error")
     raise EngineError(
         f"could not parse DuckDuckGo's response, and it is not their no-results page either — "
         f"{len(html)} bytes, title {(m.group(1).strip()[:80] if m else 'none')!r}. Their markup has "
         f"probably changed; parse_ddg() needs updating. The query was NOT answered.")
+
+
+def _brave(query, max_results, port, on_start, profile):
+    """("results"|"empty"|"blocked", hits). Brave relaxes queries: it rarely returns nothing."""
+    page = capture(BRAVE.format(urllib.parse.quote_plus(query)), mode="html", max_chars=0,
+                   port=port, on_start=on_start, profile=profile)
+    html = page["text"] or ""
+    hits = parse_brave(html)[:max_results]
+    if hits:
+        return "results", hits
+    m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+    title = (m.group(1) if m else "").lower()
+    if "brave search" in title and "captcha" not in title:
+        return "empty", []
+    return "blocked", []
+
+
+def search(query, max_results=20, port=None, on_start=None, profile=None):
+    """Web results through the real browser: DuckDuckGo, then Brave Search if DDG blocks (#34).
+
+    Returns Hits (a list of {title, url}); `.engine` names who answered. Every attempt is logged to
+    SEARCH_LOG. DDG answers curl with an image CAPTCHA, and blocks headless Chrome outright; a real
+    headed Chrome is normally served results — nothing is solved or bypassed.
+    """
+    outcome, hits = _ddg(query, max_results, port, on_start, profile)
+    _log_search("duckduckgo", query, outcome, len(hits))
+    if outcome == "blocked":
+        time.sleep(SEARCH_RETRY_WAIT)
+        outcome, hits = _ddg(query, max_results, port, on_start, profile)
+        _log_search("duckduckgo", query, f"retry_{outcome}", len(hits))
+    if outcome != "blocked":
+        return Hits(hits)
+    if on_start:
+        on_start("DuckDuckGo blocked the search twice; asking Brave Search")
+    b_outcome, b_hits = _brave(query, max_results, port, on_start, profile)
+    _log_search("brave", query, b_outcome, len(b_hits))
+    if b_outcome != "blocked":
+        out = Hits(b_hits)
+        out.engine = "brave"
+        return out
+    try:
+        headless = call("status", port=port, method="GET", timeout=5.0).get("headless")
+    except EngineError:
+        headless = None
+    if headless:
+        raise EngineError("DuckDuckGo and Brave Search both served an anti-bot challenge: this "
+                          "engine runs headless (PH_HEADLESS=1), which they block. Search through a "
+                          "headed engine; retrying will not help.")
+    raise EngineError("DuckDuckGo blocked the search (twice) and Brave Search blocked it too. This "
+                      f"is usually rate limiting from rapid repeat queries; retry in a minute. "
+                      f"Log: {SEARCH_LOG}")
 
 
 # ── downloads: PDFs and other files behind a bot wall ───────────────────────────────────────────

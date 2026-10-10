@@ -151,7 +151,7 @@ launch forever; the engine now clears it automatically if its owning process is 
 | **`pdf`** | **Any PDF** — as text, and as a file you keep. Clears the wall, downloads through the cleared session (cookies + matching User-Agent), saves the file to `path`, extracts the text, reports bytes + page count + post-redirect url. |
 | **`download`** | **Any non-page file** — firmware, archives, installers. Streams to disk through the cleared session; reports path, bytes, sha256, content-type, post-redirect url. `expect_sha256` verifies against a publisher's value. |
 | **`prefetch`** + **`collect`** | **A list of urls.** Fires them all off (8 tabs by default), returns a job id immediately; `collect` hands you pages as they finish. Don't loop `fetch` — see below. |
-| **`search`** | DuckDuckGo results (title + url) through the real browser. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
+| **`search`** | DuckDuckGo results (title + url) through the real browser, falling back to Brave Search when DDG blocks. Needed because DDG now answers curl-like clients with an image CAPTCHA instead of results — see below. |
 | `screenshot` | PNG the agent can actually look at. With a url it uses its own tab; without, it shoots the current page. |
 | `goto` | Navigate the *current* tab and keep it open — starts an interactive session. |
 | `read` | Re-read the current page after something changed it. |
@@ -341,6 +341,17 @@ not run*, and two agents duly reported quoting and `OR` as broken (#10, #12) whe
 simply matched nothing. Now the three empty-handed outcomes are distinct: their anti-bot page raises
 (rate limiting), their no-results page reports that the search **ran** and matched nothing, and an
 unrecognised page raises with the byte count and page title so markup drift reads as markup drift.
+
+**A DuckDuckGo block falls back to Brave Search (#34).**
+- On DDG's anti-bot page: one retry after `SEARCH_RETRY_WAIT` (2 s), then the same query on Brave
+  Search through the same browser.
+- Brave results are labelled: "DuckDuckGo blocked this search; these results are from Brave Search".
+  Brave loosens queries (a nonsense quoted query still returned 20 results), so check a hit
+  contains your exact terms.
+- Both blocked: raises naming both. On a headless engine (`PH_HEADLESS=1`) it says headless is the
+  cause, since both block it.
+- Every attempt is one JSON line in `search.log` under the data dir's `logs/` (engine, outcome, n,
+  owner, query): how often DDG blocks is a number, not a guess.
 
 On a genuine zero, if the query has quotes or operators to drop, `search` **runs the relaxed query
 itself** and returns those hits under a loud warning that they answer the relaxed query, not yours.

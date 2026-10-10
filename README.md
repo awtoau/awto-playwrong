@@ -161,6 +161,7 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
 | `scripts/aclose_race_test.py` | two concurrent closes of one vendored nodriver connection raise nothing and close the socket once (#29). No browser needed. |
 | `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, and the no-progress watchdog cuts a stuck batch (#27). |
+| `scripts/search_fallback_test.py` | a local page posing as DuckDuckGo's anti-bot block: `search()` retries once, falls back to live Brave Search, tags the results `brave`, and logs each attempt (#34). |
 | `scripts/upstream_check.py` | run on every review: new upstream/fork nodriver commits, vendor files not in the fork, a new PyPI release (and whether its wheel compiles), and new repos doing the same work, against `vendor/UPSTREAM.json`. `--update` records a review. |
 | `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
 | `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
@@ -222,7 +223,7 @@ print(page["text"])                              # {text, title, url, challenge}
 | `prefetch(urls, concurrency=, timeout=)` | start a batch, return a job id immediately |
 | `poll(job)` | counts only: ready / loading / pending / errors / done |
 | `collect(job, wait=, max_chars=)` | take whatever is ready; each page delivered exactly once |
-| `search(query, max_results=)` | DuckDuckGo results as `[{title, url}]` |
+| `search(query, max_results=)` | DuckDuckGo results as `[{title, url}]`; Brave Search if DDG blocks (`.engine` says which) |
 | `pdf(url, path=)` / `download(url, path=)` | a file, via the cleared session → `{path, bytes, pages, text, final_url}` |
 | `session_headers(url)` | just the `{Cookie, User-Agent, Referer}`, to drive a transfer yourself |
 | `ensure(port=, profile=)` | engine + Chrome up; idempotent, and safe when many processes call it at once |

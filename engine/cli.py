@@ -148,6 +148,9 @@ def main(argv=None):
         else:
             for i, h in enumerate(hits, 1):
                 print(f"{i:2}. {h['title']}\n    {h['url']}")
+        if getattr(hits, "engine", "duckduckgo") == "brave":
+            print("[DuckDuckGo blocked this search; results are from Brave Search, which loosens "
+                  "queries — check a result contains your exact terms]", file=sys.stderr)
         if not hits:
             # Empty means DDG ran the search and matched nothing; a parse failure raises instead.
             print(f"no results — the search ran, nothing matched {a.search!r}", file=sys.stderr)
