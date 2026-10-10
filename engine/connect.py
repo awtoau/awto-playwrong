@@ -404,7 +404,13 @@ def render(page, mode="text", max_chars=40000):
     total = len(body)
     if max_chars and total > max_chars:
         body = body[:max_chars] + (f"\n\n[truncated: showing {max_chars} of {total} chars]")
-    return f"# {page.get('title') or '(no title)'}\nURL: {page.get('url') or ''}\n\n{body}"
+    # Top, not bottom: max_chars would cut a trailing note, and the reader needs it first (#32).
+    note = INCOMPLETE_NOTE + "\n" if page.get("partial") else ""
+    return f"# {page.get('title') or '(no title)'}\nURL: {page.get('url') or ''}\n{note}\n{body}"
+
+
+INCOMPLETE_NOTE = ("[INCOMPLETE: the page was still loading when captured, so the text may be cut "
+                   "off. For a large file use `download`, which checks Content-Length.]")
 
 
 CHALLENGE = ("just a moment", "verify you are human", "checking your browser",
@@ -472,7 +478,7 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
             # for — a silently wrong answer, seen once on the very first launch of a fresh profile.
             # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
             if str(landed.get("url", "")).startswith(("chrome://", "about:")):
-                call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
+                landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
             page = _settled_text(port, tab=tag)
             challenge = None
             if solve and is_challenge(page):
@@ -482,9 +488,11 @@ def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, 
                 challenge = "cleared" if r.get("passed") else "NOT cleared"
                 page = call("text", port=port, tab=tag)
             page = _settled_text(port, page, tab=tag)  # a solve navigates again; re-settle after it
+            if landed.get("ready_state") not in (None, "complete"):
+                page["partial"] = True
             final_url = page.get("url")
             out = {"text": render(page, mode, max_chars), "title": page.get("title"),
-                   "url": final_url, "challenge": challenge}
+                   "url": final_url, "challenge": challenge, "partial": bool(page.get("partial"))}
             if shot:
                 out["b64"] = call("shot", port=port, tab=tag, timeout=90.0)["b64"]
             return out

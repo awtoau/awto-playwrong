@@ -298,6 +298,11 @@ def live_tests(c):
 DL_SIZE = 10 << 20            # advertised body
 DL_CUT = 2 << 20              # where the "broken mirror" hangs up — the size #31 saw
 DL_BODY = hashlib.sha256(b"playwrong-31").digest() * (DL_SIZE // 32)
+# Slow-page fixtures (#32): a large text body that takes longer than goto's 2 s settle to stream.
+SLOW_LINES = 400_000
+SLOW_BODY = "".join(f"{i:07d} playwrong-32\n" for i in range(SLOW_LINES)).encode()
+SLOW_LAST = f"{SLOW_LINES - 1:07d} playwrong-32"
+SLOW_GAP = 0.04               # per 64 KiB: ~5 s for the body, past the 2 s settle
 
 
 class _ShortServer(http.server.BaseHTTPRequestHandler):
@@ -329,6 +334,35 @@ class _ShortServer(http.server.BaseHTTPRequestHandler):
                                               "Content-Range": f"bytes {start}-{DL_SIZE-1}/{n}"})
         elif self.path == "/resume.bin":
             self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n, "Accept-Ranges": "bytes"})
+        elif self.path == "/slow.txt":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(SLOW_BODY)))
+            self.end_headers()
+            try:
+                for off in range(0, len(SLOW_BODY), 1 << 16):
+                    self.wfile.write(SLOW_BODY[off:off + (1 << 16)])
+                    self.wfile.flush()
+                    time.sleep(SLOW_GAP)
+            except OSError:
+                pass                          # the tab closed mid-body: a test failure, reported there
+            self.close_connection = True
+        elif self.path == "/endless.txt":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                i = 0
+                while True:                   # never finishes; ends when the tab closes
+                    line = f"{i:07d} endless\n".encode()
+                    self.wfile.write(b"%x\r\n" % len(line) + line + b"\r\n")
+                    self.wfile.flush()
+                    i += 1
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            self.close_connection = True
         elif self.path == "/chunked.bin":
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
@@ -379,6 +413,37 @@ def short_transfer_tests(c):
         c.call("close_tab", close_extra=True)
 
 
+def slow_page_tests(c):
+    """#32: a page still loading at capture must arrive whole, or say it is incomplete."""
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ShortServer)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        body = text_of(c.call("fetch", url=f"{base}/slow.txt", max_chars=0))
+        ok("fetch slow.txt: whole body arrives", SLOW_LAST in body,
+           f"{body.count('playwrong-32')} of {SLOW_LINES} lines")
+        ok("fetch slow.txt: not flagged incomplete", "[INCOMPLETE" not in body)
+        t0 = time.monotonic()
+        body = text_of(c.call("fetch", url=f"{base}/endless.txt", max_chars=0))
+        ok("fetch endless.txt: flagged incomplete", "[INCOMPLETE" in body,
+           f"{time.monotonic() - t0:.1f}s; {body[:160]!r}")
+        r = c.call("prefetch", urls=[f"{base}/slow.txt", f"{base}/endless.txt"], concurrency=2)
+        job = text_of(r).split("job ")[1].split(":")[0].strip()
+        got, t0 = "", time.monotonic()
+        while time.monotonic() - t0 < 60:     # endless.txt needs the 2 s settle + LOAD_WAIT
+            part = text_of(c.call("collect", job=job, wait=10, max_chars=0))
+            got += part
+            if ", 0 still loading]" in part:
+                break
+        ok("prefetch slow.txt: whole body arrives", SLOW_LAST in got,
+           f"{got.count('playwrong-32')} of {SLOW_LINES} lines")
+        ok("prefetch endless.txt: flagged incomplete", got.count("[INCOMPLETE") == 1,
+           f"{got.count('[INCOMPLETE')} notes in {time.monotonic() - t0:.0f}s")
+    finally:
+        srv.shutdown()
+        c.call("close_tab", close_extra=True)
+
+
 def cloudflare_test(c):
     """The whole reason playwrong exists: one call gets a page that plain HTTP cannot."""
     say(f"    fetching {CF_URL} — a real Turnstile wall (slow: the solve loop clicks and waits)")
@@ -420,6 +485,7 @@ def main():
         else:
             live_tests(c)
             short_transfer_tests(c)
+            slow_page_tests(c)
             if a.cloudflare:
                 cloudflare_test(c)
     finally:

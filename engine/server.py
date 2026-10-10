@@ -216,6 +216,9 @@ def proc_status_mb(key):
 # crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
 CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
 CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
+# Seconds past the 2 s settle to wait for readyState "complete": ~1.25x the worst seen (#32).
+# Expiry flags the capture partial, never silent; longer would tax every page whose load never fires.
+LOAD_WAIT = 5.0
 
 def cdp_sockets():
     """Established TCP connections to Chrome's CDP port, from /proc/net/tcp. The leak in #23 showed
@@ -634,6 +637,22 @@ class ND:
             del self.tags[ref]
             return await self._newtab_raw("about:blank", ref, owner)
         raise KeyError(f"no such tab: {ref!r} (tags: {sorted(self.tags)})")
+    async def _loaded(self, t, no_js=False):
+        """document.readyState once "complete" or after LOAD_WAIT (#32). None when it can't be read:
+        evaluate is blocked under no_js."""
+        if no_js:
+            return None
+        t0 = time.monotonic()
+        while True:
+            try:
+                state = await t.evaluate("document.readyState")
+            except Exception:
+                return None
+            if state == "complete" or time.monotonic() - t0 >= LOAD_WAIT:
+                if time.monotonic() - t0 > 0.5:
+                    log("load_wait", state=state, s=round(time.monotonic() - t0, 1))
+                return state
+            await asyncio.sleep(0.1)
     async def _goto(self, url, tab=None, no_js=False):
         t = await self._tab(tab)
         if no_js:
@@ -647,6 +666,7 @@ class ND:
             except Exception:
                 pass
         await t.get(url); await t.sleep(2)
+        state = await self._loaded(t, no_js)
         if not no_js:
             await self._label(t)
             try:
@@ -657,8 +677,8 @@ class ND:
             title = await self._title_from_html(t)
         # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
         # two differ, and a caller that stores the requested url records a page it never got.
-        return {"title": title,
-                "url": await self._href(t), "requested": url}
+        return {"title": title, "url": await self._href(t), "requested": url,
+                "ready_state": state}
 
     async def _title_from_html(self, t):
         try:
@@ -1050,6 +1070,7 @@ class ND:
             await t.get(url)
             await self._label(t)
             await t.sleep(2)
+            state = await self._loaded(t)
             title = await t.evaluate("document.title")
             html = await t.get_content()
             passed = None
@@ -1073,6 +1094,8 @@ class ND:
             except Exception: href = url
             slots[i] = {"status": "ready", "title": strip_owner(title), "html": html, "url": href,
                         "requested": url, "challenge": passed}
+            if state not in (None, "complete"):
+                slots[i]["partial"] = True
 
         async def one(i, url):
             async with sem:                     # at most `concurrency` tabs open at once

@@ -187,6 +187,14 @@ after the content has rendered — so on timeout whatever *did* render is captur
 rather than thrown away. Raise `timeout` for urls behind a Cloudflare challenge, since a solve
 legitimately spends 10-30s.
 
+**A page still loading at capture says so (#32).** `fetch` and `collect` wait up to `LOAD_WAIT` (5 s)
+past the 2 s settle for `document.readyState == "complete"`.
+- Still loading after that, or a timed-out prefetch → the text starts with `[INCOMPLETE: …]`, and
+  `capture()` returns `partial: true`.
+- Seen on a large text file (an 8.5 MB checksum list), which came back at about half its length with no
+  note before this.
+- For a large file, use `download`: it checks `Content-Length`.
+
 The same thing from the shell and from Python:
 
 ```sh
