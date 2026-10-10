@@ -483,12 +483,12 @@ def main():
     ap.add_argument("--cloudflare", action="store_true",
                     help=f"also fetch {CF_URL} to prove the Turnstile path end to end")
     ap.add_argument("--headed", action="store_true",
-                    help="show the test browser's window (default: headless via PH_HEADLESS=1)")
+                    help="show the test browser on your desktop (default: its own Xvfb, PH_DISPLAY=xvfb)")
     ap.add_argument("--shutdown", action="store_true",
                     help="stop the engine afterwards (ONLY for an isolated --port)")
     a = ap.parse_args()
-    if not a.headed and not a.cloudflare:     # Turnstile needs headed; it is the reason we are
-        os.environ["PH_HEADLESS"] = "1"       # headed at all. Otherwise stay off the desktop.
+    if not a.headed:
+        os.environ["PH_DISPLAY"] = "xvfb"     # headed Chrome off the desktop; --headed to watch
 
     os.makedirs(LOGDIR, exist_ok=True)
     _log_fh = open(LOG, "w")

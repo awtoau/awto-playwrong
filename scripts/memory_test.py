@@ -367,7 +367,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=8739)
     ap.add_argument("--headed", action="store_true",
-                    help="show the test browser's window (default: headless via PH_HEADLESS=1)")
+                    help="show the test browser on your desktop (default: its own Xvfb, PH_DISPLAY=xvfb)")
     ap.add_argument("--cycles", type=int, default=30)
     ap.add_argument("--keep", action="store_true", help="do not stop the engine afterwards")
     ap.add_argument("--retire", action="store_true", help="exercise the RSS self-restart only")
@@ -379,7 +379,7 @@ def main():
                     help="newtab past PH_MEMORY_HIGH_WATER is refused by name (#28)")
     a = ap.parse_args()
     if not a.headed:
-        os.environ["PH_HEADLESS"] = "1"     # test engines stay off the desktop; --headed to watch
+        os.environ["PH_DISPLAY"] = "xvfb"   # headed Chrome off the desktop; --headed to watch
     if a.port == connect.default_port():
         sys.exit(f"refusing to run against the shared engine on :{a.port}; pass --port")
     os.makedirs(LOGDIR, exist_ok=True)

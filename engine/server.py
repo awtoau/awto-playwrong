@@ -214,6 +214,45 @@ def proc_status_mb(key):
 
 # Chrome recycle triggers (#23). 64 tabs is 2x the crawler's own --tabs cap of 32, so a legitimate
 # crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
+# PH_DISPLAY=xvfb: headed Chrome on the engine's own Xvfb, off the user's desktop. Chrome is still
+# genuinely headed, so nothing changes for Turnstile; test engines use it. Unset = the desktop.
+DISPLAY_MODE = os.environ.get("PH_DISPLAY", "")
+# Xvfb answering -displayfd: ~1.25x the worst start measured (issue #36). On expiry the engine
+# exits naming Xvfb, rather than launching Chrome at a display that isn't there.
+XVFB_START_TIMEOUT = 0.2
+XVFB = None                 # the Xvfb Popen in PH_DISPLAY=xvfb mode
+
+def _die_with_parent():
+    """Xvfb is the engine's; if the engine is killed, take Xvfb with it (PR_SET_PDEATHSIG)."""
+    import ctypes
+    import signal
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
+
+def start_xvfb():
+    """Start the engine's own Xvfb on a free display and point DISPLAY at it. Returns ':N'."""
+    global XVFB
+    import select
+    import subprocess
+    r, w = os.pipe()
+    t0 = time.monotonic()
+    XVFB = subprocess.Popen(["Xvfb", "-displayfd", str(w), "-screen", "0", "1920x1080x24",
+                             "-nolisten", "tcp"], pass_fds=(w,), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            preexec_fn=_die_with_parent)
+    os.close(w)
+    ready, _, _ = select.select([r], [], [], XVFB_START_TIMEOUT)
+    n = os.read(r, 16).decode().strip() if ready else ""
+    os.close(r)
+    if not n:
+        XVFB.terminate()
+        raise RuntimeError(f"Xvfb did not report a display within {XVFB_START_TIMEOUT}s "
+                           f"(PH_DISPLAY=xvfb); is it installed and runnable?")
+    os.environ["DISPLAY"] = f":{n}"
+    for k in ("WAYLAND_DISPLAY", "XAUTHORITY"):    # Chrome must not fall back to the desktop
+        os.environ.pop(k, None)
+    log("xvfb_started", display=f":{n}", pid=XVFB.pid, ms=int((time.monotonic() - t0) * 1000))
+    return f":{n}"
+
 # Headed by default: headless is the Turnstile tell. PH_HEADLESS=1 is for test engines on an
 # isolated port, so test runs don't open windows on the user's desktop.
 HEADLESS = os.environ.get("PH_HEADLESS") == "1"
@@ -629,7 +668,10 @@ class ND:
                 if adopted: log("display_adopted", **adopted)
             kills = memcap.oom_kills()
             try:
-                self.browser = await uc.start(headless=HEADLESS, user_data_dir=PROFILE_DIR)
+                # On Xvfb, X11 explicitly: Chrome picks Wayland from the session environment.
+                args = ["--ozone-platform=x11"] if XVFB is not None else None
+                self.browser = await uc.start(headless=HEADLESS, user_data_dir=PROFILE_DIR,
+                                              browser_args=args)
             except Exception as e:
                 # nodriver blames root/sandbox for any launch failure; under the cap the usual
                 # cause is the kernel killing Chrome's processes, which memory.events records (#28).
@@ -1503,6 +1545,8 @@ def _shutdown(code=0):
             log("browser_stopped")
     except Exception as e:
         log("shutdown_err", e=repr(e)[:120])
+    if XVFB is not None:
+        XVFB.terminate()          # after Chrome: it is Chrome's display
     os._exit(code)
 
 
@@ -1540,7 +1584,9 @@ class H(BaseHTTPRequestHandler):
             self._j({"server":True,"alive":B.ok() if p is None else bool(p),
                      "launched":B.tab is not None,"chrome_pid":B.chrome_pid(),
                      "code":CODE, **mem_snapshot(),
-                     "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20,"headless":HEADLESS})
+                     "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20,"headless":HEADLESS,
+                     "display":os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"),
+                     "display_mode":DISPLAY_MODE or "desktop"})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")
@@ -1605,6 +1651,8 @@ if __name__=="__main__":
         sys.exit(0)
     # May re-exec this process under a capped systemd scope; see engine/memcap.py (#23).
     MEMORY_CAP = memcap.enter("engine", MEMORY_MAX, log, oom_policy="continue")
+    if DISPLAY_MODE == "xvfb":
+        start_xvfb()              # before any thread: preexec_fn and fork want a single thread
     log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,headless=HEADLESS,
         chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()

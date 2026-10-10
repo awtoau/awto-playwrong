@@ -144,8 +144,9 @@ browser stays alive between calls. The rest of this README is for crawling many 
 ## Testing and maintenance
 
 Every one of these runs standalone and prints a pass/fail tally. The ones that start an engine run
-its Chrome headless (`PH_HEADLESS=1`) so tests stay off the desktop; `--headed` shows the window.
-The shared engine is always headed: headless is the Turnstile tell.
+its Chrome **headed on the engine's own Xvfb** (`PH_DISPLAY=xvfb`), so tests stay off the desktop
+while Chrome is still genuinely headed; `--headed` shows the window on your desktop instead.
+`PH_HEADLESS=1` also exists, but DuckDuckGo and Turnstile detect headless Chrome (#34).
 
 | Script | What it proves |
 |---|---|

@@ -127,11 +127,11 @@ def main():
     global _fh
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--headed", action="store_true",
-                    help="show the test browser's window (default: headless via PH_HEADLESS=1)")
+                    help="show the test browser on your desktop (default: its own Xvfb, PH_DISPLAY=xvfb)")
     ap.add_argument("--port", type=int, default=8739, help="isolated engine port (never 8731)")
     a = ap.parse_args()
     if not a.headed:
-        os.environ["PH_HEADLESS"] = "1"     # test engines stay off the desktop; --headed to watch
+        os.environ["PH_DISPLAY"] = "xvfb"   # headed Chrome off the desktop; --headed to watch
     if a.port == 8731:
         sys.exit("refusing to run on 8731: this test kills the browser, and that one is shared")
 
