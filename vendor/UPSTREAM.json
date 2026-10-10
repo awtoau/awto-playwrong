@@ -3,11 +3,9 @@
   "upstream": "ultrafunkamsterdam/nodriver",
   "upstream_sha": "219a60d65d82fb3d137d0c2c5b1fb285a9f837d0",
   "fork": "awto-au/nodriver",
-  "fork_sha": "2017a44b1cec7509fe04589c5c19ac949ba90c92",
+  "fork_sha": "f0d718a008604252748e23b3f8c46ef786068b5f",
   "pypi_version": "0.50.6",
-  "vendor_only": [
-    "core/connection.py"
-  ],
+  "vendor_only": [],
   "known_alternatives": [
     "DevinoSolutions/stealth-chrome-devtools-mcp",
     "RobithYusuf/mcp-stealth-chrome",

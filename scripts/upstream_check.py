@@ -6,6 +6,7 @@ Run on every review (CLAUDE.md). Compares against vendor/UPSTREAM.json, the last
 - PyPI: latest nodriver release, and whether its wheel's cdp/network.py compiles (#1)
 - GitHub: repos doing the same work (nodriver forks/successors, stealth-browser MCP servers) that
   are not in the baseline's known list
+- every cdp.<domain>.<name> the engine, crawl and nodriver core call still exists in vendor/
 
     python scripts/upstream_check.py            # report; exit 1 if anything needs a look
     python scripts/upstream_check.py --update   # after reviewing: record the current state
@@ -120,6 +121,32 @@ def pypi():
         return ver, False
 
 
+def api_check():
+    """Every cdp.<domain>.<name> the engine, crawl and nodriver core use must exist in the vendored
+    CDP modules. A regenerated protocol (0.50.6) can drop or rename one, and that only fails at
+    the call site, at runtime."""
+    import importlib
+    import re
+    sys.path.insert(0, os.path.join(REPO, "vendor"))
+    used = set()
+    for top in ("engine", "crawl", os.path.join("vendor", "nodriver", "core")):
+        for root, _, names in os.walk(os.path.join(REPO, top)):
+            for n in names:
+                if n.endswith(".py"):
+                    used |= set(re.findall(r"\bcdp\.([a-z_]+)\.([A-Za-z_]+)",
+                                           open(os.path.join(root, n), errors="replace").read()))
+    missing = []
+    for dom, name in sorted(used):
+        try:
+            mod = importlib.import_module(f"nodriver.cdp.{dom}")
+        except ImportError:
+            missing.append(f"{dom} (module)")
+            continue
+        if not hasattr(mod, name):
+            missing.append(f"{dom}.{name}")
+    return len(used), missing
+
+
 def alternatives(known):
     cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - ACTIVE_DAYS * 86400))
     found = {}
@@ -165,6 +192,14 @@ def main():
     if sorted(diff) != sorted(base.get("vendor_only", [])):
         note("vendor/nodriver differs from the fork in files not recorded as local patches: push "
              "them to the fork, or record them")
+
+    n_used, missing = api_check()
+    say(f"\nCDP names used by engine/crawl/core: {n_used}, missing from vendor/nodriver/cdp: "
+        f"{len(missing)}")
+    for m in missing:
+        say(f"    MISSING {m}")
+    if missing:
+        note(f"{len(missing)} CDP name(s) we call are gone from the vendored protocol")
 
     ver, ok_wheel = pypi()
     say(f"\nPyPI nodriver: {ver}; wheel cdp/network.py compiles: {ok_wheel}")

@@ -192,10 +192,9 @@ architectural choice, and it's why this repo exists rather than a Playwright wra
 - `engine/client.py` — the interactive port client (`goto/click/key/js/read/tabs/…`).
 - `engine/mcp_server.py` — the MCP stdio server for agents ([docs/MCP.md](docs/MCP.md)).
 - `crawl/` — an optional library for crawling many pages on top of the engine (its own heavier deps).
-- `vendor/nodriver` — our nodriver, vendored from the fork `awto-au/nodriver`; we own it.
-  - Carries fixes upstream lacks: dropped connections closed and CDP results not retained (#23),
-    `Connection.aclose` race (#29, not yet pushed to the fork).
-  - Upstream fixed the original non-UTF-8 byte itself in 0.50.6 (#1).
+- `vendor/nodriver` — our nodriver 0.50.6, vendored from the fork `awto-au/nodriver`; we own it.
+  - Upstream 0.50.6 (current CDP protocol) plus fixes upstream lacks: dropped connections closed and
+    CDP results not retained (#23), UTF-8 in `generate_cdp.py`, `Connection.aclose` race (#29).
   - Every review runs `scripts/upstream_check.py` against `vendor/UPSTREAM.json`.
 
 ## Usage (engine)
