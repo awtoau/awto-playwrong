@@ -142,6 +142,46 @@ def main():
     ok("no --exclude excludes nothing",
        not Config(seeds=a.seed, db_dsn=a.db, store_root="x").excluded("https://f.test/goto/x"))
 
+    # ---- #2: by_priority claims best-first, min_priority leaves the rest queued -------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        d = dbmod.open_db(f"sqlite:///{os.path.join(tmp, 'p.sqlite')}")
+        d.init_schema()
+        for h in range(3):
+            for i in range(10):
+                d.enqueue(f"https://p{h}.test/x{i}", 1, priority=i / 10)   # x9 best on each host
+        top = [u for u, _d, _l in d.claim(3, by_priority=True)]
+        ok("by_priority takes the highest scores first", all(u.endswith("/x9") for u in top), str(top))
+        hd = [u for u, _d, _l in d.claim(3, by_priority=True, host_diverse=True)]
+        ok("host_diverse + by_priority: each host offers its best",
+           sorted(hd) == [f"https://p{h}.test/x8" for h in range(3)], str(hd))
+        floor = d.claim(100, by_priority=True, min_priority=0.5)
+        ok("min_priority leaves low scores queued",
+           len(floor) == 9 and all(int(u[-1]) >= 5 for u, _d, _l in floor),
+           f"{len(floor)} claimed, queued now {d.state_counts().get('queued')}")
+        n = d.set_priorities({"https://p0.test/x0": 0.99, "https://p0.test/x9": 0.0})
+        ok("set_priorities rescores queued rows only", n == 1, f"{n} row(s) updated")
+        nxt = d.claim(1, by_priority=True)
+        ok("a rescored row is claimed next", nxt and nxt[0][0] == "https://p0.test/x0", str(nxt))
+        d.close()
+
+    # An older crawl db (no priority column) gains it, and its rows rank as 0, not an error.
+    with tempfile.TemporaryDirectory() as tmp:
+        import sqlalchemy as sa
+        dsn = f"sqlite:///{os.path.join(tmp, 'old.sqlite')}"
+        e = sa.create_engine(dsn)
+        with e.begin() as c:
+            c.execute(sa.text("CREATE TABLE frontier (url TEXT PRIMARY KEY, state TEXT NOT NULL "
+                              "DEFAULT 'queued', depth INTEGER NOT NULL DEFAULT 0, discovered_from "
+                              "TEXT, n_tries INTEGER NOT NULL DEFAULT 0)"))
+            c.execute(sa.text("INSERT INTO frontier (url) VALUES ('https://old.test/a')"))
+        e.dispose()
+        d = dbmod.open_db(dsn)
+        d.init_schema()
+        got = d.claim(5, by_priority=True)
+        ok("an old db gains priority and its rows still claim", [u for u, _d, _l in got] ==
+           ["https://old.test/a"], str(got))
+        d.close()
+
     say(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         say("failed: " + ", ".join(FAIL))

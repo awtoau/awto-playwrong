@@ -161,6 +161,7 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
 | `scripts/aclose_race_test.py` | two concurrent closes of one vendored nodriver connection raise nothing and close the socket once (#29). No browser needed. |
 | `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, and the no-progress watchdog cuts a stuck batch (#27). |
+| `scripts/rank_test.py` | `crawl.rank` scoring (url shape, sitemap discovery, OpenPageRank, secrets lookup) offline, then `crawl.run --rank` on a local site: a 2-page budget fetches the sitemap-only page, not the tag listings (#2). `--offline` skips the crawl. |
 | `scripts/search_fallback_test.py` | a local page posing as DuckDuckGo's anti-bot block: `search()` retries once, falls back to live Brave Search, tags the results `brave`, and logs each attempt (#34). |
 | `scripts/upstream_check.py` | run on every review: new upstream/fork nodriver commits, vendor files not in the fork, a new PyPI release (and whether its wheel compiles), and new repos doing the same work, against `vendor/UPSTREAM.json`. `--update` records a review. |
 | `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
@@ -267,6 +268,10 @@ python -m crawl.report --db site.sqlite            # re-print the report later
 ```
 `--exclude REGEX` (repeatable) keeps matching discovered links out of the queue — forum post anchors,
 redirects, member pages, calendars.
+`--rank` fetches the important pages first (#2, `crawl/rank.py`): priority = sitemap membership +
+url shape + OpenPageRank/10, each 0-1. `--prefer KW` / `--avoid KW` steer the shape score;
+`--min-priority P` leaves lower rows queued. OpenPageRank needs a key in `~/.config/awto/secrets.yaml`
+(section `openpagerank`, field `password`); without one it ranks on sitemap + shape and says so.
 `--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
 agent guide and `schema.sql` for the relational model.
 

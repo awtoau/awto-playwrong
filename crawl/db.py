@@ -36,6 +36,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Engine,
+    Float,
     Integer,
     MetaData,
     String,
@@ -86,6 +87,9 @@ frontier = Table(
     # build", which reclaim treats as expired.
     Column("claimed_at", DateTime),
     Column("sha256", String(64)),
+    # Importance for claim(by_priority=True) (#2): crawl.rank's score, higher first. Added to older
+    # databases by _ensure_columns() as nullable; NULL ranks as 0.
+    Column("priority", Float, server_default="0"),
 )
 page = Table(
     "page", _META,
@@ -244,9 +248,10 @@ class CrawlDB:
         self.close()
 
     # -- frontier --------------------------------------------------------------------------------
-    def enqueue(self, url, depth=0, discovered_from=None, link_code=None):
+    def enqueue(self, url, depth=0, discovered_from=None, link_code=None, priority=0.0):
         stmt, name = _upsert_stmt(self.engine, frontier, ["url"])
-        stmt = stmt.values(url=url, depth=depth, discovered_from=discovered_from, link_code=link_code)
+        stmt = stmt.values(url=url, depth=depth, discovered_from=discovered_from, link_code=link_code,
+                           priority=priority)
         stmt = _do_nothing(stmt, name, ["url"])
         with self.engine.begin() as c:
             c.execute(stmt)
@@ -255,6 +260,23 @@ class CrawlDB:
         # rows: (url, depth, discovered_from[, link_code])
         for r in rows:
             self.enqueue(*r[:4]) if len(r) >= 4 else self.enqueue(*r[:3])
+
+    def set_priorities(self, scores):
+        """Re-score QUEUED rows: {url: priority}. Rows already claimed or done keep theirs."""
+        import sqlalchemy as _sa
+        if not scores:
+            return 0
+        with self.engine.begin() as c:
+            r = c.execute(update(frontier)
+                          .where(frontier.c.url == _sa.bindparam("u"), frontier.c.state == "queued")
+                          .values(priority=_sa.bindparam("p")),
+                          [{"u": u, "p": p} for u, p in scores.items()])
+        return r.rowcount
+
+    def queued_urls(self):
+        with self.engine.begin() as c:
+            return [u for (u,) in c.execute(select(frontier.c.url)
+                                            .where(frontier.c.state == "queued")).fetchall()]
 
     def host_counts(self):
         """{host: pages already attempted} — anything no longer queued.
@@ -274,7 +296,7 @@ class CrawlDB:
         return out
 
     def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False,
-              max_per_host=0, host_counts=None):
+              max_per_host=0, host_counts=None, by_priority=False, min_priority=None):
         """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth, link_code), …].
         Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
         same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
@@ -293,33 +315,42 @@ class CrawlDB:
         WITHIN this batch, not just between batches — checking only between them let a single batch
         take ten urls from a host that had one slot left, overshooting the cap by most of a batch.
         Urls over the cap stay QUEUED: they are not errors, and a later run with a higher cap should
-        still be able to take them."""
+        still be able to take them.
+
+        by_priority / min_priority (#2): highest `priority` first, ahead of depth, in every mode
+        (host_diverse keeps its round-robin, each host offering its best first). Rows under
+        min_priority stay queued: the per-site stop once only low-value pages remain."""
         from urllib.parse import urlsplit
 
         import sqlalchemy as _sa
+        prio = _sa.func.coalesce(frontier.c.priority, 0.0)
+        queued = frontier.c.state == "queued"
+        if min_priority is not None:
+            queued = _sa.and_(queued, prio >= min_priority)
+        lead = [prio.desc()] if by_priority else []
         with self.engine.begin() as c:
             if host_diverse:
-                # Pull a generous candidate window (shallowest first), then greedily round-robin by host
+                # Pull a generous candidate window (best first), then greedily round-robin by host
                 # in Python so each of the n slots is a different host where possible.
-                win = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code)
-                       .where(frontier.c.state == "queued")
-                       .order_by(frontier.c.depth, _sa.func.random())
+                win = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code, prio)
+                       .where(queued)
+                       .order_by(*lead, frontier.c.depth, _sa.func.random())
                        .limit(max(n * 40, 400)))
                 if self.dialect == "postgresql":
                     win = win.with_for_update(skip_locked=True)
                 cand = c.execute(win).all()
                 room = _host_room(max_per_host, host_counts)
                 by_host = {}
-                for u, dep, lc in cand:
+                for u, dep, lc, pr in cand:
                     h = (urlsplit(u).netloc or "").lower()
                     if room is not None and room.get(h, max_per_host) <= 0:
                         continue                  # host is at its cap; leave its urls queued
-                    by_host.setdefault(h, []).append((u, dep, lc))
+                    by_host.setdefault(h, []).append((u, dep, lc, pr))
                 if room is not None:              # never offer a host more than its remaining slots
                     for h in by_host:
                         by_host[h] = by_host[h][:max(0, room.get(h, max_per_host))]
-                for h in by_host:                        # shallowest first within each host
-                    by_host[h].sort(key=lambda t: t[1])
+                for h in by_host:            # best (then shallowest) first within each host
+                    by_host[h].sort(key=(lambda t: (-t[3], t[1])) if by_priority else (lambda t: t[1]))
                 picked, hosts = [], list(by_host.keys())
                 i = 0
                 while len(picked) < n and any(by_host.values()):
@@ -331,13 +362,14 @@ class CrawlDB:
                         break
                 rows = picked
             else:
-                order = [frontier.c.depth, _sa.func.random()] if shuffle else [frontier.c.depth, frontier.c.url]
+                order = lead + ([frontier.c.depth, _sa.func.random()] if shuffle
+                                else [frontier.c.depth, frontier.c.url])
                 room = _host_room(max_per_host, host_counts)
                 # Over-fetch when a cap is in play: it is applied in Python (there is no portable
                 # host expression across SQLite/Postgres/MySQL), so asking for exactly n would come
                 # back short as soon as capped hosts start filling the window.
                 sel = (select(frontier.c.url, frontier.c.depth, frontier.c.link_code)
-                       .where(frontier.c.state == "queued")
+                       .where(queued)
                        .order_by(*order)
                        .limit(max(n * 40, 400) if room is not None else n))
                 if self.dialect == "postgresql":

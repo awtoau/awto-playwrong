@@ -882,7 +882,7 @@ def _copy(r, f, digest, total):
 
 
 def download(url, path=None, port=None, on_start=None, solve=True, tries=20, profile=None,
-             expect_sha256=None, expect_size=None):
+             expect_sha256=None, expect_size=None, extra_headers=None):
     """Fetch a file (firmware, archive, image, PDF, …) from behind a bot wall and write it to disk.
 
     Returns {path, bytes, content_type, final_url, sha256}. `path` defaults to tmp/ + the url's
@@ -891,12 +891,16 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
     `final_url` is the url after redirects. A manifest wants that rather than the url you asked
     for — they differ exactly when a download went somewhere you did not expect.
 
+    extra_headers: added to the plain-HTTP request (an API key, say). The in-browser fallback
+    does not send them.
+
     expect_sha256 / expect_size: raise if the bytes do not match what a publisher stated. This is
     the general form of the page-count check on pdf() — the way a silent wrong answer (block page,
     truncated transfer, wrong artifact) is caught at the moment it arrives rather than later.
     """
     headers = session_headers(url, port=port, on_start=on_start, solve=solve, tries=tries,
                               profile=profile)
+    headers.update(extra_headers or {})       # e.g. an API key header; plain-HTTP path only
     if on_start:
         on_start(f"downloading with the cleared session ({len(headers.get('Cookie',''))} B of cookies)")
     if path is None:

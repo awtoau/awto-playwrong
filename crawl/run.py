@@ -28,7 +28,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from . import browser, db, graph, netblock, parse, ratelimit, render, store
+from . import browser, db, graph, netblock, parse, rank, ratelimit, render, store
 
 
 def _same_site(url, hosts):
@@ -118,7 +118,8 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
             d.link_page_asset(sp.sha256, iu[:2000], alt=(alt or "")[:500], kind=kind, link_code=link_code)
         for lu in links:
             if _same_site(lu, cfg.hosts) and depth + 1 <= cfg.depth and not cfg.excluded(lu):
-                d.enqueue(lu, depth + 1, discovered_from=url, link_code=link_code)
+                d.enqueue(lu, depth + 1, discovered_from=url, link_code=link_code,
+                          priority=cfg.ranker.score(lu) if cfg.ranker else 0.0)
         d.scan(url, status="ok", http_status=doc_status["code"], sha256=sp.sha256); terminal = True
         ms = int((time.monotonic() - t0) * 1000)
         stats["ok"] += 1
@@ -309,6 +310,22 @@ async def _worker(slot, b, queue, cfg, d, stats):
             queue.task_done()
 
 
+def _rank_frontier(cfg, d):
+    """#2: sitemap urls in, every queued row scored. Runs before the crawl, and again on a resume
+    so rows queued by an unranked run get a priority too."""
+    cfg.ranker = rank.Ranker(prefer=cfg.prefer, avoid=cfg.avoid, port=cfg.port,
+                             say=lambda m: print(m, flush=True))
+    origins = sorted({f"{urlsplit(s).scheme}://{urlsplit(s).netloc}" for s in cfg.seeds})
+    added = 0
+    for u in cfg.ranker.prepare(origins):
+        if _same_site(u, cfg.hosts) and not cfg.excluded(u):
+            d.enqueue(u, 1, discovered_from="sitemap", priority=cfg.ranker.score(u))
+            added += 1
+    n = d.set_priorities({u: cfg.ranker.score(u) for u in d.queued_urls()})
+    print(f"rank: {added} sitemap url(s) queued, {n} queued row(s) scored"
+          + (f", floor {cfg.min_priority}" if cfg.min_priority is not None else ""), flush=True)
+
+
 async def _watch(workers, stats, no_progress):
     """Wait for the batch's workers; cancel them if no page resolves for no_progress seconds (#27).
     Returns True when it had to cut the batch."""
@@ -352,6 +369,8 @@ async def crawl(cfg):
                      if rec["abandoned"] else ""), flush=True)
         for s in cfg.seeds:
             d.enqueue(s, 0)
+        if cfg.rank:
+            _rank_frontier(cfg, d)
         print(f"crawl: seeds={len(cfg.seeds)} db={cfg.db_dsn} store={cfg.store_root} "
               f"max={cfg.max_pages} tabs={cfg.tabs} depth={cfg.depth} (fresh tab per URL)", flush=True)
         b = await browser.attach(cfg.port)
@@ -378,7 +397,8 @@ async def crawl(cfg):
                       f"past {db.MAX_TRIES} tries", flush=True)
             batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
                             shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
-                            max_per_host=cfg.max_per_host, host_counts=per_host)
+                            max_per_host=cfg.max_per_host, host_counts=per_host,
+                            by_priority=cfg.rank, min_priority=cfg.min_priority)
             if not batch:
                 # Empty does not mean finished: it also happens when every remaining row is claimed
                 # but unresolved. Force-expire the leases and look once more before calling it done.
@@ -388,7 +408,8 @@ async def crawl(cfg):
                           f"unresolved url(s)", flush=True)
                     batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
                                     shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
-                                    max_per_host=cfg.max_per_host, host_counts=per_host)
+                                    max_per_host=cfg.max_per_host, host_counts=per_host,
+                                    by_priority=cfg.rank, min_priority=cfg.min_priority)
             if not batch:
                 break
             if cfg.max_per_host:
@@ -459,8 +480,13 @@ class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
                  depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
                  rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0,
-                 max_per_host=0, exclude=None):
+                 max_per_host=0, exclude=None, rank=False, prefer=(), avoid=(),
+                 min_priority=None):
         self.seeds = list(seeds)
+        # importance ranking (#2): claim best-first; ranker is built by crawl() when rank is on
+        self.rank, self.prefer, self.avoid = rank, tuple(prefer or ()), tuple(avoid or ())
+        self.min_priority = min_priority
+        self.ranker = None
         self.db_dsn = db_dsn
         self.store_root = store_root
         self.max_pages = max_pages
@@ -516,6 +542,16 @@ def _parse_args(argv):
     p.add_argument("--exclude", action="append", metavar="REGEX",
                    help="Never queue a discovered link whose URL matches REGEX (re.search; "
                         "repeatable). For forum/calendar traps: post anchors, redirects, member pages.")
+    p.add_argument("--rank", action="store_true",
+                   help="Fetch the important pages first: sitemap membership + url shape + "
+                        "OpenPageRank (key in secrets.yaml `openpagerank`), see crawl/rank.py")
+    p.add_argument("--prefer", action="append", metavar="KW",
+                   help="With --rank: urls containing KW score higher (repeatable), e.g. docs")
+    p.add_argument("--avoid", action="append", metavar="KW",
+                   help="With --rank: urls containing KW score lower (repeatable)")
+    p.add_argument("--min-priority", type=float, metavar="P",
+                   help="With --rank: leave rows scored under P queued (per-site stop once only "
+                        "low-value pages remain; scores run 0-3)")
     p.add_argument("--no-js", action="store_true", help="Block Script too (leanest; static sites)")
     p.add_argument("--rate-delay", type=float, default=1.5,
                    help="Min seconds between fetches to the SAME host (per-host politeness + 429 backoff). 0 disables.")
@@ -545,7 +581,8 @@ def main(argv=None):
                  port=a.port, hosts=hosts, keep_js=not a.no_js,
                  rate_delay=a.rate_delay, shuffle=not a.no_shuffle,
                  host_diverse=not a.no_host_diverse, stall_ceiling=a.stall_ceiling,
-                 exclude=a.exclude)
+                 exclude=a.exclude, rank=a.rank, prefer=a.prefer, avoid=a.avoid,
+                 min_priority=a.min_priority)
     asyncio.run(crawl(cfg))
 
 
