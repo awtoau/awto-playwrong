@@ -161,6 +161,7 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
 | `scripts/aclose_race_test.py` | two concurrent closes of one vendored nodriver connection raise nothing and close the socket once (#29). No browser needed. |
 | `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, and the no-progress watchdog cuts a stuck batch (#27). |
+| `scripts/upstream_check.py` | run on every review: new upstream/fork nodriver commits, vendor files not in the fork, a new PyPI release (and whether its wheel compiles), and new repos doing the same work, against `vendor/UPSTREAM.json`. `--update` records a review. |
 | `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
 | `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
 | `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
@@ -191,13 +192,11 @@ architectural choice, and it's why this repo exists rather than a Playwright wra
 - `engine/client.py` — the interactive port client (`goto/click/key/js/read/tabs/…`).
 - `engine/mcp_server.py` — the MCP stdio server for agents ([docs/MCP.md](docs/MCP.md)).
 - `crawl/` — an optional library for crawling many pages on top of the engine (its own heavier deps).
-- `vendor/nodriver` — patched nodriver 0.50.3 (fixes a non-UTF-8 byte in `cdp/network.py` line ~1345
-  that raises `SyntaxError` on import under CPython 3.14). Upstream: issue
-  [ultrafunkamsterdam/nodriver#35](https://github.com/ultrafunkamsterdam/nodriver/issues/35) + fix PR
-  [#36](https://github.com/ultrafunkamsterdam/nodriver/pull/36) (both open/unmerged). **Drop the vendor
-  pin once #36 merges and a fixed release ships.**
-  - Owned here now, with local fixes: `Connection.aclose` takes the socket before awaiting, so two
-    concurrent closes no longer raise `None.wait_closed()` (#29).
+- `vendor/nodriver` — our nodriver, vendored from the fork `awto-au/nodriver`; we own it.
+  - Carries fixes upstream lacks: dropped connections closed and CDP results not retained (#23),
+    `Connection.aclose` race (#29, not yet pushed to the fork).
+  - Upstream fixed the original non-UTF-8 byte itself in 0.50.6 (#1).
+  - Every review runs `scripts/upstream_check.py` against `vendor/UPSTREAM.json`.
 
 ## Usage (engine)
 ```

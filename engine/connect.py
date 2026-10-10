@@ -417,10 +417,16 @@ CHALLENGE = ("just a moment", "verify you are human", "checking your browser",
              "cf-chl", "challenge-platform")
 
 
+# Cloudflare's own challenge markup. The phrase alone is not enough: a page ABOUT Cloudflare (the
+# nodriver PyPI page) says "verify you are human" and ran the whole solve loop (#37).
+CF_MARKUP = ("challenges.cloudflare.com", "cf-chl", "challenge-platform", "turnstile")
+
+
 def is_challenge(page):
     t = (page.get("title") or "").lower()
     h = (page.get("html") or "").lower()
-    return any(k in t for k in CHALLENGE) or "verify you are human" in h
+    return any(k in t for k in CHALLENGE) or (
+        "verify you are human" in h and any(k in h for k in CF_MARKUP))
 
 
 def solve_timeout(tries):

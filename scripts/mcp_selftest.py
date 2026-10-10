@@ -347,6 +347,9 @@ class _ShortServer(http.server.BaseHTTPRequestHandler):
                                               "Content-Range": f"bytes {start}-{DL_SIZE-1}/{n}"})
         elif self.path == "/resume.bin":
             self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n, "Accept-Ranges": "bytes"})
+        elif self.path == "/mentions.html":       # #37: a page ABOUT bot checks is not one
+            b = b"<title>About bots</title><p>Sites ask you to verify you are human.</p>"
+            self._send(200, b, {"Content-Type": "text/html", "Content-Length": str(len(b))})
         elif self.path == "/slow.txt":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -432,6 +435,11 @@ def slow_page_tests(c):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
+        t0 = time.monotonic()
+        body = text_of(c.call("fetch", url=f"{base}/mentions.html"))
+        ok("a page mentioning 'verify you are human' is not treated as a challenge",
+           "[cloudflare challenge" not in body and "About bots" in body,
+           f"{time.monotonic() - t0:.1f}s; {body[:100]!r}")
         body = text_of(c.call("fetch", url=f"{base}/slow.txt", max_chars=0))
         ok("fetch slow.txt: whole body arrives", SLOW_LAST in body,
            f"{body.count('playwrong-32')} of {SLOW_LINES} lines")
