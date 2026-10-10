@@ -43,6 +43,10 @@ URL = "https://example.com"
 # not the launch, is what makes this slow. On expiry the op is reported as failed with its elapsed
 # time, which is the answer either way: recovery did not happen.
 RELAUNCH_BUDGET = 20.0
+# A page whose renderer never yields (#27, #29). Opened with newtab{url}, so no goto waits on it.
+HUNG = "data:text/html,<title>hung</title><script>while(true){}</script>"
+# Closing a local target is a CDP round trip of ms; 2 s is far past that. Expiry = the hang itself.
+CLOSE_BUDGET = 2.0
 # How long Chrome takes to die after SIGKILL. It is a local process kill; 5s is ~100x what it needs,
 # and on expiry we say so rather than reporting a confusing "did not recover".
 DEATH_BUDGET = 5.0
@@ -184,6 +188,22 @@ def main():
             st = status(a.port)
             ok("reattach keeps the same Chrome", st.get("chrome_pid") == pid and
                st.get("alive") is True, f"was {pid}, now {st.get('chrome_pid')}")
+
+        # 1d. A tab whose renderer is stuck in JS (#27, #29): closing it must return, not wedge.
+        connect.call("newtab", port=a.port, url=HUNG, tag="recovery-hung")
+        t0 = time.monotonic()
+        try:
+            r = connect.call("closetab", port=a.port, tag="recovery-hung", timeout=CLOSE_BUDGET)
+            ok("a tab hung in JS closes promptly", r.get("closed") == 1,
+               f"{r} in {time.monotonic() - t0:.2f}s")
+        except connect.EngineError as e:
+            ok("a tab hung in JS closes promptly", False,
+               f"{time.monotonic() - t0:.1f}s: {str(e)[:120]}")
+        try:
+            r = connect.call("js", port=a.port, expr="3+3", timeout=CLOSE_BUDGET)
+            ok("the engine still answers after the hung tab", r.get("result") == 6, json.dumps(r))
+        except connect.EngineError as e:
+            ok("the engine still answers after the hung tab", False, str(e)[:120])
 
         # 2. Someone closes the window — the likeliest real cause. Closing every page target from
         #    the DevTools endpoint is what that does, and Chrome exits with its last tab.
