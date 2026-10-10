@@ -257,10 +257,12 @@ class Connection:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._listener_task
             self._listener_task = None
-        if self.socket:
-            await self.socket.close()
-            await self.socket.wait_closed()
-        self.socket = None
+        # Take it before awaiting: a concurrent aclose() cleared self.socket mid-close, and the
+        # second await hit None.wait_closed() (awtoau/awto-playwrong#29).
+        sock, self.socket = self.socket, None
+        if sock:
+            await sock.close()
+            await sock.wait_closed()
 
     def _fail_pending_futures(self, exc: BaseException) -> None:
         for future in self._mapper.values():

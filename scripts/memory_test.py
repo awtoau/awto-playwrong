@@ -254,7 +254,10 @@ def guard_cap(port):
         err = ""
     except connect.EngineError as e:
         err = str(e)
-    ok("Chrome's launch failure names the memory cap", "memory cap" in err, err[:200])
+    # Headed Chrome cannot start under 200M. Headless is smaller and may: then there is no failure
+    # to name, and the checks below still hold.
+    ok("Chrome's launch failure names the memory cap", ("memory cap" in err) if err else
+       os.environ.get("PH_HEADLESS") == "1", err[:200] or "started anyway (headless fits)")
     s2 = status(port)
     ok("engine stays up under the cap (#28: kill one process, not the scope)",
        s2.get("pid") == pid, f"pid {pid} -> {s2.get('pid')}")
@@ -363,6 +366,8 @@ def main():
     global _fh
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=8739)
+    ap.add_argument("--headed", action="store_true",
+                    help="show the test browser's window (default: headless via PH_HEADLESS=1)")
     ap.add_argument("--cycles", type=int, default=30)
     ap.add_argument("--keep", action="store_true", help="do not stop the engine afterwards")
     ap.add_argument("--retire", action="store_true", help="exercise the RSS self-restart only")
@@ -373,6 +378,8 @@ def main():
     ap.add_argument("--high-water", action="store_true",
                     help="newtab past PH_MEMORY_HIGH_WATER is refused by name (#28)")
     a = ap.parse_args()
+    if not a.headed:
+        os.environ["PH_HEADLESS"] = "1"     # test engines stay off the desktop; --headed to watch
     if a.port == connect.default_port():
         sys.exit(f"refusing to run against the shared engine on :{a.port}; pass --port")
     os.makedirs(LOGDIR, exist_ok=True)

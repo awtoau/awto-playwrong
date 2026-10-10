@@ -165,12 +165,75 @@ async def _auto_dismiss_dialogs(tab):
         pass
 
 
+# Bounds on the tab plumbing around each fetch (#27); same CDP ops as the engine's, derived the same
+# way (issue #29, `scripts/op_latency.py`): createTarget worst 399 ms -> 0.5 s; close p99.9 217 ms
+# -> 0.3 s. Expiry logs the op, limit and elapsed; the worker moves on.
+NEWTAB_TIMEOUT = 0.5
+CLOSE_TIMEOUT = 0.3
+# Setup sends (Fetch/Page enable) on a fresh about:blank tab: local round trips, bounded like a close
+# plus margin for the first send's attach.
+SETUP_TIMEOUT = 1.0
+# Seconds between watchdog looks at progress; the no-progress limit itself is minutes.
+WATCH_POLL = 5.0
+# Batches in a row the watchdog may cut before the run gives up: the browser is not coming back.
+WATCH_STRIKES = 2
+
+
+class Stalled(RuntimeError):
+    """A bounded CDP step around a fetch did not answer (#27)."""
+
+
+async def _bounded(coro, limit, what, url=""):
+    """await coro within limit seconds, or raise Stalled naming it. The coroutine is left running
+    (cancelling a socket close mid-way strands it, #23)."""
+    task = asyncio.ensure_future(coro)
+    t0 = time.monotonic()
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), limit)
+    except TimeoutError:
+        task.add_done_callback(lambda f: f.cancelled() or f.exception())   # no "never retrieved"
+        msg = f"{what} did not answer in {limit}s (waited {time.monotonic() - t0:.2f}s) {url[:60]}"
+        print(f"  TIMEOUT {msg}", flush=True)
+        raise Stalled(msg) from None
+
+
+async def _close_tab(b, tab, url=""):
+    """Close a crawl tab, bounded. Tab.close() goes through the tab's own session, which never
+    answers once its renderer has died (#27, #28); then close it through the browser connection."""
+    try:
+        await _bounded(tab.close(), CLOSE_TIMEOUT, "tab close", url)
+        return
+    except Exception:
+        pass
+    tid = getattr(getattr(tab, "target", None), "target_id", None)
+    if tid:
+        try:
+            from nodriver import cdp as _cdp
+            await _bounded(b.send(_cdp.target.close_target(target_id=tid)), CLOSE_TIMEOUT,
+                           "browser-side tab close", url)
+        except Exception:
+            pass
+
+
 async def _new_tab(b, cfg):
     """Open one crawl tab (resource blocker + JS-dialog auto-dismiss enabled). Returns (tab, blocker)."""
-    tab = await b.get("about:blank", new_tab=True)
-    blk = netblock.ResourceBlocker(tab, block_types=cfg.block_types)
-    await blk.enable()
-    await _auto_dismiss_dialogs(tab)   # never hang on a "Leave page?" / permission dialog
+    try:
+        tab = await _bounded(b.get("about:blank", new_tab=True), NEWTAB_TIMEOUT, "new tab")
+    except Stalled:
+        raise
+    except Exception as e:
+        if "no browser is open" not in str(e):
+            raise
+        # Every window closed, Chrome still up: a tab needs a window to go in (#35).
+        print("  no browser window open; opening a new one", flush=True)
+        tab = await _bounded(b.get("about:blank", new_window=True), NEWTAB_TIMEOUT, "new window")
+    try:
+        blk = netblock.ResourceBlocker(tab, block_types=cfg.block_types)
+        await _bounded(blk.enable(), SETUP_TIMEOUT, "resource blocker enable")
+        await _bounded(_auto_dismiss_dialogs(tab), SETUP_TIMEOUT, "dialog auto-dismiss")
+    except Exception:
+        await _close_tab(b, tab)
+        raise
     return tab, blk
 
 
@@ -179,13 +242,10 @@ async def _recycle(b, cfg, tab, blk):
     a wedged/leaked renderer is discarded so it can't poison the next page, but we never grow the tab
     count. Best-effort close (a crashed tab may already be gone)."""
     try:
-        await blk.disable()
+        await _bounded(blk.disable(), CLOSE_TIMEOUT, "resource blocker disable")
     except Exception:
         pass
-    try:
-        await tab.close()
-    except Exception:
-        pass
+    await _close_tab(b, tab)
     return await _new_tab(b, cfg)
 
 
@@ -235,18 +295,37 @@ async def _worker(slot, b, queue, cfg, d, stats):
                     pass
                 stats["fail"] += 1
             finally:
+                # Both bounded: after a stall the tab's renderer may be dead, and an unbounded await
+                # here hung every worker in turn, the whole run with them (#27).
                 if blk is not None:
                     try:
-                        await blk.disable()
+                        await _bounded(blk.disable(), CLOSE_TIMEOUT, "resource blocker disable",
+                                       url)
                     except Exception:
                         pass
                 if tab is not None:
-                    try:
-                        await tab.close()                  # close after every URL — never reuse
-                    except Exception:
-                        pass
+                    await _close_tab(b, tab, url)          # close after every URL — never reuse
         finally:
             queue.task_done()
+
+
+async def _watch(workers, stats, no_progress):
+    """Wait for the batch's workers; cancel them if no page resolves for no_progress seconds (#27).
+    Returns True when it had to cut the batch."""
+    pending, last, t_last = set(workers), -1, time.monotonic()
+    while pending:
+        _, pending = await asyncio.wait(pending, timeout=WATCH_POLL)
+        now, seen = time.monotonic(), stats["ok"] + stats["fail"]
+        if seen != last:
+            last, t_last = seen, now
+        elif pending and now - t_last > no_progress:
+            print(f"  NO PROGRESS for {now - t_last:.0f}s (limit {no_progress:.0f}s): cancelling "
+                  f"{len(pending)} stuck worker(s); their claims are reclaimed by lease", flush=True)
+            for w in pending:
+                w.cancel()
+            await asyncio.wait(pending, timeout=WATCH_POLL)
+            return True
+    return False
 
 
 async def crawl(cfg):
@@ -286,6 +365,10 @@ async def crawl(cfg):
         # Lease for a claimed url: 4x the ceiling on a single fetch. A worker holding one longer than
         # that is not slow, it is gone — the stall guard would have abandoned the page first.
         lease = (cfg.stall_ceiling if cfg.stall_ceiling else max(45.0, cfg.nav_timeout * 4)) * 4
+        # No page resolved in 3 stall ceilings (every tab abandoned a page, 3 rounds) x1.25 means the
+        # workers are stuck, not slow; the watchdog cuts the batch (#27).
+        no_progress = (lease / 4) * 3 * 1.25
+        strikes = 0
         while attempted < cfg.max_pages:
             # Mid-run recovery. reclaim_stuck() used to run only at startup, so a row stranded by a
             # dead worker stayed stranded for the whole run (#17).
@@ -320,7 +403,16 @@ async def crawl(cfg):
             # cfg.tabs concurrent workers; each makes + closes its OWN tab per URL (slot arg unused now).
             workers = [asyncio.create_task(_worker([None], b, queue, cfg, d, stats))
                        for _ in range(cfg.tabs)]
-            await asyncio.gather(*workers)
+            if await _watch(workers, stats, no_progress):
+                strikes += 1
+                if strikes >= WATCH_STRIKES:
+                    print(f"\nGIVING UP: {strikes} batches in a row made no progress for "
+                          f"{no_progress:.0f}s — the browser on :{cfg.port} is not answering. "
+                          f"Claimed rows are reclaimed by the next run.", flush=True)
+                    stats["gave_up"] = True
+                    break
+            else:
+                strikes = 0
             attempted += len(batch)
         if cfg.max_per_host:
             at_cap = sorted(h for h, n in per_host.items() if n >= cfg.max_per_host)

@@ -214,6 +214,9 @@ def proc_status_mb(key):
 
 # Chrome recycle triggers (#23). 64 tabs is 2x the crawler's own --tabs cap of 32, so a legitimate
 # crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
+# Headed by default: headless is the Turnstile tell. PH_HEADLESS=1 is for test engines on an
+# isolated port, so test runs don't open windows on the user's desktop.
+HEADLESS = os.environ.get("PH_HEADLESS") == "1"
 CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
 CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
 # New tabs are refused above this share of the cap held as unreclaimable memory, so a caller backs
@@ -226,6 +229,18 @@ HEAP_QUERY_TIMEOUT = 1.0
 # How long a dropped tab socket waits for the matching Target.targetCrashed before it is treated as
 # the browser dying: a local CDP event lands in ms, 0.25 s is far past that and still short.
 CRASH_EVENT_WAIT = 0.25
+
+# Bounds on the two ops #29 saw wedge for 60 s. Derivation: `scripts/op_latency.py` over the engine
+# log (issue #29). newtab's createTarget: worst seen 399 ms -> 0.5 s. A close: p99.9 217 ms; the
+# 10 s outlier is websockets' close handshake, so a close past 0.3 s finishes in the background.
+NEWTAB_TIMEOUT = 0.5
+CLOSE_TIMEOUT = 0.3
+# Unanswered newtabs in a row before the browser connection is treated as dead and reattached
+# (same Chrome, session kept) instead of wedging until a manual --stop. 2: one can be a blip.
+NEWTAB_STRIKES = 2
+
+class NewTabTimeout(RuntimeError):
+    """Chrome did not answer Target.createTarget within NEWTAB_TIMEOUT (#29)."""
 
 class TabCrashed(RuntimeError):
     """An op aimed at a tab whose renderer process is gone (#28)."""
@@ -456,6 +471,8 @@ class ND:
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
         self._dead = False      # set when an op hits a dropped connection; cleared by _ensure()
         self.crashed = {}       # target_id -> crash status, from Target.targetCrashed (#28)
+        self.newtab_strikes = 0 # consecutive NewTabTimeouts; see NEWTAB_STRIKES (#29)
+        self.test_stalls = 0    # PH_TEST_HOOKS only: newtabs to stall past NEWTAB_TIMEOUT
         self.tags = {}          # agent tag -> target_id. See _tab(): tags, never indices.
         self.jobs = {}          # prefetch job id -> {slots, total, delivered}
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
@@ -598,15 +615,21 @@ class ND:
             if self.ok(): return          # someone else fixed it while we waited for the lock
             if self.browser is not None:
                 if not self.gone() and await self._reattach(): return
+                if self.gone():
+                    # Relaunching used to leave no trace of WHY Chrome went; the exit code is it (#35).
+                    p = getattr(self.browser, "_process", None)
+                    log("browser_exited", pid=getattr(p, "pid", None),
+                        returncode=getattr(p, "returncode", None))
                 await self._retire()      # still running but unreachable: stop it, don't strand it
             self.browser = self.tab = None
             self._dead = False
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
-            adopted = ensure_display()
-            if adopted: log("display_adopted", **adopted)
+            if not HEADLESS:
+                adopted = ensure_display()
+                if adopted: log("display_adopted", **adopted)
             kills = memcap.oom_kills()
             try:
-                self.browser = await uc.start(headless=False, user_data_dir=PROFILE_DIR)
+                self.browser = await uc.start(headless=HEADLESS, user_data_dir=PROFILE_DIR)
             except Exception as e:
                 # nodriver blames root/sandbox for any launch failure; under the cap the usual
                 # cause is the kernel killing Chrome's processes, which memory.events records (#28).
@@ -724,7 +747,23 @@ class ND:
         never answers, so close it through the browser connection (#28)."""
         tid = getattr(getattr(t, "target", None), "target_id", None)
         if tid not in self.crashed:
-            return await t.close()
+            task = asyncio.ensure_future(t.close())
+            t0 = time.monotonic()
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), CLOSE_TIMEOUT)
+            except TimeoutError:
+                # Left running: cancelling mid-close strands the socket (#23). The target itself
+                # goes now, through the browser connection (#29).
+                log("close_slow", target=(tid or "")[:8], limit_s=CLOSE_TIMEOUT,
+                    elapsed_s=round(time.monotonic() - t0, 2))
+            except Exception as e:
+                log("close_err", target=(tid or "")[:8], e=repr(e)[:80])
+            try:
+                await asyncio.wait_for(
+                    self.browser.send(cdp.target.close_target(target_id=tid)), CLOSE_TIMEOUT)
+            except Exception as e:
+                log("close_fallback_err", target=(tid or "")[:8], e=repr(e)[:80])
+            return
         await self.browser.send(cdp.target.close_target(target_id=tid))
         try:
             await asyncio.wait_for(t.aclose(), 1.0)       # a local socket close is ms
@@ -964,6 +1003,43 @@ class ND:
                     "heap_mb": await heap_mb(t),
                     "url": (getattr(getattr(t, "target", None), "url", "") or "")[:60]}
         return await asyncio.gather(*(one(t) for t in list(self.browser.tabs)))
+    async def _open_target(self, url):
+        """browser.get(new_tab), bounded by NEWTAB_TIMEOUT (#29). A late answer still opens a tab,
+        so that tab is closed when it lands rather than left untagged."""
+        async def get():
+            if self.test_stalls > 0:
+                self.test_stalls -= 1
+                await asyncio.sleep(NEWTAB_TIMEOUT * 4)
+            try:
+                return await self.browser.get(url, new_tab=True)
+            except Exception as e:
+                if "no browser is open" not in str(e):
+                    raise
+                # Every window closed but Chrome still up (headless always; headed while it shuts
+                # down): a tab needs a window to go in, so open one (#35).
+                log("no_window", action="new_window")
+                return await self.browser.get(url, new_window=True)
+        task = asyncio.ensure_future(get())
+        t0 = time.monotonic()
+        try:
+            t = await asyncio.wait_for(asyncio.shield(task), NEWTAB_TIMEOUT)
+        except TimeoutError:
+            def reap(f):
+                if not f.cancelled() and f.exception() is None:
+                    asyncio.ensure_future(self._close_tab_obj(f.result()))
+            task.add_done_callback(reap)
+            self.newtab_strikes += 1
+            log("newtab_timeout", limit_s=NEWTAB_TIMEOUT, elapsed_s=round(time.monotonic() - t0, 2),
+                strikes=self.newtab_strikes)
+            if self.newtab_strikes >= NEWTAB_STRIKES:
+                self.newtab_strikes = 0
+                self.forget(f"newtab unanswered {NEWTAB_STRIKES}x in a row")   # next op reattaches
+            raise NewTabTimeout(
+                f"Chrome did not open a tab within {NEWTAB_TIMEOUT}s (worst seen is under 0.4 s). "
+                f"Retry: after {NEWTAB_STRIKES} in a row the engine reconnects to the same Chrome."
+            ) from None
+        self.newtab_strikes = 0
+        return t
     async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
         """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
         a re-opened tab straight back to the op that asked for it."""
@@ -971,7 +1047,7 @@ class ND:
         check_headroom("a new tab")
         await self._maybe_recycle()
         self.fetches += 1
-        t = await self.browser.get(url, new_tab=True)
+        t = await self._open_target(url)
         if not tag:
             # A tagged tab is its owner's, driven by tag. Making it current too meant its closing
             # took every untagged op down with it (#22).
@@ -1464,7 +1540,7 @@ class H(BaseHTTPRequestHandler):
             self._j({"server":True,"alive":B.ok() if p is None else bool(p),
                      "launched":B.tab is not None,"chrome_pid":B.chrome_pid(),
                      "code":CODE, **mem_snapshot(),
-                     "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20})
+                     "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20,"headless":HEADLESS})
         elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
         elif self.path.startswith("/frame"):
             try:self._raw(B.run(B._frame()),"image/png")
@@ -1488,6 +1564,8 @@ class H(BaseHTTPRequestHandler):
         op=self.path.strip("/")
         if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
         if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
+        if op=="_test_stall_newtab" and os.environ.get("PH_TEST_HOOKS")=="1":
+            B.test_stalls = int(a.get("n", 1)); self._j({"ok":1}); return
         if op=="_test_forget" and os.environ.get("PH_TEST_HOOKS")=="1":
             # recovery_test.py only: the websocket-dead-process-alive state (#6) nothing else can make.
             B.loop.call_soon_threadsafe(B.forget, "test hook"); B.run(asyncio.sleep(0))
@@ -1527,7 +1605,7 @@ if __name__=="__main__":
         sys.exit(0)
     # May re-exec this process under a capped systemd scope; see engine/memcap.py (#23).
     MEMORY_CAP = memcap.enter("engine", MEMORY_MAX, log, oom_policy="continue")
-    log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,
+    log("server_start",port=PORT,memory_cap=MEMORY_CAP,rss_limit_mb=RSS_LIMIT >> 20,headless=HEADLESS,
         chrome_max_tabs=CHROME_MAX_TABS,chrome_max_fetches=CHROME_MAX_FETCHES)
     threading.Thread(target=_memwatch, daemon=True, name="memwatch").start()
     SRV = ThreadingHTTPServer(("127.0.0.1",PORT),H)

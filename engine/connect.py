@@ -598,8 +598,16 @@ def search(query, max_results=20, port=None, on_start=None, profile=None):
         return hits
     # Three different empty-handed outcomes, and the caller must be able to tell them apart.
     if DDG_BLOCKED.search(html):
-        # Even a real browser gets the anomaly page under rapid repeat querying, and it is transient
-        # — blaming the parser sends you off debugging code that is fine.
+        # Headed: rate limiting from rapid repeat queries, transient. Headless: DDG blocks it outright
+        # (2026-10-10, #34), so "retry in a minute" would never work. Blaming the parser is wrong too.
+        try:
+            headless = call("status", port=port, method="GET", timeout=5.0).get("headless")
+        except EngineError:
+            headless = None
+        if headless:
+            raise EngineError("DuckDuckGo served an anti-bot challenge: this engine runs headless "
+                              "(PH_HEADLESS=1), which DuckDuckGo blocks. Search through a headed "
+                              "engine; retrying will not help.")
         raise EngineError("DuckDuckGo served an anti-bot challenge instead of results (usually rate "
                           "limiting from rapid repeat queries) — retry in a minute")
     if DDG_EMPTY.search(html):

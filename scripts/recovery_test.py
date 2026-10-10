@@ -47,6 +47,8 @@ RELAUNCH_BUDGET = 20.0
 HUNG = "data:text/html,<title>hung</title><script>while(true){}</script>"
 # Closing a local target is a CDP round trip of ms; 2 s is far past that. Expiry = the hang itself.
 CLOSE_BUDGET = 2.0
+# A stalled newtab must fail within the engine's 0.5 s bound plus the HTTP round trip (#29).
+STALL_BUDGET = 1.5
 # How long Chrome takes to die after SIGKILL. It is a local process kill; 5s is ~100x what it needs,
 # and on expiry we say so rather than reporting a confusing "did not recover".
 DEATH_BUDGET = 5.0
@@ -124,8 +126,12 @@ def wait_dead(pid):
 def main():
     global _fh
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--headed", action="store_true",
+                    help="show the test browser's window (default: headless via PH_HEADLESS=1)")
     ap.add_argument("--port", type=int, default=8739, help="isolated engine port (never 8731)")
     a = ap.parse_args()
+    if not a.headed:
+        os.environ["PH_HEADLESS"] = "1"     # test engines stay off the desktop; --headed to watch
     if a.port == 8731:
         sys.exit("refusing to run on 8731: this test kills the browser, and that one is shared")
 
@@ -205,19 +211,56 @@ def main():
         except connect.EngineError as e:
             ok("the engine still answers after the hung tab", False, str(e)[:120])
 
+        # 1e. Chrome stops answering newtab (#29): each attempt fails fast by name, and after two in
+        #     a row the engine reattaches to the same Chrome instead of wedging until --stop.
+        pid = status(a.port).get("chrome_pid")
+        before = connect.call("tabs", port=a.port, method="GET").get("count")
+        connect.call("_test_stall_newtab", port=a.port, n=2)
+        for i in (1, 2):
+            t0 = time.monotonic()
+            try:
+                connect.call("newtab", port=a.port, url="about:blank", tag=f"stall-{i}",
+                             timeout=STALL_BUDGET)
+                ok(f"stalled newtab {i} fails fast by name", False, "newtab succeeded")
+            except connect.EngineError as e:
+                dt = time.monotonic() - t0
+                ok(f"stalled newtab {i} fails fast by name",
+                   "did not open a tab" in str(e) and dt < STALL_BUDGET, f"{dt:.2f}s: {str(e)[:90]}")
+        r = connect.capture(URL, port=a.port, max_chars=200)
+        ok("fetch works after the newtab stalls", "Example Domain" in r["text"])
+        st = status(a.port)
+        ok("same Chrome after the newtab stalls", st.get("chrome_pid") == pid,
+           f"was {pid}, now {st.get('chrome_pid')}")
+        after = connect.call("tabs", port=a.port, method="GET").get("count")
+        ok("tabs that opened late were closed, not left untagged", after <= before,
+           f"{before} -> {after}")
+
         # 2. Someone closes the window — the likeliest real cause. Closing every page target from
         #    the DevTools endpoint is what that does, and Chrome exits with its last tab.
         cdp = connect.call("cdp", port=a.port)
         n = kill_targets(a.port, cdp)
-        ok("closing the last window ends the browser", n > 0 and wait_dead(pid) is not None,
-           f"{n} target(s) closed, pid {pid} gone")
-        st = status(a.port)
-        ok("status sees the closed browser as dead", st.get("alive") is False, json.dumps(st))
-        r = connect.capture(URL, port=a.port, max_chars=200)
-        ok("fetch recovers from a closed window", "Example Domain" in r["text"])
-        st = status(a.port)
-        ok("no orphan left behind", wait_dead(pid) is not None and st.get("chrome_pid") != pid,
-           f"old pid {pid} gone, now {st.get('chrome_pid')}")
+        if os.environ.get("PH_HEADLESS") == "1":
+            # Headless Chrome outlives its last tab, then refuses new ones: "no browser is open"
+            # (#35). The next op must open a window on the same Chrome, not fail.
+            try:
+                r = connect.capture(URL, port=a.port, max_chars=200)
+                ok("fetch recovers with every window closed", "Example Domain" in r["text"],
+                   f"{n} target(s) closed")
+            except connect.EngineError as e:
+                ok("fetch recovers with every window closed", False, str(e)[:140])
+            st = status(a.port)
+            ok("same Chrome, no relaunch", st.get("chrome_pid") == pid,
+               f"was {pid}, now {st.get('chrome_pid')}")
+        else:
+            ok("closing the last window ends the browser", n > 0 and wait_dead(pid) is not None,
+               f"{n} target(s) closed, pid {pid} gone")
+            st = status(a.port)
+            ok("status sees the closed browser as dead", st.get("alive") is False, json.dumps(st))
+            r = connect.capture(URL, port=a.port, max_chars=200)
+            ok("fetch recovers from a closed window", "Example Domain" in r["text"])
+            st = status(a.port)
+            ok("no orphan left behind", wait_dead(pid) is not None and st.get("chrome_pid") != pid,
+               f"old pid {pid} gone, now {st.get('chrome_pid')}")
 
         # 3. A crash: SIGKILL, no clean close — exactly the 'no close frame received or sent' the
         #    real failure logged. Re-read the pid; step 2 replaced the browser.

@@ -143,7 +143,9 @@ browser stays alive between calls. The rest of this README is for crawling many 
 
 ## Testing and maintenance
 
-Every one of these runs standalone and prints a pass/fail tally.
+Every one of these runs standalone and prints a pass/fail tally. The ones that start an engine run
+its Chrome headless (`PH_HEADLESS=1`) so tests stay off the desktop; `--headed` shows the window.
+The shared engine is always headed: headless is the Turnstile tell.
 
 | Script | What it proves |
 |---|---|
@@ -156,6 +158,9 @@ Every one of these runs standalone and prints a pass/fail tally.
 | `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
 | `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Also forces a reattach (`PH_TEST_HOOKS=1`) and checks it keeps the same Chrome (#33). Isolated port only — it refuses to run on 8731. |
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
+| `scripts/aclose_race_test.py` | two concurrent closes of one vendored nodriver connection raise nothing and close the socket once (#29). No browser needed. |
+| `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, and the no-progress watchdog cuts a stuck batch (#27). |
+| `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
 | `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
 | `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
@@ -190,6 +195,8 @@ architectural choice, and it's why this repo exists rather than a Playwright wra
   [ultrafunkamsterdam/nodriver#35](https://github.com/ultrafunkamsterdam/nodriver/issues/35) + fix PR
   [#36](https://github.com/ultrafunkamsterdam/nodriver/pull/36) (both open/unmerged). **Drop the vendor
   pin once #36 merges and a fixed release ships.**
+  - Owned here now, with local fixes: `Connection.aclose` takes the socket before awaiting, so two
+    concurrent closes no longer raise `None.wait_closed()` (#29).
 
 ## Usage (engine)
 ```
