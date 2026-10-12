@@ -129,6 +129,8 @@ def main():
         connect.ensure(a.port, want_browser=True)
         connect.call("newtab", port=a.port, url="about:blank", tag=tag)
         connect.call("goto", port=a.port, url=url, tab=tag, timeout=60)
+        wd = connect.call("js", port=a.port, expr="navigator.webdriver", tab=tag).get("result")
+        ok("navigator.webdriver is false (no automation flag)", wd is False, repr(wd))
         t0 = time.monotonic()
         r = connect.call("solve", port=a.port, tries=10, tab=tag, timeout=120)
         dt = time.monotonic() - t0

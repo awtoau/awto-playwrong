@@ -12,16 +12,19 @@ import base64
 import json
 import os
 import platform
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import time
 import urllib.request
 
-# Chrome writing DevToolsActivePort after spawn: worst launch seen 2.8 s (`op_done op=start` in
-# tmp/nd-server.log, 2026-10-12); 1.25x. On expiry: CDPLaunchError with the tail of Chrome's log.
+# Chrome printing "DevTools listening on" after spawn: worst launch seen 2.8 s (`op_done op=start`
+# in tmp/nd-server.log, 2026-10-12); 1.25x. On expiry: CDPLaunchError with the tail of Chrome's log.
 LAUNCH_TIMEOUT = 3.5
+LISTENING = re.compile(rb"DevTools listening on (ws://\S+)")
 # Websocket upgrade to a local Chrome: ms. 2 s covers a loaded box; on expiry ConnectionLost.
 WS_OPEN_TIMEOUT = 2.0
 # Browser.close or SIGTERM -> exit for Chrome: ~0.3 s typical. On expiry: the next step (SIGTERM,
@@ -38,7 +41,8 @@ CHROME_CANDIDATES = {
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome"],
 }
 
-# nodriver's launch flags, kept verbatim except the port (0 + DevToolsActivePort: no bind race).
+# nodriver's launch flags, kept verbatim. The port is a concrete free one, never 0:
+# --remote-debugging-port=0 makes Chrome report navigator.webdriver = true (scripts/stealth_check.py).
 # IsolateOrigins,site-per-process OFF keeps ordinary cross-origin iframes in-process (pierce reaches
 # them). Turnstile's iframe is out-of-process anyway: find_text handles that via iframe targets (#45).
 CHROME_FLAGS = [
@@ -103,54 +107,67 @@ def _log_tail(path, n=600):
         return ""
 
 
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 async def launch(headless=False, user_data_dir=None, extra_args=None, log_path=None):
     """Spawn Chrome and connect. Returns a Browser that owns the process (and a temp profile)."""
     temp = user_data_dir is None
     udd = tempfile.mkdtemp(prefix=PROFILE_PREFIX) if temp else user_data_dir
-    port_file = os.path.join(udd, "DevToolsActivePort")
-    try:
-        os.unlink(port_file)              # a persistent profile keeps the last run's port
-    except FileNotFoundError:
-        pass
+    port = _free_port()
     args = [find_chrome(), *CHROME_FLAGS, f"--user-data-dir={udd}",
-            "--remote-debugging-host=127.0.0.1", "--remote-debugging-port=0"]
+            "--remote-debugging-host=127.0.0.1", f"--remote-debugging-port={port}"]
     if headless:
         args.append("--headless=new")
     if getattr(os, "getuid", lambda: 1)() == 0:
         args.append("--no-sandbox")
     args += list(extra_args or ())
     args.append("about:blank")
-    log_f = open(log_path, "wb") if log_path else subprocess.DEVNULL    # truncated per launch
-    # Own process group: stop() ends Chrome's helpers too, not just the main process.
-    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
-                            start_new_session=True)
-    if log_path:
-        log_f.close()
+    # Chrome's output goes to a file (truncated per launch): its "DevTools listening on ws://…" line
+    # is the endpoint, so a port lost to another process between _free_port() and the bind can
+    # never connect us to someone else's browser.
+    if not log_path:
+        fd, log_path = tempfile.mkstemp(prefix="playwrong-chrome-", suffix=".log")
+        os.close(fd)
+        own_log = True
+    else:
+        own_log = False
+    with open(log_path, "wb") as log_f:
+        # Own process group: stop() ends Chrome's helpers too, not just the main process.
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+                                start_new_session=True)
     t0 = time.monotonic()
-    port = None
-    while time.monotonic() - t0 < LAUNCH_TIMEOUT:
-        if proc.poll() is not None:
-            break
-        try:
-            with open(port_file) as f:
-                first = f.readline().strip()
-            if first:
-                port = int(first)
+    ws_url = None
+    try:
+        while time.monotonic() - t0 < LAUNCH_TIMEOUT and proc.poll() is None:
+            try:
+                with open(log_path, "rb") as f:
+                    m = LISTENING.search(f.read())
+            except OSError:
+                m = None
+            if m:
+                ws_url = m.group(1).decode()
                 break
-        except (OSError, ValueError):
-            pass
-        await asyncio.sleep(0.02)
-    if port is None:
-        why = (f"exited with code {proc.returncode}" if proc.poll() is not None else
-               f"opened no DevTools port within {LAUNCH_TIMEOUT}s "
-               f"(waited {time.monotonic() - t0:.2f}s)")
-        if proc.poll() is None:
-            proc.kill()
-        if temp:
-            shutil.rmtree(udd, ignore_errors=True)
-        tail = _log_tail(log_path) if log_path else ""
-        raise CDPLaunchError(f"Chrome {why}: {' '.join(args[:1])}" + (f"\n{tail}" if tail else ""))
-    b = await attach("127.0.0.1", port)
+            await asyncio.sleep(0.02)
+        if ws_url is None or f"127.0.0.1:{port}/" not in ws_url:
+            why = (f"exited with code {proc.returncode}" if proc.poll() is not None else
+                   f"is not listening on 127.0.0.1:{port} within {LAUNCH_TIMEOUT}s "
+                   f"(waited {time.monotonic() - t0:.2f}s, saw {ws_url})")
+            if proc.poll() is None:
+                proc.kill()
+            if temp:
+                shutil.rmtree(udd, ignore_errors=True)
+            tail = _log_tail(log_path)
+            raise CDPLaunchError(f"Chrome {why}: {args[0]}" + (f"\n{tail}" if tail else ""))
+    finally:
+        if own_log:
+            os.unlink(log_path)               # Chrome keeps writing to the unlinked file; harmless
+    b = await _connect(ws_url, "127.0.0.1", port)
     b.process, b.user_data_dir, b._temp_profile = proc, udd, temp
     return b
 
@@ -163,11 +180,18 @@ def _version(host, port):
 
 async def attach(host, port):
     """Connect to a running Chrome's DevTools endpoint. The Browser owns no process."""
+    try:
+        info = await asyncio.to_thread(_version, host, port)
+    except Exception as e:
+        raise ConnectionLost(f"could not connect to Chrome at {host}:{port}: {e!r}") from e
+    return await _connect(info["webSocketDebuggerUrl"], host, port)
+
+
+async def _connect(ws_url, host, port):
     # Imported here so find_chrome() and the rest stay stdlib-only (scripts/doctor.py uses them).
     from websockets.asyncio.client import connect as _ws_connect
     try:
-        info = await asyncio.to_thread(_version, host, port)
-        ws = await _ws_connect(info["webSocketDebuggerUrl"], max_size=2 ** 28, ping_interval=None,
+        ws = await _ws_connect(ws_url, max_size=2 ** 28, ping_interval=None,
                                open_timeout=WS_OPEN_TIMEOUT)
     except Exception as e:
         raise ConnectionLost(f"could not connect to Chrome at {host}:{port}: {e!r}") from e

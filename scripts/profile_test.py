@@ -1,7 +1,6 @@
 """profile_test.py — a persistent profile (PH_PROFILE_DIR) survives restarts and crashes (#41).
 
-- Clean restart: a persistent cookie is still there, the profile dir is kept, the stale
-  DevToolsActivePort from the last run does not point the new launch at a dead port.
+- Clean restart: a persistent cookie is still there, the profile dir is kept.
 - Crash: SIGKILL engine + Chrome (pids from this engine's own /status, never pgrep), then the next
   launch heals the stale SingletonLock and comes up.
 - Isolated engine on :8739, headed on its own Xvfb (`--headed` for the desktop).
@@ -113,12 +112,12 @@ def main():
         connect.call("goto", port=p, url=url, timeout=60)
         ok("cookie set in the first run", has_cookie(p))
         ok("Chrome runs on the persistent profile",
-           os.path.exists(os.path.join(PROFILE, "DevToolsActivePort")), PROFILE)
+           os.path.exists(os.path.join(PROFILE, "Local State")), PROFILE)
         # Chrome writes cookies to disk lazily; a clean shutdown flushes them.
         connect.call("shutdown", port=p, timeout=15.0)
         ok("clean shutdown ends engine and Chrome", wait_down(p, [s1["pid"], s1["chrome_pid"]]))
         ok("the profile dir is kept after stop", os.path.isdir(os.path.join(PROFILE, "Default")))
-        # 2. clean restart: the old DevToolsActivePort names a dead port
+        # 2. clean restart
         connect.ensure(p, want_browser=True)
         s2 = connect.call("status", port=p, method="GET")
         ok("relaunch on the same profile comes up", s2.get("alive") is True,

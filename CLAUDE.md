@@ -32,9 +32,11 @@ that hits it usually reaches for curl instead of reporting it. So:
 
 `engine/cdp.py` is ours (#41); a Chrome update is what can break it. Every review:
 
-- `python scripts/cdp_smoke_test.py` and `python scripts/turnstile_click_test.py`. A failure after
-  a Chrome update = file an issue naming the Chrome version (`google-chrome --version`) and the
-  failing check.
+- `python scripts/cdp_smoke_test.py`, `python scripts/turnstile_click_test.py`,
+  `python scripts/stealth_check.py`. A failure after a Chrome update = file an issue naming the
+  Chrome version (`google-chrome --version`) and the failing check.
+- Any change to Chrome's launch arguments: `stealth_check.py` before merging. A port of 0 silently
+  set `navigator.webdriver = true` (#47).
 
 ## Testing
 
