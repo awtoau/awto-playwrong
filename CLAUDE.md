@@ -32,8 +32,9 @@ that hits it usually reaches for curl instead of reporting it. So:
 
 `engine/cdp.py` is ours (#41); a Chrome update is what can break it. Every review:
 
-- `python scripts/cdp_smoke_test.py`. A failure after a Chrome update = file an issue naming the
-  Chrome version (`google-chrome --version`) and the failing check.
+- `python scripts/cdp_smoke_test.py` and `python scripts/turnstile_click_test.py`. A failure after
+  a Chrome update = file an issue naming the Chrome version (`google-chrome --version`) and the
+  failing check.
 
 ## Testing
 

@@ -31,9 +31,9 @@ async def solve(tab, wait_after=5.0, find_timeout=15.0):
     """Click the in-iframe 'verify you are human' checkbox if present; return True once the page is
     no longer a challenge. Best-effort — safe to call on a page that isn't challenged (returns True)."""
     try:
-        pos = await tab.find_text("verify you are human", timeout=find_timeout)
-        if pos:
-            await tab.click(*pos)
+        hit = await tab.find_text("verify you are human", timeout=find_timeout)
+        if hit:
+            await hit.click()
             await asyncio.sleep(wait_after)
     except Exception:
         pass

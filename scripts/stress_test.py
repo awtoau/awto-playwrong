@@ -166,12 +166,29 @@ def t_batch_plus_interactive():
 
 # ── ownership labelling ─────────────────────────────────────────────────────────────────────────
 
+def browser_title(target_id):
+    """The title as Chrome shows it. Every engine op strips the label (#16), so read it over CDP."""
+    import asyncio
+
+    from engine import cdp
+    ep = connect.call("cdp", port=PORT)
+
+    async def go():
+        b = await cdp.attach(ep["host"], ep["port"])
+        try:
+            t = next(t for t in b.tabs if t.target_id == target_id)
+            return await t.evaluate("document.title")
+        finally:
+            await b.aclose()
+    return asyncio.run(go()) or ""
+
+
 def t_owner_labelling():
     """The owner must be visible IN the browser and invisible in the data."""
     tag, owner = "stress-owner", "stressbot@somerepo:999"
-    connect.call("newtab", port=PORT, url="about:blank", tag=tag, owner=owner)
+    tid = connect.call("newtab", port=PORT, url="about:blank", tag=tag, owner=owner)["target_id"]
     r = connect.call("goto", port=PORT, url="https://example.com", tab=tag, timeout=60)
-    shown = connect.call("js", port=PORT, expr="document.title", tab=tag).get("result") or ""
+    shown = browser_title(tid)
     ok("the browser tab title names its owner", owner in shown, shown[:70])
     ok("the API title stays clean", r["title"] == "Example Domain", repr(r["title"]))
     ok("read-back title stays clean",
@@ -183,7 +200,7 @@ def t_owner_labelling():
     ok("tabs reports a clean title too", listed and listed[0].get("title") == "Example Domain")
     # Re-navigating must not stack a second label on the same tab.
     connect.call("goto", port=PORT, url="https://example.org", tab=tag, timeout=60)
-    again = connect.call("js", port=PORT, expr="document.title", tab=tag).get("result") or ""
+    again = browser_title(tid)
     ok("re-navigating does not stack labels", again.count("\u27e6") == 1, again[:70])
     connect.call("closetab", port=PORT, tag=tag)
 

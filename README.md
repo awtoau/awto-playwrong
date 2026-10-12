@@ -151,6 +151,7 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | Script | What it proves |
 |---|---|
 | `scripts/doctor.py` | preflight: Python, deps, Chrome, display, port. Prints the exact fix command for anything missing. |
+| `scripts/turnstile_click_test.py` | the engine's `solve` clicks a REAL interactive Turnstile (Cloudflare's test sitekey `3x…FF` on a local page): the checkbox sits in an out-of-process iframe, the click lands, the widget issues its token (#45). |
 | `scripts/cdp_smoke_test.py` | `engine/cdp.py` against a real headless Chrome, no network: launch, tabs, evaluate, content, screenshot, find + click through an iframe and shadow root (the Turnstile layout), Fetch/dialog handling surviving navigation (#43), stop cleaning up its profile. |
 | `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup, and a local server that hangs up mid-download (must resume or fail by name, #31). `--cloudflare` adds a real Turnstile wall. |
 | `scripts/download_latency.py` | measures time-to-headers and the longest gap between socket reads on real downloads: the numbers `download()`'s per-read timeout is derived from (#30). `--runs N`. |
@@ -188,8 +189,9 @@ and it's why this repo exists rather than a Playwright wrapper.
   Holds the browser, the cleared session, and every verb.
 - `engine/cdp.py` — our CDP client (#41; replaced the vendored AGPL nodriver). One websocket,
   flattened sessions per tab, raw JSON. Stealth is by omission: no `--enable-automation`, no
-  chromedriver, never `Runtime.enable`. Keeps `--disable-features=IsolateOrigins,site-per-process` so
-  the Turnstile iframe stays reachable.
+  chromedriver, never `Runtime.enable`. The Turnstile iframe runs out-of-process regardless of the
+  site-isolation flags, so `find_text` also searches the tab's iframe targets and clicks through
+  that iframe's own session (#45).
 - `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
   html→text, one-shot `capture()`, `search()` and `download()`/`pdf()`. Every entry point goes
   through it, so "how do I start this thing" has exactly one answer.

@@ -200,7 +200,8 @@ def guard_retire(port):
     pid = s["pid"]
     say(f"  engine pid={pid} rss={s['rss_mb']}MB rss_limit={s['rss_limit_mb']}MB")
     try:
-        cycle(port, 0)                      # `text` adds ~10 MB, taking a ~62 MB engine past 64M
+        # A 40 MB js result is held by the engine while check_rss runs: past 64M from any baseline.
+        connect.call("js", port=port, expr="'x'.repeat(40e6)", timeout=60)
     except connect.EngineError as e:
         say(f"  op after the trigger: {str(e)[:100]}")
     gone = wait_gone(port, pid, 50.0)

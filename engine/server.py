@@ -849,9 +849,9 @@ class ND:
     async def _click_challenge(self, t):
         """Click the "verify you are human" checkbox if it is on the page; True if clicked."""
         try:
-            pos = await t.find_text("verify you are human", timeout=3)
-            if pos:
-                await t.click(*pos); await asyncio.sleep(4)
+            hit = await t.find_text("verify you are human", timeout=3)
+            if hit:
+                await hit.click(); await asyncio.sleep(4)
                 return True
         except Exception as e:
             log("click_err", e=str(e)[:50])

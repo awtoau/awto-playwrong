@@ -38,8 +38,8 @@ CHROME_CANDIDATES = {
 }
 
 # nodriver's launch flags, kept verbatim except the port (0 + DevToolsActivePort: no bind race).
-# IsolateOrigins,site-per-process OFF keeps the Turnstile iframe in-process, so DOM.getDocument
-# (pierce) reaches its checkbox. Do not drop it.
+# IsolateOrigins,site-per-process OFF keeps ordinary cross-origin iframes in-process (pierce reaches
+# them). Turnstile's iframe is out-of-process anyway: find_text handles that via iframe targets (#45).
 CHROME_FLAGS = [
     "--remote-allow-origins=*", "--no-first-run", "--no-service-autorun",
     "--no-default-browser-check", "--homepage=about:blank", "--no-pings",
@@ -467,34 +467,85 @@ class Tab:
                                                          "clickCount": 1})
 
     async def find_text(self, text, timeout=3.0, poll=0.5):
-        """Centre (x, y) of the element whose text best matches `text`, searching iframes and shadow
-        roots; None after `timeout`. Best match = text length closest to the needle's."""
+        """A Hit on the element whose text best matches `text` (length closest to the needle's),
+        searching shadow roots, in-process iframes, then this tab's out-of-process iframes; None
+        after `timeout`. Turnstile's iframe is out-of-process even with site isolation off."""
         t0 = time.monotonic()
         while True:
-            try:
-                doc = (await self.send("DOM.getDocument", {"depth": -1, "pierce": True}))["root"]
-                for el in sorted(_text_hosts(doc, text),
-                                 key=lambda e: abs(len(text) - len(_text_all(e)))):
-                    try:
-                        q = await self.send("DOM.getContentQuads",
-                                            {"backendNodeId": el["backendNodeId"]})
-                    except CDPError:
-                        continue                    # not rendered (display:none, detached)
-                    if q.get("quads"):
-                        quad = q["quads"][0]
-                        return sum(quad[0::2]) / 4, sum(quad[1::2]) / 4
-            finally:
+            hit, frame_ids = await self._find_in(self, text)
+            for fid in [] if hit else frame_ids:
+                frame = Tab(self.browser, fid)       # an iframe target: own session, own coords
                 try:
-                    await self.send("DOM.disable")   # stop Chrome tracking the whole tree
-                except Exception:
-                    pass
+                    hit, _ = await self._find_in(frame, text)
+                except (CDPError, TargetGone):       # not a target, or gone mid-search
+                    hit = None
+                if hit:
+                    break
+                await frame.detach()
+            if hit:
+                return hit
             if time.monotonic() - t0 >= timeout:
                 return None
             await asyncio.sleep(poll)
 
+    @staticmethod
+    async def _find_in(t, text):
+        """(Hit or None, frame ids of iframe elements) for one target's pierced DOM."""
+        try:
+            doc = (await t.send("DOM.getDocument", {"depth": -1, "pierce": True}))["root"]
+            for el in sorted(_text_hosts(doc, text), key=lambda e: abs(len(text) - len(_text_all(e)))):
+                try:
+                    q = await t.send("DOM.getContentQuads", {"backendNodeId": el["backendNodeId"]})
+                except CDPError:
+                    continue                        # not rendered (display:none, detached)
+                if q.get("quads"):
+                    quad = q["quads"][0]
+                    return Hit(t, sum(quad[0::2]) / 4, sum(quad[1::2]) / 4), []
+            return None, _iframe_frame_ids(doc)
+        finally:
+            try:
+                await t.send("DOM.disable")         # stop Chrome tracking the whole tree
+            except Exception:
+                pass
+
+    async def detach(self):
+        """Drop this tab's session (Chrome keeps the target)."""
+        sid = self.session_id
+        if sid:
+            try:
+                await self.browser.send("Target.detachFromTarget", {"sessionId": sid})
+            except Exception:
+                pass
+            self._detached(TargetGone(f"tab {self.target_id[:8]} detached"))
+
     async def close(self):
         """Close through the BROWSER session: a crashed tab's own session never answers (#28)."""
         await self.browser.close_target(self.target_id)
+
+
+class Hit:
+    """Where find_text found its element: the target holding it and (x, y) in that target's
+    viewport. click() goes through that target's session, so it lands inside an OOPIF too."""
+    def __init__(self, tab, x, y):
+        self.tab, self.x, self.y = tab, x, y
+
+    async def click(self):
+        try:
+            await self.tab.click(self.x, self.y)
+        finally:
+            if self.tab.browser._tabs.get(self.tab.target_id) is not self.tab:
+                await self.tab.detach()             # an iframe session opened just for the find
+
+
+def _iframe_frame_ids(root):
+    """frameId of every IFRAME element: an out-of-process iframe's target id is its frame id."""
+    out, stack = [], [root]
+    while stack:
+        n = stack.pop()
+        if n.get("nodeName") == "IFRAME" and n.get("frameId") and "contentDocument" not in n:
+            out.append(n["frameId"])
+        stack.extend(_children(n))
+    return out
 
 
 def _children(n):

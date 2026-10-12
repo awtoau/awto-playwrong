@@ -113,10 +113,10 @@ async def main():
         check("content", html.startswith("<!DOCTYPE") or "<p id=\"p\">hello</p>" in html, html[:40])
         png = await t.screenshot()
         check("screenshot png", png[:8] == b"\x89PNG\r\n\x1a\n", f"{len(png)} bytes")
-        pos = await t.find_text("verify you are human", timeout=3)
-        check("find_text through iframe+shadow", pos is not None, str(pos))
-        if pos:
-            await t.click(*pos)
+        hit = await t.find_text("verify you are human", timeout=3)
+        check("find_text through iframe+shadow", hit is not None, hit and f"({hit.x}, {hit.y})")
+        if hit:
+            await hit.click()
             await asyncio.sleep(0.2)
             check("click reaches the label", await t.evaluate("document.title") == "clicked")
         seen = []

@@ -7,9 +7,12 @@ never be clicked. Raw CDP (no Playwright instrumentation) gets the real interact
 "verify you are human" in the cross-origin iframe, clicks it, and PASSES. The detected component is
 Playwright itself. => use the engine for anything behind Cloudflare.
 
-## Site isolation must be OFF to reach the challenge iframe
-`--disable-features=IsolateOrigins,site-per-process` (engine/cdp.py) + real Chrome. Keeps the
-cross-origin Turnstile iframe in-process, so `DOM.getDocument(pierce)` reaches its checkbox.
+## The Turnstile checkbox is in an out-of-process iframe
+- Even with `--disable-features=IsolateOrigins,site-per-process`, the challenges.cloudflare.com
+  iframe is its own target: the page's `DOM.getDocument(pierce)` has no `contentDocument` for it.
+- Its target id = the `frameId` on the page's `<iframe>` node. Attach to that, search its DOM, and
+  send the click on ITS session in its own viewport coordinates (`engine/cdp.py` `find_text`, #45).
+- Proven by `scripts/turnstile_click_test.py` (Cloudflare test sitekey `3x00000000000000000000FF`).
 
 ## Torn-frame guard (image/cam grabs)
 A frame grabbed mid-write is torn (partial JPEG). Validate: JPEG ends FFD9, PNG ends IEND; if torn,

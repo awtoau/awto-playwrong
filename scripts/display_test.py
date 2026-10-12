@@ -34,7 +34,9 @@ def ok(name, cond, detail=""):
 
 
 def load_server():
-    spec = importlib.util.spec_from_file_location("pw_server", os.path.join(REPO, "engine", "server.py"))
+    # server.py runs as a script and imports its siblings (cdp, memcap) bare: give it engine/ too.
+    sys.path.insert(0, os.path.join(REPO, "engine"))
+    spec =importlib.util.spec_from_file_location("pw_server", os.path.join(REPO, "engine", "server.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
