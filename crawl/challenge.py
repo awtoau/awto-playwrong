@@ -38,7 +38,7 @@ async def solve(tab, wait_after=5.0, find_timeout=15.0):
     except Exception:
         pass
     try:
-        title = await tab.evaluate("document.title")
+        title = await tab.evaluate("document.title", isolated=True)
         html = await tab.content()
         return not is_challenge(title, html)
     except Exception:

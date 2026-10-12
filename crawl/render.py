@@ -34,7 +34,7 @@ DISMISS_JS = r"""(() => {
 async def dismiss_overlays(tab):
     """Click cookie-consent 'accept' + Escape leftover modals so the real content shows. Best-effort."""
     try:
-        clicked = await tab.evaluate(DISMISS_JS)
+        clicked = await tab.evaluate(DISMISS_JS, isolated=True)   # DOM clicks; page can't hook it
         try:
             for ty in ("keyDown", "keyUp"):
                 await tab.send("Input.dispatchKeyEvent", {"type": ty, "key": "Escape",
@@ -55,7 +55,8 @@ async def wait_for_render(tab, min_chars=200, max_wait=8.0, poll=0.5):
     t0 = _t.monotonic()
     while _t.monotonic() - t0 < max_wait:
         try:
-            n = await tab.evaluate("document.body ? document.body.innerText.length : 0")
+            n = await tab.evaluate("document.body ? document.body.innerText.length : 0",
+                                   isolated=True)
             n = int(n) if isinstance(n, (int, float)) else 0
         except Exception:
             n = 0
@@ -71,7 +72,8 @@ async def wait_for_render(tab, min_chars=200, max_wait=8.0, poll=0.5):
 async def body_text_len(tab):
     """Current visible body-text length (used to decide if a page is empty). Best-effort -> 0."""
     try:
-        return int(await tab.evaluate("document.body ? document.body.innerText.length : 0") or 0)
+        return int(await tab.evaluate("document.body ? document.body.innerText.length : 0",
+                                      isolated=True) or 0)
     except Exception:
         return 0
 
@@ -86,7 +88,7 @@ async def wait_ready(tab, max_wait=10.0, poll=0.25):
     state = "loading"
     while _t.monotonic() - t0 < max_wait:
         try:
-            state = await tab.evaluate("document.readyState") or "loading"
+            state = await tab.evaluate("document.readyState", isolated=True) or "loading"
         except Exception:
             state = "loading"
         if state in ("interactive", "complete"):

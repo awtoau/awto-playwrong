@@ -119,6 +119,20 @@ async def main():
             await hit.click()
             await asyncio.sleep(0.2)
             check("click reaches the label", await t.evaluate("document.title") == "clicked")
+        # #49: a page hooking DOM methods must not see isolated-world calls.
+        await t.navigate("data:text/html,<title>hook</title><p id=p>x</p><script>window.__hits=0;"
+                         "const g=document.getElementById.bind(document);"
+                         "document.getElementById=(i)=>{window.__hits++;return g(i)}</script>")
+        await asyncio.sleep(0.3)
+        iso = await t.evaluate("document.getElementById('p').textContent", isolated=True)
+        check("isolated world reads the DOM", iso == "x", repr(iso))
+        check("isolated call is invisible to the page's hook", await t.evaluate("__hits") == 0)
+        await t.evaluate("document.getElementById('p')")
+        check("main-world call is seen by the hook (control)", await t.evaluate("__hits") == 1)
+        await t.navigate("data:text/html,<title>after</title>")
+        await asyncio.sleep(0.3)
+        check("isolated world survives a navigation", await t.evaluate(
+            "document.title", isolated=True) == "after")
         seen = []
         t.on("Page.frameNavigated", lambda p: seen.append(p))
         await t.send("Page.enable")

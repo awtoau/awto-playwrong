@@ -30,9 +30,9 @@ KNOWN_RED = {
     # none. Only that form is excused: "navigator.webdriver = true" is a real leak (#41: port 0).
     "navigatorWebdriver": ("canShare/share listed (Chrome on a Wayland desktop)",
                            lambda note: "canShare" in note and "webdriver = true" not in note),
-    # Runtime.evaluate runs in the page's main world; every engine op does. Isolated-world
-    # evaluation would hide it (nodriver did the same).
-    "mainWorldExecution": ("engine evaluates in the main world", lambda note: True),
+    # Pass 2 runs the CALLER's js op, which is main-world by design (callers read page globals).
+    # The engine's own reads are isolated (#49); cdp_smoke_test proves a page hook cannot see them.
+    "mainWorldExecution": ("the caller's js op is main-world by design", lambda note: True),
 }
 VERDICT = re.compile(r"(🟢|🔴|🟡|⚪️?)\s*([A-Za-z]+)\s+[\d.]+ ms\s+(.*?)(?=🟢|🔴|🟡|⚪|\bJSON\b|$)")
 # Detector settle after load: its async checks (useragent) finished by 0.5 s on the shared engine.

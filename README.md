@@ -194,7 +194,9 @@ and it's why this repo exists rather than a Playwright wrapper.
   flattened sessions per tab, raw JSON. Stealth is by omission: no `--enable-automation`, no
   chromedriver, never `Runtime.enable`. The Turnstile iframe runs out-of-process regardless of the
   site-isolation flags, so `find_text` also searches the tab's iframe targets and clicks through
-  that iframe's own session (#45).
+  that iframe's own session (#45). The engine's own page reads (readyState, title, location, the
+  owner label, crawl render polling) run in an isolated world a page cannot hook; only the caller's
+  `js` op is main-world, since callers read page globals (#49).
 - `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
   html→text, one-shot `capture()`, `search()` and `download()`/`pdf()`. Every entry point goes
   through it, so "how do I start this thing" has exactly one answer.

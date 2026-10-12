@@ -780,7 +780,7 @@ class ND:
         t0 = time.monotonic()
         while True:
             try:
-                state = await t.evaluate("document.readyState")
+                state = await t.evaluate("document.readyState", isolated=True)
             except Exception:
                 return None
             if state == "complete" or time.monotonic() - t0 >= LOAD_WAIT:
@@ -799,7 +799,7 @@ class ND:
         if not no_js:
             await self._label(t)
             try:
-                title = strip_owner(await t.evaluate("document.title"))
+                title = strip_owner(await t.evaluate("document.title", isolated=True))
             except Exception:
                 title = await self._title_from_html(t)
         else:
@@ -830,13 +830,13 @@ class ND:
                 # \\s, not \s: this is a JS regex escape, and as a Python escape it does not exist \u2014
                 # every import warned, and the log was mostly that warning. Issue #9.
                 "(()=>{const m=%r,o=%r;const t=document.title.replace(/^\u27e6[^\u27e7]*\u27e7\\s*/,'');"
-                "document.title=m+o+'\u27e7 '+t;return 1})()" % (OWNER_L, owner))
+                "document.title=m+o+'\u27e7 '+t;return 1})()" % (OWNER_L, owner), isolated=True)
         except Exception:
             pass
 
     async def _href(self, t=None):
         """Authoritative current url: Tab.url comes from target events and can lag, so ask the page."""
-        try: return await (t or self.tab).evaluate("location.href")
+        try: return await (t or self.tab).evaluate("location.href", isolated=True)
         except Exception: return ""
     def _is_chal(self, t, h):
         t=(t or "").lower(); h=(h or "").lower()
@@ -844,7 +844,7 @@ class ND:
     async def _solve(self, tries=20, tab=None):
         tb = await self._tab(tab)
         for i in range(tries):
-            t=await tb.evaluate("document.title"); h=await tb.content()
+            t=await tb.evaluate("document.title", isolated=True); h=await tb.content()
             if not self._is_chal(t,h): log("solved",i=i); return {"passed":True,"iter":i}
             if await self._click_challenge(tb): log("clicked",i=i)
             await asyncio.sleep(1)
@@ -863,7 +863,7 @@ class ND:
         t = await self._tab(tab)
         # The html carries the label too, inside <title> — mode="html" handed it straight to the
         # caller while the `title` field beside it was clean (#16).
-        return {"title":strip_owner(await t.evaluate("document.title")),
+        return {"title":strip_owner(await t.evaluate("document.title", isolated=True)),
                 "html":unlabel(await t.content(), self.owner_of(t)),
                 "url": await self._href(t)}
     async def _frame(self, tab=None):
@@ -1152,6 +1152,7 @@ class ND:
         async IIFE rather than being rejected."""
         t = await self._tab(tab)
         try:
+            # Main world on purpose: callers read page globals. Engine-internal reads are isolated (#49).
             raw = await t.evaluate(JS_WRAP % expr.strip().rstrip(";"), await_promise=True)
         except cdp.JSError as e:
             # The wrapper catches runtime throws, so this is a syntax error in the expression.
@@ -1228,20 +1229,20 @@ class ND:
             await self._label(t)
             await asyncio.sleep(2)
             state = await self._loaded(t)
-            title = await t.evaluate("document.title")
+            title = await t.evaluate("document.title", isolated=True)
             html = await t.content()
             passed = None
             if solve and self._is_chal(title, html):
                 passed = False
                 for _ in range(tries):
-                    title = await t.evaluate("document.title")
+                    title = await t.evaluate("document.title", isolated=True)
                     html = await t.content()
                     if not self._is_chal(title, html):
                         passed = True
                         break
                     await self._click_challenge(t)
                     await asyncio.sleep(1)
-            try: href = await t.evaluate("location.href")
+            try: href = await t.evaluate("location.href", isolated=True)
             except Exception: href = url
             slots[i] = {"status": "ready", "title": strip_owner(title), "html": html, "url": href,
                         "requested": url, "challenge": passed}
@@ -1278,7 +1279,7 @@ class ND:
         there is real content, otherwise an honest error."""
         if t is not None:
             try:
-                title = await asyncio.wait_for(t.evaluate("document.title"), timeout=5)
+                title = await asyncio.wait_for(t.evaluate("document.title", isolated=True), timeout=5)
                 html = await asyncio.wait_for(t.content(), timeout=10)
                 if html and len(html) > 500:      # enough to be a page, not a blank shell
                     return {"status": "ready", "title": title, "html": html, "url": url,

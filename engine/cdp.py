@@ -417,6 +417,7 @@ class Tab:
         self.error = None           # set when crashed/closed: every later send raises it
         self._handlers = {}
         self._attaching = None
+        self._world_id = None       # isolated-world context for the current document; see _world()
 
     def _info(self, info):
         self.url = info.get("url", self.url)
@@ -433,6 +434,7 @@ class Tab:
             self.browser.fail_session(self.session_id, err)
         self.session_id = None
         self._attaching = None
+        self._world_id = None
 
     def fail(self, err):
         """Mark the tab dead (renderer crash): in-flight and later commands raise err."""
@@ -477,15 +479,35 @@ class Tab:
         """Page.navigate: returns once Chrome has started the load, not when it finishes."""
         return await self.send("Page.navigate", {"url": url})
 
-    async def evaluate(self, expr, await_promise=False):
-        """The expression's value (by value). Raises JSError if it threw."""
-        r = await self.send("Runtime.evaluate", {
-            "expression": expr, "returnByValue": True, "awaitPromise": await_promise,
-            "userGesture": True, "allowUnsafeEvalBlockedByCSP": True})
+    async def evaluate(self, expr, await_promise=False, isolated=False):
+        """The expression's value (by value). Raises JSError if it threw.
+        isolated=True runs in a private world on the same DOM: page scripts cannot see or hook the
+        call (#49). Page JS globals are not visible there, so a caller's own `js` stays main-world."""
+        params = {"expression": expr, "returnByValue": True, "awaitPromise": await_promise,
+                  "userGesture": True, "allowUnsafeEvalBlockedByCSP": True}
+        if isolated:
+            params["contextId"] = await self._world()
+        try:
+            r = await self.send("Runtime.evaluate", params)
+        except CDPError as e:
+            if not isolated or "context" not in (e.message or "").lower():
+                raise
+            self._world_id = None                    # the world died with its document: remake once
+            params["contextId"] = await self._world()
+            r = await self.send("Runtime.evaluate", params)
         if "exceptionDetails" in r:
             d = r["exceptionDetails"]
             raise JSError((d.get("exception") or {}).get("description") or d.get("text") or str(d))
         return r.get("result", {}).get("value")
+
+    async def _world(self):
+        """Execution context id of this tab's isolated world for the current document."""
+        if self._world_id is None:
+            tree = await self.send("Page.getFrameTree")
+            r = await self.send("Page.createIsolatedWorld",
+                                {"frameId": tree["frameTree"]["frame"]["id"], "worldName": "pw"})
+            self._world_id = r["executionContextId"]
+        return self._world_id
 
     async def content(self):
         """Serialised document, doctype included. Works with page JS disabled."""
