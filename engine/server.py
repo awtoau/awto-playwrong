@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cdp  # engine/cdp.py; server.py runs as a script, so its dir is on sys.path
+import logroll
 import memcap
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
@@ -161,8 +162,10 @@ def log(a, **k):
     # could be tied to either. Timestamp is ISO 8601 with offset (UTC).
     ts = datetime.now(UTC).isoformat(timespec="milliseconds")
     try:
-        open(LOG, "a").write(f"{ts} pid={PID} rss_mb={proc_status_mb('VmRSS')} {a} "
-                             + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
+        logroll.roll(LOG)                 # every engine on this checkout shares the file (#39)
+        with open(LOG, "a") as f:
+            f.write(f"{ts} pid={PID} rss_mb={proc_status_mb('VmRSS')} {a} "
+                    + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
     except Exception:
         pass
 

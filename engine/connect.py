@@ -33,6 +33,11 @@ import urllib.request
 import zlib
 from html.parser import HTMLParser
 
+try:
+    from . import logroll  # imported as engine.connect (every caller in this repo)
+except ImportError:
+    import logroll  # loaded as a top-level module with engine/ on sys.path
+
 # This process's identity inside a SHARED browser. Every tab this process opens is tagged with it,
 # and every op it issues names the tab it means — so a second agent driving the same engine cannot
 # move the page out from under us. One browser, many agents, no contention.
@@ -149,6 +154,7 @@ def spawn(port=None, profile=None):
     env = {**os.environ, "PH_PORT": str(port)}
     if profile:
         env["PH_PROFILE"] = profile      # engine/server.py turns the NAME into a user-data-dir
+    logroll.roll(SERVER_LOG)             # the engine holds it open for life: roll at spawn (#39)
     subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
                      env=env,
                      stdout=open(SERVER_LOG, "a"), stderr=subprocess.STDOUT,
@@ -621,6 +627,7 @@ def _log_search(engine, query, outcome, n=0):
     """One JSON line per engine attempt, so how often DDG blocks is a number, not a guess (#34)."""
     try:
         os.makedirs(LOGDIR, exist_ok=True)
+        logroll.roll(SEARCH_LOG)
         with open(SEARCH_LOG, "a") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engine": engine,
                                 "outcome": outcome, "n": n, "owner": OWNER, "q": query[:200]}) + "\n")

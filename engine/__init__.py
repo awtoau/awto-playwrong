@@ -6,6 +6,7 @@
   cli.py      the `playwrong` command
   client.py   the interactive CLI (goto/click/key/js/tabs/…)
   memcap.py   the systemd memory cap the engine and crawl run under
+  logroll.py  size cap for the engine's logs
   mcp_server.py  the MCP stdio front-end
 
 Nothing here needs to be started by hand; connect.ensure() does it.

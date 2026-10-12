@@ -7,17 +7,9 @@ close them when done — NEVER stop the shared server.
 """
 import asyncio
 import json
-import os
-import subprocess
-import sys
 import urllib.request as _urlreq
 
-from engine import cdp
-
-# The playwrong repo root = two levels up from this file (…/awto-playwrong/crawl/browser.py).
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SERVER = os.path.join(_REPO, "engine", "server.py")
-_LOG_DIR = os.path.join(_REPO, "tmp")
+from engine import cdp, connect
 
 
 def _call(op, port, body=None, method="POST", timeout=60):
@@ -77,12 +69,7 @@ def browser_ok(port):
 
 
 def _start_server(port):
-    os.makedirs(_LOG_DIR, exist_ok=True)
-    subprocess.Popen(
-        [sys.executable, _SERVER],
-        env={**os.environ, "PH_PORT": str(port)},
-        stdout=open(os.path.join(_LOG_DIR, "playwrong-server.log"), "a"),
-        stderr=subprocess.STDOUT)
+    connect.spawn(port)          # the one engine spawn path: detached, log rolled (#39)
 
 
 async def _wait_up(port, tries=60):
