@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>playwrong</title>
+  <!-- awto house style: #E30613 square, thin white line art breaking its own frame -->
+  <rect width="256" height="256" fill="#E30613"/>
+  <rect x="52" y="96" width="116" height="116" fill="none" stroke="#fff" stroke-width="7"/>
+  <!-- red underlay cuts a gap in the box edge where the tick escapes -->
+  <polyline points="82,152 112,184 214,58" fill="none" stroke="#E30613" stroke-width="25"/>
+  <polyline points="82,152 112,184 214,58" fill="none" stroke="#fff" stroke-width="7"
+            stroke-linejoin="miter"/>
+</svg>
