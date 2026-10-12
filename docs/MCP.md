@@ -56,10 +56,10 @@ python3 -m venv .venv                                  # optional but recommende
 Then restart your MCP client. Tools appear as `mcp__playwrong__fetch`, `…__screenshot`, and so on.
 
 **What you actually need on the box:** Python 3.11+, Google Chrome or Chromium, and a display
-(the browser runs **headed** on purpose — headless is the Turnstile tell). Everything else is either
-stdlib or vendored: the only two PyPI packages are `websockets` and `Deprecated`, both pulled in by
-the in-tree `vendor/nodriver`. The crawl/ library's heavier deps (SQLAlchemy, psycopg, zstandard) are
-**not** needed for browser driving.
+(the browser runs **headed** on purpose — headless is the Turnstile tell). Everything else is
+stdlib or in-tree: the only PyPI package is `websockets`, for the CDP client (`engine/cdp.py`). The
+crawl/ library's heavier deps (SQLAlchemy, psycopg, zstandard) are **not** needed for browser
+driving.
 
 If anything is missing, `scripts/doctor.py` tells you which one and prints the literal command that
 fixes it:
@@ -68,8 +68,7 @@ fixes it:
 python scripts/doctor.py
 ```
 
-It checks: Python version, the two deps, the vendored nodriver import, a Chrome binary (per-platform
-paths), `DISPLAY`/`WAYLAND_DISPLAY`, a writable `tmp/`, the MCP server compiling, and whether the
+It checks: Python version, the dependency, a Chrome binary (the engine's own per-platform lookup), `DISPLAY`/`WAYLAND_DISPLAY`, a writable `tmp/`, the MCP server compiling, and whether the
 engine port is free or already serving. Exit code 0 = ready.
 
 ### VSCode has a SEPARATE registry — this is the #1 "it didn't install" confusion
@@ -381,8 +380,8 @@ from engine import connect               # python
 print(connect.capture("https://awto.au")["text"])
 ```
 
-None of them need a server started first. If you find yourself writing `ensure_server()` or exporting
-`PYTHONPATH=vendor`, you're reimplementing `connect.ensure()`.
+None of them need a server started first. If you find yourself writing `ensure_server()`, you're
+reimplementing `connect.ensure()`.
 
 ## Many agents, one browser
 
@@ -454,7 +453,7 @@ browser state:
   persistent profile and its own engine on a stable, name-derived port)
 - **a throwaway session that must not touch your real one** → `--port 8799`
 - **true parallel throughput** beyond what one browser can serialise → several engines, or attach
-  your own nodriver via the engine's `/cdp` endpoint and drive many tabs yourself
+  your own CDP client (`engine.cdp.attach`) via the engine's `/cdp` endpoint and drive many tabs
 
 ### Your tabs are yours
 
@@ -516,7 +515,7 @@ That is the right level, because the failure being prevented is an accident, not
 - **Concurrency.** The engine has one globally-active tab, so a capture is serialised by a lock
   inside this process. Two *separate* MCP server processes (two agents) driving one engine can still
   interleave. If you need genuine parallelism: run a second engine on another `PH_PORT` (register a
-  second MCP entry with `--port`), or attach your own nodriver to the shared browser via the engine's
+  second MCP entry with `--port`), or attach your own CDP client to the shared browser via the engine's
   `/cdp` endpoint — see the sharding section of [AGENT-API.md](AGENT-API.md).
 
 ## Troubleshooting
@@ -525,7 +524,7 @@ That is the right level, because the failure being prevented is an accident, not
 |---|---|
 | Tools work in Claude Code but the **VSCode panel is empty** | Two separate registries — see above. Run `install.py --vscode`, then reload the window. |
 | Ran `--vscode`, panel *still* empty | VSCode MCP config is per-profile. The window's profile has its own `mcp.json`; writing only `User/mcp.json` does nothing for it. `--vscode` now writes every profile — re-run it and reload. |
-| Chrome windows piling up / lots of RAM gone | Orphaned browsers from an engine that died without closing its own. `python scripts/cleanup_orphans.py` reports them, `--kill` closes them. It only ever touches Chrome on a nodriver temp profile (`/tmp/uc_*`) or a playwrong profile, so your own browser can never match. |
+| Chrome windows piling up / lots of RAM gone | Orphaned browsers from an engine that died without closing its own. `python scripts/cleanup_orphans.py` reports them, `--kill` closes them. It only ever touches Chrome on an engine temp profile (`/tmp/playwrong-profile-*`) or a playwrong profile, so your own browser can never match. |
 | A tab fails with `TabCrashed` / `renderer was killed` | Its page ran out of memory under the engine's cap and the kernel killed that renderer only (#28). `close_tab` it and open a new one; other tabs are fine. `MemoryHighWater` on a new tab means the engine is near the cap: close tabs you no longer need. |
 | Engine RSS keeps climbing, or the host swaps / OOM-kills | `status` shows `rss_mb`, `fds` and `cdp_sockets`; sockets far above the tab count is a connection leak (#23 was 277 for 3 tabs). `python scripts/engine_inspect.py` says what the heap holds; `python scripts/memory_test.py` is the regression check. The engine is capped (`PH_MEMORY_MAX`, default 8G) and exits at 75 % of it, logging `rss_limit`. |
 | Tools missing after registering | Restart the MCP client. Check with `claude mcp list`. |

@@ -51,8 +51,8 @@ def _note(m): print(f"… {m}", file=sys.stderr, flush=True)
 
 def call(op, **a):
     """Send one primitive. Every verb AUTO-STARTS the engine and Chrome if they are down — there is
-    no "start the server first" step any more, and no PYTHONPATH to set (server.py puts vendor/ on
-    sys.path itself). `status` deliberately does not auto-start: its job is to report what is true."""
+    no "start the server first" step, and no PYTHONPATH to set. `status` deliberately does not
+    auto-start: its job is to report what is true."""
     if op=="status":
         if not connect.reachable(): return {"server":False,"alive":False,"port":PORT}
         return connect.call("status", method="GET")

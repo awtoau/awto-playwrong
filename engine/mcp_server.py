@@ -2,20 +2,20 @@
 
 WHY THIS EXISTS
 An agent that wants one bot-walled page used to have to: read docs/AGENT-API.md, write a script with
-ensure_server(), know PYTHONPATH=vendor + PH_PORT, understand lazy Chrome launch, do
+ensure_server(), know PH_PORT, understand lazy Chrome launch, do
 goto -> sniff title -> solve -> text, then remember to close its tab — and then swallow ~500KB of raw
 HTML. This file removes all of that: the ops arrive in the agent's tool list already described, the
 engine is auto-started, the Turnstile dance is collapsed into ONE `fetch` call, tabs are opened and
 closed inside that call so they cannot leak, and HTML comes back as readable text.
 
 WHAT IT IS NOT
-Not a rewrite. The real engine is still engine/server.py (nodriver, one shared headed Chrome, HTTP on
+Not a rewrite. The real engine is still engine/server.py (raw CDP, one shared headed Chrome, HTTP on
 PH_PORT). This is a thin JSON-RPC-over-stdio proxy in front of it. Every tool here is one or a few
 HTTP POSTs to that engine.
 
-DEPENDENCIES: stdlib only. The engine itself needs `websockets` + `Deprecated` (nodriver's runtime
-deps) — see scripts/doctor.py. This file needs nothing, so it starts instantly and can report a
-broken engine install as a tool error instead of failing to load.
+DEPENDENCIES: stdlib only. The engine itself needs `websockets` — see scripts/doctor.py. This file
+needs nothing, so it starts instantly and can report a broken engine install as a tool error
+instead of failing to load.
 
 PROTOCOL: MCP over stdio = newline-delimited JSON-RPC 2.0 on stdin/stdout. STDOUT IS THE WIRE —
 nothing may print to it except protocol messages (all diagnostics go to stderr, and the engine

@@ -143,12 +143,7 @@ def reachable(port=None, timeout=2.0):
 
 
 def spawn(port=None, profile=None):
-    """Launch engine/server.py detached, output to a log file.
-
-    No PYTHONPATH is set: server.py puts vendor/ on sys.path itself (and does it with
-    sys.path.insert(0, ...), so the vendored nodriver wins over any site-packages copy). Callers
-    that export PYTHONPATH=vendor are copying a step that has not been needed for a long time.
-    """
+    """Launch engine/server.py detached, output to a log file. No PYTHONPATH needed."""
     port = port or default_port()
     os.makedirs(LOGDIR, exist_ok=True)
     env = {**os.environ, "PH_PORT": str(port)}

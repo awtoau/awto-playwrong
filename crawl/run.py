@@ -59,30 +59,26 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
     rl = getattr(cfg, "rl", None)
     # capture the main document's HTTP status via a one-shot CDP response hook (so we can SEE a 429).
     doc_status = {"code": None, "retry_after": None}
-    def _on_resp(ev):
+    def _on_resp(p):
         try:
-            r = ev.response
-            # first same-URL (or same-host document) response wins — that's the navigation response.
-            if doc_status["code"] is None and getattr(r, "status", None):
-                doc_status["code"] = int(r.status)
-                hdrs = {k.lower(): v for k, v in (getattr(r, "headers", {}) or {}).items()}
+            r = p.get("response", {})
+            # first Document response wins — that's the navigation response.
+            if p.get("type") == "Document" and doc_status["code"] is None and r.get("status"):
+                doc_status["code"] = int(r["status"])
+                hdrs = {k.lower(): v for k, v in (r.get("headers") or {}).items()}
                 ra = hdrs.get("retry-after")
                 if ra:
                     try: doc_status["retry_after"] = float(ra)
                     except ValueError: doc_status["retry_after"] = None
         except Exception:
             pass
+    tab.on("Network.responseReceived", _on_resp)     # Network.enable is sent in _new_tab (#42)
     try:
         if rl is not None:
             await rl.acquire(host)          # block until it's polite to hit this host
-        try:
-            from nodriver import cdp as _cdp
-            tab.add_handler(_cdp.network.ResponseReceived, _on_resp)
-        except Exception:
-            pass
         nav_timed_out = False
         try:
-            await asyncio.wait_for(tab.get(url), timeout=cfg.nav_timeout)
+            await asyncio.wait_for(tab.navigate(url), timeout=cfg.nav_timeout)
         except TimeoutError:
             nav_timed_out = True
         # rate-limited? back the host off and requeue this URL — don't store the 429 body as content.
@@ -105,7 +101,7 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
             stats["fail"] += 1
             print(f"  TIMEOUT(empty) {url}", flush=True)
             return
-        html = await tab.get_content()
+        html = await tab.content()
         sp = store.store_page(html, cfg.store_root)          # store_page already extracted title+text
         links = parse.extract_links(html, url)
         images = list(parse.extract_images(html, url))
@@ -133,6 +129,7 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
         stats["fail"] += 1
         print(f"  ERR {url} :: {str(e)[:120]}", flush=True)
     finally:
+        tab.off("Network.responseReceived", _on_resp)
         if not terminal:   # crash/cancel before any scan -> don't leave the row stuck in 'fetching'
             try:
                 d.scan(url, status="error", note="no terminal state (crash/cancel)")
@@ -146,22 +143,14 @@ async def _auto_dismiss_dialogs(tab):
     geolocation), alert()/confirm()/prompt() do the same. Chrome pauses the tab waiting for a human —
     the crawler has none, so it would stall. We handle every Page.javascriptDialogOpening by accepting
     it (beforeunload accept = 'leave', which is what we want since we're navigating away). Best-effort."""
+    async def _accept(_p):
+        try:
+            await tab.send("Page.handleJavaScriptDialog", {"accept": True})
+        except Exception:
+            pass
     try:
-        from nodriver import cdp as _cdp
-        await tab.send(_cdp.page.enable())
-
-        def _on_dialog(ev):
-            async def _accept():
-                try:
-                    await tab.send(_cdp.page.handle_java_script_dialog(accept=True))
-                except Exception:
-                    pass
-            try:
-                import asyncio as _a
-                _a.ensure_future(_accept())
-            except Exception:
-                pass
-        tab.add_handler(_cdp.page.JavascriptDialogOpening, _on_dialog)
+        tab.on("Page.javascriptDialogOpening", _accept)     # async handler: runs as its own task
+        await tab.send("Page.enable")
     except Exception:
         pass
 
@@ -199,27 +188,17 @@ async def _bounded(coro, limit, what, url=""):
 
 
 async def _close_tab(b, tab, url=""):
-    """Close a crawl tab, bounded. Tab.close() goes through the tab's own session, which never
-    answers once its renderer has died (#27, #28); then close it through the browser connection."""
+    """Close a crawl tab, bounded, through the browser session (a dead renderer's never answers)."""
     try:
-        await _bounded(tab.close(), CLOSE_TIMEOUT, "tab close", url)
-        return
+        await _bounded(b.close_target(tab.target_id), CLOSE_TIMEOUT, "tab close", url)
     except Exception:
         pass
-    tid = getattr(getattr(tab, "target", None), "target_id", None)
-    if tid:
-        try:
-            from nodriver import cdp as _cdp
-            await _bounded(b.send(_cdp.target.close_target(target_id=tid)), CLOSE_TIMEOUT,
-                           "browser-side tab close", url)
-        except Exception:
-            pass
 
 
 async def _new_tab(b, cfg):
     """Open one crawl tab (resource blocker + JS-dialog auto-dismiss enabled). Returns (tab, blocker)."""
     try:
-        tab = await _bounded(b.get("about:blank", new_tab=True), NEWTAB_TIMEOUT, "new tab")
+        tab = await _bounded(b.new_tab("about:blank"), NEWTAB_TIMEOUT, "new tab")
     except Stalled:
         raise
     except Exception as e:
@@ -227,11 +206,15 @@ async def _new_tab(b, cfg):
             raise
         # Every window closed, Chrome still up: a tab needs a window to go in (#35).
         print("  no browser window open; opening a new one", flush=True)
-        tab = await _bounded(b.get("about:blank", new_window=True), NEWTAB_TIMEOUT, "new window")
+        tab = await _bounded(b.new_tab("about:blank", new_window=True), NEWTAB_TIMEOUT, "new window")
     try:
         blk = netblock.ResourceBlocker(tab, block_types=cfg.block_types)
         await _bounded(blk.enable(), SETUP_TIMEOUT, "resource blocker enable")
         await _bounded(_auto_dismiss_dialogs(tab), SETUP_TIMEOUT, "dialog auto-dismiss")
+        # Document status for 429/503 backoff (#42). Bodies are never read: buffer nothing.
+        await _bounded(tab.send("Network.enable", {"maxTotalBufferSize": 0,
+                                                   "maxResourceBufferSize": 0}),
+                       SETUP_TIMEOUT, "network enable")
     except Exception:
         await _close_tab(b, tab)
         raise
@@ -565,7 +548,7 @@ def _parse_args(argv):
 def main(argv=None):
     a = _parse_args(argv if argv is not None else sys.argv[1:])
     if argv is None:
-        # Same hard cap as the engine: an attacher runs its own nodriver, and in #23 one reached
+        # Same hard cap as the engine: an attacher runs its own CDP client, and in #23 one reached
         # 4.5 GB uncapped (#26). May re-exec this process; PH_CRAWL_MEMORY_MAX=0 disables.
         from engine import memcap
         cap = memcap.enter("crawl", os.environ.get("PH_CRAWL_MEMORY_MAX", "4G"),

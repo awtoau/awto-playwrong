@@ -27,9 +27,9 @@ python3 -m venv .venv                                            # optional but 
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
-(headless is the Turnstile tell). The only two PyPI packages are `websockets` and `Deprecated`;
-nodriver is vendored in-tree and everything else is stdlib. `python scripts/doctor.py` checks all of
-it and prints the exact command for anything missing.
+(headless is the Turnstile tell). The only PyPI package is `websockets`; the CDP client
+(`engine/cdp.py`) and everything else is in-tree stdlib. `python scripts/doctor.py` checks all of it
+and prints the exact command for anything missing.
 
 > The `crawl/` library needs more (SQLAlchemy, psycopg, zstandard — see `pyproject.toml`). You don't
 > need any of that just to drive a browser.
@@ -124,7 +124,7 @@ which then fails by name) instead of the host or every client — #23 was 39.5 G
 was one OOM taking every tab. New tabs are refused above 85 % of the cap (`PH_MEMORY_HIGH_WATER`). `PH_MEMORY_MAX=16G` raises it,
 `PH_MEMORY_MAX=0` disables it; without a systemd user manager it runs uncapped and `/status` says so.
 `python -m crawl.run` gets the same treatment in a scope of its own, `PH_CRAWL_MEMORY_MAX` (default
-4G), because it attaches with its own nodriver (#26). An engine that a crawl spawns still gets its
+4G), because it attaches with its own CDP client (#26). An engine that a crawl spawns still gets its
 own 8G scope, so the two never share a cap.
 
 ### Driving a page, not just reading it
@@ -150,7 +150,8 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 
 | Script | What it proves |
 |---|---|
-| `scripts/doctor.py` | preflight: Python, deps, vendored nodriver, Chrome, display, port. Prints the exact fix command for anything missing. |
+| `scripts/doctor.py` | preflight: Python, deps, Chrome, display, port. Prints the exact fix command for anything missing. |
+| `scripts/cdp_smoke_test.py` | `engine/cdp.py` against a real headless Chrome, no network: launch, tabs, evaluate, content, screenshot, find + click through an iframe and shadow root (the Turnstile layout), Fetch/dialog handling surviving navigation (#43), stop cleaning up its profile. |
 | `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup, and a local server that hangs up mid-download (must resume or fail by name, #31). `--cloudflare` adds a real Turnstile wall. |
 | `scripts/download_latency.py` | measures time-to-headers and the longest gap between socket reads on real downloads: the numbers `download()`'s per-read timeout is derived from (#30). `--runs N`. |
 | `scripts/stress_test.py` | the edge cases: duplicate and bad urls, empty batches, double collect, missing tabs, a batch running while someone else drives, malformed requests. |
@@ -159,14 +160,12 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
 | `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Also forces a reattach (`PH_TEST_HOOKS=1`) and checks it keeps the same Chrome (#33). Isolated port only — it refuses to run on 8731. |
 | `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
-| `scripts/aclose_race_test.py` | two concurrent closes of one vendored nodriver connection raise nothing and close the socket once (#29). No browser needed. |
-| `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, and the no-progress watchdog cuts a stuck batch (#27). |
+| `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, the no-progress watchdog cuts a stuck batch (#27), and pages record their HTTP status (#42). |
 | `scripts/rank_test.py` | `crawl.rank` scoring (url shape, sitemap discovery, OpenPageRank, secrets lookup) offline, then `crawl.run --rank` on a local site: a 2-page budget fetches the sitemap-only page, not the tag listings (#2). `--offline` skips the crawl. |
 | `scripts/search_fallback_test.py` | a local page posing as DuckDuckGo's anti-bot block: `search()` retries once, falls back to live Brave Search, tags the results `brave`, and logs each attempt (#34). |
-| `scripts/upstream_check.py` | run on every review: new upstream/fork nodriver commits, vendor files not in the fork, a new PyPI release (and whether its wheel compiles), and new repos doing the same work, against `vendor/UPSTREAM.json`. `--update` records a review. |
 | `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
-| `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, every nodriver connection and what it holds, optional tracemalloc. For the next "why is it 4 GB". |
-| `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches nodriver temp profiles, so your own browser can't match. |
+| `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, CDP client counters (pending commands, sessions, tabs, handlers), optional tracemalloc. For the next "why is it 4 GB". |
+| `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches engine temp profiles and playwrong profiles, so your own browser can't match. |
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
 | `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |
 | `scripts/install.py` | deps, the `playwrong` command on PATH, and both MCP registries. |
@@ -178,15 +177,19 @@ you drive over **IP:port** — `goto a page → get back {html, cookies, status,
 that any number of apps/agents can share. No DB, no project specifics: pure capture. Wire your own
 data layer on top (the project keeps its DB code; this stays generic).
 
-## Why nodriver, and not Playwright
+## Why raw CDP, and not Playwright
 **Playwright is the detection tell.** Cloudflare serves it a dead challenge that never resolves, no
-matter how the automation is configured. nodriver drives a real Chrome over raw CDP and passes. The
-browser also runs **headed** deliberately — headless is itself a signal. That is the whole
-architectural choice, and it's why this repo exists rather than a Playwright wrapper.
+matter how the automation is configured. A real Chrome driven over raw CDP passes. The browser also
+runs **headed** deliberately — headless is itself a signal. That is the whole architectural choice,
+and it's why this repo exists rather than a Playwright wrapper.
 
 ### The pieces
-- `engine/server.py` — the engine: one persistent **headed real Chrome** (nodriver), driven over HTTP
-  on a port. Holds the browser, the cleared session, and every verb.
+- `engine/server.py` — the engine: one persistent **headed real Chrome**, driven over HTTP on a port.
+  Holds the browser, the cleared session, and every verb.
+- `engine/cdp.py` — our CDP client (#41; replaced the vendored AGPL nodriver). One websocket,
+  flattened sessions per tab, raw JSON. Stealth is by omission: no `--enable-automation`, no
+  chromedriver, never `Runtime.enable`. Keeps `--disable-features=IsolateOrigins,site-per-process` so
+  the Turnstile iframe stays reachable.
 - `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
   html→text, one-shot `capture()`, `search()` and `download()`/`pdf()`. Every entry point goes
   through it, so "how do I start this thing" has exactly one answer.
@@ -194,10 +197,6 @@ architectural choice, and it's why this repo exists rather than a Playwright wra
 - `engine/client.py` — the interactive port client (`goto/click/key/js/read/tabs/…`).
 - `engine/mcp_server.py` — the MCP stdio server for agents ([docs/MCP.md](docs/MCP.md)).
 - `crawl/` — an optional library for crawling many pages on top of the engine (its own heavier deps).
-- `vendor/nodriver` — our nodriver 0.50.6, vendored from the fork `awto-au/nodriver`; we own it.
-  - Upstream 0.50.6 (current CDP protocol) plus fixes upstream lacks: dropped connections closed and
-    CDP results not retained (#23), UTF-8 in `generate_cdp.py`, `Connection.aclose` race (#29).
-  - Every review runs `scripts/upstream_check.py` against `vendor/UPSTREAM.json`.
 
 ## Usage (engine)
 ```
@@ -232,8 +231,8 @@ print(page["text"])                              # {text, title, url, challenge}
 
 The crawl library adds `CrawlDB.host_counts()` — pages already attempted per host, which is what makes
 `--max-per-host` survive a resume.
-Launching `engine/server.py` by hand still works if you want it in the foreground — and it needs no
-`PYTHONPATH`, since it puts `vendor/` on `sys.path` itself.
+Launching `engine/server.py` by hand still works if you want it in the foreground; it needs no
+`PYTHONPATH`.
 Or POST directly: `POST http://127.0.0.1:8731/goto {"url": "..."}` → returns the capture.
 
 ## The capture contract (what you get back)
@@ -249,7 +248,7 @@ the same shared browser.
 
 | module | what |
 |---|---|
-| `crawl.browser` | attach nodriver to the shared engine Chrome via `/cdp` (starts the server if down) |
+| `crawl.browser` | attach an `engine.cdp` client to the shared engine Chrome via `/cdp` (starts the server if down) |
 | `crawl.challenge` | Cloudflare "verify you are human" detect + `solve()`; generic soft-404 matcher |
 | `crawl.netblock` | CDP Fetch resource-type block — **one pattern per blocked type** so page load never stalls (the naive `url_pattern="*"` version froze `readyState=loading` → empty captures; see the docstring) |
 | `crawl.render` | consent-dismiss (`dismiss_overlays`) + `wait_ready` (readyState) + `wait_for_render` (client-mount) |
@@ -294,10 +293,6 @@ Every flag is load-bearing on a free-threaded (no-GIL) machine — omit one and 
   `python3.14` has the GIL; `uv` would otherwise pick it and no-GIL is silently lost).
 - `--no-binary-package sqlalchemy` + `DISABLE_SQLALCHEMY_CEXT=1` — build SQLAlchemy from source with
   its C extension off; the prebuilt wheel's `cyextension` re-enables the GIL on import.
-- The patched **nodriver is bundled** in the wheel (`crawl/_vendor/nodriver`) and `import crawl`
-  prepends it to `sys.path`, so no `PYTHONPATH` juggling — `import crawl` then `import nodriver` gets
-  the fixed copy. (A bare `import nodriver` without importing `crawl` first still finds the broken
-  PyPI copy; always go through `crawl`.)
 
 Verify after install: `python -c "import sys, crawl; import sqlalchemy.util as u; assert not
 sys._is_gil_enabled() and not u.has_compiled_ext()"` on the tool's interpreter.
@@ -306,12 +301,6 @@ For development, an editable install in a free-threaded venv works too:
 `uv pip install -e .` after `DISABLE_SQLALCHEMY_CEXT=1 uv pip install --no-binary sqlalchemy "sqlalchemy>=2.0"`.
 
 ## Gotchas — read before running
-- **nodriver import landmine.** Upstream `nodriver/cdp/network.py` has a non-UTF-8 byte (line ~1345)
-  that raises `SyntaxError` under **Python 3.14** (both the GIL and free-threaded builds — 3.14 tightened
-  the source tokenizer to reject non-UTF-8 bytes with no encoding declaration; 3.13 and earlier were
-  lenient). `vendor/nodriver` here is patched, and `engine/server.py` puts it FIRST on `sys.path`, so
-  the patched copy wins over any `site-packages` install automatically. If you import nodriver
-  yourself in another process, make sure `vendor/` leads there too.
 - **SQLAlchemy on no-GIL.** Its `cyextension` C module silently re-enables the GIL. Install the
   pure-Python build: `DISABLE_SQLALCHEMY_CEXT=1 pip install --no-binary SQLAlchemy "SQLAlchemy>=2.0"`.
   Verify `not sys._is_gil_enabled()` after import. Drivers must be pure-Python too: `psycopg` (not
@@ -324,14 +313,12 @@ For development, an editable install in a free-threaded venv works too:
 
 ## Key lessons baked in (see docs/)
 - **Playwright is the Turnstile tell.** Cloudflare detects Playwright's CDP instrumentation and serves
-  a dead challenge; **nodriver** (raw CDP, no Playwright) gets the real interactive widget and passes.
+  a dead challenge; **raw CDP** (no Playwright) gets the real interactive widget and passes.
 - **Site-isolation flags** + real Chrome channel matter for reaching cross-origin challenge iframes.
 - **Torn-frame guard** for image/cam grabs (validate JPEG ends FFD9 / PNG ends IEND; retry on
   mid-write).
 - **Clean shutdown over the command port** — never pkill the browser.
-- **Python 3.14t free-threaded** — sync Playwright segfaults; use async / nodriver.
-- **Python 3.14+, any build** — released nodriver won't import (a bare `\xb1` in a comment, which
-  3.14 stopped tolerating). The vendored copy is patched; nothing to install.
+- **Python 3.14t free-threaded** — sync Playwright segfaults; use async / raw CDP.
 
 ## Licence
 MIT — see [LICENSE](LICENSE).

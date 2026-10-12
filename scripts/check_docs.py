@@ -31,7 +31,8 @@ DOCS = ["README.md"] + [os.path.join("docs", f) for f in sorted(os.listdir(os.pa
 # Files that USED to exist. Naming one in a doc is always a bug now — this is the check that would
 # have caught the mcp/server.py rename immediately.
 GONE = ["mcp/server.py", "engine/solve.py", "engine/shared_browser.py", "methods/",
-        "nd_server.py", "nd_solve.py", "start_server.py", "browser_ctl.py", "ph_common"]
+        "nd_server.py", "nd_solve.py", "start_server.py", "browser_ctl.py", "ph_common",
+        "vendor/", "upstream_check.py", "aclose_race_test.py", "UPSTREAM.json", "_vendor"]
 
 # Markdown link targets and inline-code paths that look repo-relative.
 LINK = re.compile(r"\[[^\]]*\]\((?!https?:|#|mailto:)([^)#]+)")
@@ -50,10 +51,9 @@ EXTERNAL = ("User/", ".vscode/", "~", "/home", "/mnt", "site-packages", "AppData
 
 
 def _resolves(doc, target):
-    """A path resolves if it exists relative to the doc, the repo root, or vendor/ — or, for a bare
-    basename mentioned in prose, if the repo contains a file with that name anywhere."""
-    roots = [os.path.dirname(os.path.join(REPO, doc)), REPO, os.path.join(REPO, "vendor"),
-             os.path.join(REPO, "vendor", "nodriver")]
+    """A path resolves if it exists relative to the doc or the repo root — or, for a bare basename
+    mentioned in prose, if the repo contains a file with that name anywhere."""
+    roots = [os.path.dirname(os.path.join(REPO, doc)), REPO]
     return any(os.path.exists(os.path.join(r, target)) for r in roots)
 
 

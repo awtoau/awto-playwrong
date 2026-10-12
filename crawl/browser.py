@@ -1,7 +1,7 @@
 """crawl.browser — attach to the shared awto-playwrong headed Chrome. Zero project refs.
 
 The whole point of awto-playwrong: ONE long-running headed Chrome (Turnstile-cleared, reused by many
-agents). This module attaches a nodriver Browser to it via the engine's published CDP endpoint,
+agents). This module attaches an engine.cdp Browser to it via the engine's published CDP endpoint,
 starting the engine server if it isn't up. Callers open their OWN tabs on the returned browser and
 close them when done — NEVER stop the shared server.
 """
@@ -12,12 +12,11 @@ import subprocess
 import sys
 import urllib.request as _urlreq
 
-import nodriver as uc
+from engine import cdp
 
 # The playwrong repo root = two levels up from this file (…/awto-playwrong/crawl/browser.py).
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SERVER = os.path.join(_REPO, "engine", "server.py")
-_VENDOR = os.path.join(_REPO, "vendor")
 _LOG_DIR = os.path.join(_REPO, "tmp")
 
 
@@ -81,7 +80,7 @@ def _start_server(port):
     os.makedirs(_LOG_DIR, exist_ok=True)
     subprocess.Popen(
         [sys.executable, _SERVER],
-        env={**os.environ, "PYTHONPATH": _VENDOR, "PH_PORT": str(port)},
+        env={**os.environ, "PH_PORT": str(port)},
         stdout=open(os.path.join(_LOG_DIR, "playwrong-server.log"), "a"),
         stderr=subprocess.STDOUT)
 
@@ -95,7 +94,7 @@ async def _wait_up(port, tries=60):
 
 
 async def attach(port=8731):
-    """Attach nodriver to the shared browser via /cdp — self-healing.
+    """Attach a CDP client to the shared browser via /cdp — self-healing.
 
     Robust to the browser being CLOSED (Dan's case): a bare server status=alive can lie when its Chrome
     was stopped, so we (1) ensure the server is up, (2) ask it to launch/relaunch Chrome via /goto,
@@ -129,7 +128,7 @@ async def attach(port=8731):
             continue
         info = _call("cdp", port, timeout=10)
         try:
-            return await uc.start(host=info["host"], port=info["port"])  # host+port => attach
+            return await cdp.attach(info["host"], info["port"])
         except Exception as e:
             last_err = e
             await asyncio.sleep(1.5)

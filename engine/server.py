@@ -1,16 +1,15 @@
 """server.py — the capture engine: ONE headed Chrome, driven over HTTP, shared by every caller.
 
-Backed by nodriver, not Playwright: Playwright is the Turnstile tell (Cloudflare serves it a dead
-challenge that never resolves), while nodriver drives Chrome over raw CDP and passes. One browser
-does everything — clear Turnstile, capture pages, feed the viz screenshots — so there is no second
-browser and no orphan windows.
+Raw CDP (engine/cdp.py), not Playwright: Playwright is the Turnstile tell (Cloudflare serves it a
+dead challenge that never resolves). One browser does everything — clear Turnstile, capture pages,
+feed the viz screenshots — so there is no second browser and no orphan windows.
 
 Control port (POST JSON): goto{url} solve{tries} text shot js{expr} cookies clearcookies
                           newtab closetab closeextra tabs cdp move click key shutdown
 GET: /status /tabs /viz /frame /markers ; POST /setmarkers
 
-You do not need to run this by hand — engine/connect.py starts it on demand, and it puts vendor/ on
-sys.path itself, so no PYTHONPATH is required. To run it in the foreground anyway:
+You do not need to run this by hand — engine/connect.py starts it on demand. To run it in the
+foreground anyway:
 
     python engine/server.py            # PH_PORT (default 8731); log in tmp/nd-server.log
                                        # PH_MEMORY_MAX (default 8G) caps python+Chrome via systemd
@@ -28,29 +27,8 @@ import traceback
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import memcap  # engine/memcap.py; server.py runs as a script, so its dir is on sys.path
-
-
-def _use_vendored_nodriver():
-    """Put the PATCHED nodriver first on sys.path, in a checkout AND in an installed package.
-
-    Upstream nodriver 0.50.x has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on
-    import under CPython 3.14+. The fixed copy lives at `vendor/nodriver` in a source checkout and
-    ships to `crawl/_vendor/nodriver` in the wheel. Looking only at `../vendor` (as this did) meant
-    an INSTALLED playwrong found no vendored copy, imported the broken PyPI one, and died on its
-    first run with exactly that SyntaxError — the landmine the README warns about, in the one place
-    a user cannot fix it themselves."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, "..", "vendor"),                  # source checkout
-                 os.path.join(os.path.dirname(here), "crawl", "_vendor")):   # installed wheel
-        if os.path.isdir(os.path.join(cand, "nodriver")):
-            sys.path.insert(0, cand)
-            return
-
-
-_use_vendored_nodriver()
-import nodriver as uc  # noqa: E402
-from nodriver import cdp  # noqa: E402
+import cdp  # engine/cdp.py; server.py runs as a script, so its dir is on sys.path
+import memcap
 
 PORT = int(os.environ.get("PH_PORT", "8731"))
 
@@ -99,8 +77,8 @@ def code_version():
                            capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
             sha = r.stdout.strip()
-            # Repo root, not `here`: scoped to engine/ this reported a clean tree while vendor/,
-            # crawl/ and pyproject.toml were all modified — "dirty" has to mean "the checkout differs
+            # Repo root, not `here`: scoped to engine/ this reported a clean tree while crawl/ and
+            # pyproject.toml were both modified — "dirty" has to mean "the checkout differs
             # from that sha", or it answers a question nobody asked.
             root = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
                                   capture_output=True, text=True, timeout=5).stdout.strip() or here
@@ -134,6 +112,7 @@ def data_dir():
 
 TMP = data_dir()
 LOG = os.path.join(TMP, "nd-server.log")
+CHROME_LOG = os.path.join(TMP, "chrome.log")     # Chrome's stdout/stderr, truncated per launch
 CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
 # Ownership shown IN the tab title, so a human looking at a shared browser can tell at a glance which
@@ -167,15 +146,8 @@ def strip_owner(title):
     the window, and must never leak into a capture, a result, or a caller's data."""
     return OWNER_TITLE_RE.sub("", title or "")
 
-# Serialise the caller's expression IN THE PAGE and hand back a JSON string.
-#
-# Reading nodriver's return value directly does not work: it yields a RemoteObject for anything that
-# isn't a primitive (so `({a:1})` came back as "RemoteObject(type_='object', ...)"), a raw
-# ExceptionDetails for a thrown error, and a tuple in other cases — none of them JSON-serialisable,
-# which killed the HTTP response mid-flight. Stringifying in the page sidesteps every one of those
-# shapes: objects, arrays, promises, undefined and exceptions all arrive as one plain string.
-#
-# `await (…)` wraps both sync and async expressions, so no special case is needed for either.
+# Serialise the caller's expression IN THE PAGE and hand back a JSON string: undefined, promises and
+# thrown errors (with stack) all arrive as one plain string. `await (…)` covers sync and async.
 JS_WRAP = ("(async () => { try { const v = await (%s);"
            " return JSON.stringify(v === undefined ? null : v); }"
            " catch (e) { return JSON.stringify("
@@ -403,8 +375,8 @@ def _retire_worker():
 
 def ensure_display(env=None, uid=None, x11_dir="/tmp/.X11-unix", run_dir=None):
     """Adopt the user's desktop display when spawned without one; headed Chrome cannot start otherwise.
-    An engine spawned from an ssh/remote-editor shell has no DISPLAY, and nodriver then fails with a
-    misleading "running as root / no_sandbox" hint. Returns what was adopted; raises if there is none."""
+    An engine spawned from an ssh/remote-editor shell has no DISPLAY, and Chrome then exits at launch.
+    Returns what was adopted; raises if there is none."""
     env = os.environ if env is None else env
     if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
         return {}
@@ -487,25 +459,20 @@ def heal_profile(profile_dir):
 
 def _dead_conn(e):
     """Is this exception "the browser went away", as opposed to a page-level failure?
-
-    Matched by name and message rather than by class: the same event surfaces as websockets'
-    ConnectionClosedError, as a bare builtin ConnectionError('Connection closed') from nodriver's
-    own send(), and as an OSError when the socket dies harder. Observed message on the real
-    failure: 'no close frame received or sent'."""
-    n, s = type(e).__name__, str(e)
-    return ("ConnectionClosed" in n or n in ("ConnectionError", "ConnectionResetError")
-            or "Connection closed" in s or "no close frame" in s)
+    cdp.ConnectionLost is a ConnectionError; websockets' own close errors are matched by name."""
+    return isinstance(e, ConnectionError) or "ConnectionClosed" in type(e).__name__
 
 
 def _lost_target(e):
-    """Is this "the TAB went away" with Chrome still fine (#22)? -32001 when our session outlived the
-    target, -32602 when nodriver tries to re-attach to it. Page-level: re-point, never forget()."""
+    """Is this "the TAB went away" with Chrome still fine (#22)? Page-level: re-point, never forget().
+    Chrome's -32001/-32602 messages cover a session or target that outlived the tab."""
     s = str(e)
-    return "Session with given id not found" in s or "No target with given id" in s
+    return (isinstance(e, cdp.TargetGone) or "Session with given id not found" in s
+            or "No target with given id" in s)
 
 
 class ND:
-    """nodriver browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
+    """The browser on its own asyncio loop in a thread; sync-facing .do() for the HTTP handler."""
     def __init__(self):
         self.loop = asyncio.new_event_loop(); self.browser=self.tab=None
         self._dead = False      # set when an op hits a dropped connection; cleared by _ensure()
@@ -528,8 +495,8 @@ class ND:
         """Has the Chrome we launched exited? Cheap — no CDP round trip on the happy path.
 
         `self.tab` is a plain Python object that outlives the browser, so testing it alone answers
-        "did we ever launch", never "is it still there". nodriver's `stopped` reads the child
-        process's returncode, which is the difference between recovering and not."""
+        "did we ever launch", never "is it still there". `stopped` reads the child process's
+        returncode, which is the difference between recovering and not."""
         if self.browser is None: return True
         try: return bool(self.browser.stopped)
         except Exception: return True   # can't tell -> assume gone; a spare relaunch beats a wedge
@@ -550,7 +517,7 @@ class ND:
         if not self.ok(): return False
         try:
             # Through the BROWSER connection: browser health must not depend on one tab existing (#22).
-            await asyncio.wait_for(self.browser.send(cdp.browser.get_version()), timeout)
+            await asyncio.wait_for(self.browser.send("Browser.getVersion"), timeout)
             return True
         except TimeoutError:
             return None
@@ -559,7 +526,7 @@ class ND:
             return False
     def owner_of(self, t):
         """The `agent@repo:pid` that opened this tab, or None if it was opened without a label."""
-        return self.owners.get(getattr(getattr(t, "target", None), "target_id", None))
+        return self.owners.get(getattr(t, "target_id", None))
     def owner_alive(self, owner):
         """Is the process behind an owner label still running?
 
@@ -582,7 +549,7 @@ class ND:
     def chrome_pid(self):
         """PID of the Chrome we launched, or None. Diagnostic — and what lets a test kill exactly
         this browser instead of pgrep-ing for one and hitting somebody's shared session."""
-        p = getattr(self.browser, "_process", None) if self.browser is not None else None
+        p = self.browser.process if self.browser is not None else None
         return getattr(p, "pid", None)
     def forget(self, why):
         """Mark the connection dead, but KEEP the browser handle.
@@ -603,25 +570,24 @@ class ND:
 
         Preferred over relaunching whenever the process is alive: a relaunch throws away the cleared
         Turnstile session and every login, which is the whole reason this project holds one browser
-        open. `uc.start(host, port)` attaches instead of spawning — crawl/browser.py has attached to
-        the shared browser this way for a while."""
+        open."""
         info = getattr(self, "_cdp", None) or {}
         if not info.get("host"): return False
         old = self.browser
         try:
-            new = await uc.start(host=info["host"], port=info["port"])
+            new = await cdp.attach(info["host"], info["port"])
             # An attached handle owns no process, so gone() read True and the next op launched a
             # second Chrome, orphaning this one (#33). Carry ours over.
-            if old is not None and getattr(new, "_process", None) is None:
-                new._process = getattr(old, "_process", None)
-                new._process_pid = getattr(old, "_process_pid", None)
+            if old is not None and new.process is None:
+                new.process, new.user_data_dir = old.process, old.user_data_dir
+                new._temp_profile = old._temp_profile
             self.browser = new
-            self.tab = await self.browser.get("about:blank")
+            self.tab = await self._first_tab()
             await self._watch_crashes()
             self._dead = False
             log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
             if old is not None:
-                asyncio.ensure_future(self._release_all(old))   # its Tabs are ghosts now (#23)
+                asyncio.ensure_future(old.aclose())
             return True
         except Exception as e:
             log("reattach_failed", e=repr(e)[:100])
@@ -639,7 +605,7 @@ class ND:
     async def _ensure(self):
         """Launch the browser once, however many callers arrive at once — and relaunch it if it died.
 
-        The bare `if self.tab: return` was a double-checked lock with no lock. uc.start() awaits, so
+        The bare `if self.tab: return` was a double-checked lock with no lock. The launch awaits, so
         twelve concurrent first-ops ALL saw self.tab as None and ALL launched a browser: one engine,
         twelve Chromes, eleven of them untracked and therefore unclosable. Measured exactly that —
         nd_started fired 12 times for a single server. The lock makes the launch happen once; the
@@ -656,7 +622,7 @@ class ND:
                 if not self.gone() and await self._reattach(): return
                 if self.gone():
                     # Relaunching used to leave no trace of WHY Chrome went; the exit code is it (#35).
-                    p = getattr(self.browser, "_process", None)
+                    p = self.browser.process
                     log("browser_exited", pid=getattr(p, "pid", None),
                         returncode=getattr(p, "returncode", None))
                 await self._retire()      # still running but unreachable: stop it, don't strand it
@@ -670,11 +636,11 @@ class ND:
             try:
                 # On Xvfb, X11 explicitly: Chrome picks Wayland from the session environment.
                 args = ["--ozone-platform=x11"] if XVFB is not None else None
-                self.browser = await uc.start(headless=HEADLESS, user_data_dir=PROFILE_DIR,
-                                              browser_args=args)
+                self.browser = await cdp.launch(headless=HEADLESS, user_data_dir=PROFILE_DIR,
+                                                extra_args=args, log_path=CHROME_LOG)
             except Exception as e:
-                # nodriver blames root/sandbox for any launch failure; under the cap the usual
-                # cause is the kernel killing Chrome's processes, which memory.events records (#28).
+                # Under the cap the usual cause is the kernel killing Chrome's processes, which
+                # memory.events records (#28).
                 after = memcap.oom_kills()
                 if kills is not None and after is not None and after > kills:
                     raise RuntimeError(
@@ -682,11 +648,15 @@ class ND:
                         f"processes under the engine's {MEMORY_CAP} memory cap. Raise PH_MEMORY_MAX "
                         f"(it is set when the engine starts).") from e
                 raise
-            self.tab = await self.browser.get("about:blank")
+            self.tab = await self._first_tab()
             self._publish_cdp()
             self.crashed.clear()
             await self._watch_crashes()
-            log("nd_started", cdp=f"{self.browser.config.host}:{self.browser.config.port}")
+            log("nd_started", cdp=f"{self.browser.host}:{self.browser.port}")
+    async def _first_tab(self):
+        """The first page Chrome lists, or a new about:blank when every tab is gone."""
+        tabs = self.browser.tabs
+        return tabs[0] if tabs else await self.browser.new_tab("about:blank")
     async def _start(self):
         """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
         primitive /status can't give you on its own. Chrome only launches on the FIRST real op
@@ -700,47 +670,15 @@ class ND:
         await self._ensure()
         return {"started": True}
     def tab_count(self):
-        """Tabs the browser lists, from the cached target list; no CDP round trip."""
+        """Tabs the browser lists, from the event-maintained target list; no CDP round trip."""
         try: return len(self.browser.tabs) if self.browser is not None else 0
         except Exception: return 0
-    async def _release(self, c):
-        """Close a nodriver connection the browser no longer lists — the leak in #23.
-
-        Every Tab has its own websocket and listener task; nodriver's update_targets() drops a gone
-        target from its list without closing either, and the task pins the Tab, the socket and its
-        last 25 CDP results (whole DOM trees from get_content): ~20 MB per closed tab, 277 ghosts
-        for 3 tabs when measured. A close handshake is one local round trip, single-digit ms; 2s is
-        ~200x that, and on expiry the transport is aborted so the socket goes regardless."""
-        try:
-            c._transactions.clear(); c._tx_by_id.clear()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(c.aclose(), 2.0)
-        except Exception as e:
-            log("release_err", e=repr(e)[:80])
-            try: c.socket.transport.abort()
-            except Exception: pass
-    async def _release_all(self, browser):
-        for c in [browser, *list(getattr(browser, "_targets", ()))]:
-            await self._release(c)
-    def _trim(self):
-        """Drop nodriver's per-connection history of the last 25 CDP results after every op. The
-        engine never reads it, and on a tab that has served get_content() it is 25 DOM trees (#23)."""
-        try:
-            for c in [self.browser, *self.browser._targets]:
-                c._transactions.clear(); c._tx_by_id.clear()
-        except Exception:
-            pass
-    async def _guarded(self, coro):
-        try: return await coro
-        finally: self._trim()
     def _publish_cdp(self):
         """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
-        same browser (nodriver.start(host,port) connects to an existing browser) and shard by opening
-        their own tabs — the parallel-crawl use case. One browser, many attached drivers, tabs = shards."""
+        same browser (cdp.attach(host, port)) and shard by opening their own tabs — the
+        parallel-crawl use case. One browser, many attached drivers, tabs = shards."""
         try:
-            host=self.browser.config.host; port=self.browser.config.port
+            host=self.browser.host; port=self.browser.port
             self._cdp={"host":host,"port":port,"http":f"http://{host}:{port}"}
             with open(os.path.join(TMP,"playwrong-cdp.json"),"w") as f:
                 json.dump(self._cdp,f)
@@ -753,31 +691,21 @@ class ND:
         """Hear renderer crashes on the browser connection, so a killed tab fails by name (#28).
         Without this, an op on a tab whose renderer the kernel OOM-killed hung until the client
         timed out, which reads as a wedged engine."""
-        try:
-            self.browser.add_handler(cdp.target.TargetCrashed, self._on_crash)   # Browser is the
-            await self.browser.send(cdp.target.set_discover_targets(discover=True))  # connection
-        except Exception as e:
-            log("crash_watch_err", e=repr(e)[:100])
-    def _on_crash(self, ev, conn=None):
-        self.crashed[ev.target_id] = ev.status
-        log("renderer_crashed", target=ev.target_id[:8], status=ev.status, code=ev.error_code,
-            owner=self.owners.get(ev.target_id), memory_cap=MEMORY_CAP, **scope_mb())
-        err = self._crash_error(ev.target_id)
-        async def dead_send(*a, **k):
-            raise err
+        # Target discovery is already on: cdp.Browser enables it to keep its tab list live.
+        self.browser.on("Target.targetCrashed", self._on_crash)
+    def _on_crash(self, p):
+        tid, status = p.get("targetId"), p.get("status")
+        self.crashed[tid] = status
+        log("renderer_crashed", target=(tid or "")[:8], status=status, code=p.get("errorCode"),
+            owner=self.owners.get(tid), memory_cap=MEMORY_CAP, **scope_mb())
         for t in list(self.browser.tabs if self.browser else []):
-            if getattr(getattr(t, "target", None), "target_id", None) == ev.target_id:
-                t.send = dead_send            # later commands: they would wait on the dead renderer
-                try:
-                    t._fail_pending_futures(err)   # commands already in flight
-                except Exception as e:
-                    log("crash_fail_pending_err", e=repr(e)[:80])
+            if t.target_id == tid:
+                t.fail(self._crash_error(tid))   # in-flight and later commands raise TabCrashed
     async def _crash_for(self, ref):
-        """TabCrashed if the tab `ref` names has crashed, else None. A dying renderer also closes its
-        tab's socket, which must not read as the BROWSER dying: forget() would drop every agent's
-        tags. The crash event can land just after the socket error; CRASH_EVENT_WAIT covers that."""
-        tid = (self.tags.get(ref) if isinstance(ref, str) else
-               getattr(getattr(self.tab, "target", None), "target_id", None))
+        """TabCrashed if the tab `ref` names has crashed, else None. A dying renderer can surface as
+        a socket-level error, which must not read as the BROWSER dying: forget() would drop every
+        agent's tags. The crash event can land just after that error; CRASH_EVENT_WAIT covers it."""
+        tid = (self.tags.get(ref) if isinstance(ref, str) else getattr(self.tab, "target_id", None))
         t0 = time.monotonic()
         while tid and time.monotonic() - t0 < CRASH_EVENT_WAIT:
             if tid in self.crashed:
@@ -785,32 +713,17 @@ class ND:
             await asyncio.sleep(0.02)
         return None
     async def _close_tab_obj(self, t):
-        """Tab.close(), except for a crashed tab: its own session routes to the dead renderer and
-        never answers, so close it through the browser connection (#28)."""
-        tid = getattr(getattr(t, "target", None), "target_id", None)
-        if tid not in self.crashed:
-            task = asyncio.ensure_future(t.close())
-            t0 = time.monotonic()
-            try:
-                return await asyncio.wait_for(asyncio.shield(task), CLOSE_TIMEOUT)
-            except TimeoutError:
-                # Left running: cancelling mid-close strands the socket (#23). The target itself
-                # goes now, through the browser connection (#29).
-                log("close_slow", target=(tid or "")[:8], limit_s=CLOSE_TIMEOUT,
-                    elapsed_s=round(time.monotonic() - t0, 2))
-            except Exception as e:
-                log("close_err", target=(tid or "")[:8], e=repr(e)[:80])
-            try:
-                await asyncio.wait_for(
-                    self.browser.send(cdp.target.close_target(target_id=tid)), CLOSE_TIMEOUT)
-            except Exception as e:
-                log("close_fallback_err", target=(tid or "")[:8], e=repr(e)[:80])
-            return
-        await self.browser.send(cdp.target.close_target(target_id=tid))
+        """Target.closeTarget on the browser session, bounded by CLOSE_TIMEOUT (#29). Never the
+        tab's own session: a crashed renderer's never answers (#28)."""
+        tid = t.target_id
+        t0 = time.monotonic()
         try:
-            await asyncio.wait_for(t.aclose(), 1.0)       # a local socket close is ms
+            await asyncio.wait_for(self.browser.close_target(tid), CLOSE_TIMEOUT)
+        except TimeoutError:
+            log("close_slow", target=tid[:8], limit_s=CLOSE_TIMEOUT,
+                elapsed_s=round(time.monotonic() - t0, 2))
         except Exception as e:
-            log("crashed_tab_aclose_err", e=repr(e)[:80])
+            log("close_err", target=tid[:8], e=repr(e)[:80])
         self.crashed.pop(tid, None)
     def _crash_error(self, tid):
         return TabCrashed(
@@ -820,7 +733,7 @@ class ND:
     async def _tab(self, ref=None):
         """_resolve_tab(), refusing a tab whose renderer crashed (#28)."""
         t = await self._resolve_tab(ref)
-        tid = getattr(getattr(t, "target", None), "target_id", None)
+        tid = t.target_id
         if tid in self.crashed:
             raise self._crash_error(tid)
         return t
@@ -845,7 +758,7 @@ class ND:
         want = self.tags.get(ref, ref) if isinstance(ref, str) else None
         for i, t in enumerate(self.browser.tabs):
             if isinstance(ref, int) and i == ref: return t
-            if want and getattr(getattr(t, "target", None), "target_id", None) == want: return t
+            if want and t.target_id == want: return t
         # A KNOWN tag whose target is gone is a stale handle, not a bad reference: the tab was closed
         # by hand, swept, or crashed. The tag is the agent's stable handle and the tab is the
         # disposable half, so re-open under the same tag instead of raising. Before this, one closed
@@ -874,17 +787,11 @@ class ND:
             await asyncio.sleep(0.1)
     async def _goto(self, url, tab=None, no_js=False):
         t = await self._tab(tab)
-        if no_js:
-            try:
-                await t.send(cdp.emulation.set_script_execution_disabled(value=True))
-            except Exception:
-                pass
-        else:
-            try:
-                await t.send(cdp.emulation.set_script_execution_disabled(value=False))
-            except Exception:
-                pass
-        await t.get(url); await t.sleep(2)
+        try:
+            await t.send("Emulation.setScriptExecutionDisabled", {"value": bool(no_js)})
+        except Exception:
+            pass
+        await t.navigate(url); await asyncio.sleep(2)
         state = await self._loaded(t, no_js)
         if not no_js:
             await self._label(t)
@@ -901,7 +808,7 @@ class ND:
 
     async def _title_from_html(self, t):
         try:
-            content = await t.get_content()
+            content = await t.content()
             m = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
             return strip_owner(html.unescape(m.group(1)).strip()) if m else ""
         except Exception:
@@ -912,7 +819,7 @@ class ND:
         Best effort on purpose: a single-page app rewrites document.title whenever it likes, so the
         label is a convenience for whoever is watching the screen, never something the code relies
         on. Failing to set it must never fail the navigation that just succeeded."""
-        owner = self.owners.get(getattr(getattr(t, "target", None), "target_id", None))
+        owner = self.owners.get(t.target_id)
         if not owner:
             return
         try:
@@ -925,8 +832,7 @@ class ND:
             pass
 
     async def _href(self, t=None):
-        """Authoritative current url. nodriver's Tab has no .url attribute (only .target.url, which
-        lags), so ask the page."""
+        """Authoritative current url: Tab.url comes from target events and can lag, so ask the page."""
         try: return await (t or self.tab).evaluate("location.href")
         except Exception: return ""
     def _is_chal(self, t, h):
@@ -935,45 +841,44 @@ class ND:
     async def _solve(self, tries=20, tab=None):
         tb = await self._tab(tab)
         for i in range(tries):
-            t=await tb.evaluate("document.title"); h=await tb.get_content()
+            t=await tb.evaluate("document.title"); h=await tb.content()
             if not self._is_chal(t,h): log("solved",i=i); return {"passed":True,"iter":i}
-            try:
-                el=await tb.find("verify you are human", best_match=True, timeout=3)
-                if el: await el.mouse_click(); log("clicked",i=i); await tb.sleep(4)
-            except Exception as e: log("click_err",e=str(e)[:50])
-            await tb.sleep(1)
+            if await self._click_challenge(tb): log("clicked",i=i)
+            await asyncio.sleep(1)
         return {"passed":False,"iter":tries}
+    async def _click_challenge(self, t):
+        """Click the "verify you are human" checkbox if it is on the page; True if clicked."""
+        try:
+            pos = await t.find_text("verify you are human", timeout=3)
+            if pos:
+                await t.click(*pos); await asyncio.sleep(4)
+                return True
+        except Exception as e:
+            log("click_err", e=str(e)[:50])
+        return False
     async def _text(self, tab=None):
         t = await self._tab(tab)
         # The html carries the label too, inside <title> — mode="html" handed it straight to the
         # caller while the `title` field beside it was clean (#16).
         return {"title":strip_owner(await t.evaluate("document.title")),
-                "html":unlabel(await t.get_content(), self.owner_of(t)),
+                "html":unlabel(await t.content(), self.owner_of(t)),
                 "url": await self._href(t)}
     async def _frame(self, tab=None):
-        t = await self._tab(tab)
-        # Per-tab filename: two agents screenshotting at once would otherwise overwrite each other's
-        # file between the save and the read.
-        p=os.path.join(TMP,f"nd-frame-{getattr(getattr(t,'target',None),'target_id','x')}.png")
-        await t.save_screenshot(p)
-        try: return open(p,"rb").read()
-        finally:
-            try: os.remove(p)
-            except OSError: pass
+        return await (await self._tab(tab)).screenshot()
     async def _shot(self, tab=None):
         return {"b64": base64.b64encode(await self._frame(tab)).decode()}
     async def _clearcookies(self):
-        await self._ensure(); await self.browser.cookies.clear(); return {"cleared":True}
-    # --- added verbs (CDP input + tab ops) so the full client surface works on the nodriver engine ---
+        await self._ensure(); await self.browser.clear_cookies(); return {"cleared":True}
+    # --- CDP input ---
     async def _move(self, x, y, tab=None):
         t = await self._tab(tab)
-        await t.send(cdp.input_.dispatch_mouse_event(type_="mouseMoved", x=float(x), y=float(y)))
+        await t.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": float(x), "y": float(y)})
         return {"ok":1,"x":x,"y":y}
     async def _click(self, x, y, tab=None):
         t = await self._tab(tab)
         for ty in ("mousePressed","mouseReleased"):
-            await t.send(cdp.input_.dispatch_mouse_event(
-                type_=ty, x=float(x), y=float(y), button=cdp.input_.MouseButton.LEFT, click_count=1))
+            await t.send("Input.dispatchMouseEvent", {"type": ty, "x": float(x), "y": float(y),
+                                                      "button": "left", "clickCount": 1})
         return {"ok":1,"x":x,"y":y}
     async def _key(self, key, tab=None):
         tb = await self._tab(tab)
@@ -983,10 +888,10 @@ class ND:
                   "Space":32,"Delete":46}
         if key in named:
             for ty in ("keyDown","keyUp"):
-                await tb.send(cdp.input_.dispatch_key_event(
-                    type_=ty, key=key, windows_virtual_key_code=named[key]))
+                await tb.send("Input.dispatchKeyEvent", {"type": ty, "key": key,
+                                                         "windowsVirtualKeyCode": named[key]})
         else:
-            await tb.send(cdp.input_.dispatch_key_event(type_="char", text=key))
+            await tb.send("Input.dispatchKeyEvent", {"type": "char", "text": key})
         return {"ok":1,"key":key}
     async def _maybe_recycle(self):
         """Replace Chrome past CHROME_MAX_TABS open tabs or CHROME_MAX_FETCHES tabs opened (#23).
@@ -1002,9 +907,7 @@ class ND:
             return
         log("chrome_recycle", why="tabs" if n >= CHROME_MAX_TABS else "fetches", tabs=n,
             fetches=self.fetches, max_tabs=CHROME_MAX_TABS, max_fetches=CHROME_MAX_FETCHES)
-        old = self.browser
         await self._retire()
-        await self._release_all(old)
         self.browser = self.tab = None
         self._dead = False
         self.fetches = 0
@@ -1018,49 +921,45 @@ class ND:
         await self._refresh()
         tagged = {v for v in self.tags.values() if v}
         for t in self.browser.tabs:
-            if getattr(getattr(t, "target", None), "target_id", None) not in tagged:
+            if t.target_id not in tagged:
                 self.tab = t
                 break
         else:
-            self.tab = await self.browser.get("about:blank", new_tab=True)
+            self.tab = await self.browser.new_tab("about:blank")
             await self._refresh()
-        log("tab_repointed", why=why,
-            target=getattr(getattr(self.tab, "target", None), "target_id", None))
+        log("tab_repointed", why=why, target=self.tab.target_id)
     async def _tab_heaps(self):
         """Per-tab JS heap + array-buffer MB for the mem log (#28), queried concurrently."""
         if self.browser is None:
             return []
         async def heap_mb(t):
-            if getattr(t, "socket", None) is None:
-                return "unconnected"          # querying would open a socket per tab: the #23 leak
+            if not t.attached:
+                return "unconnected"          # never driven: attaching just to measure is waste
             try:
-                _, total, _, backing = await asyncio.wait_for(
-                    t.send(cdp.runtime.get_heap_usage()), HEAP_QUERY_TIMEOUT)
-                return int(total + backing) >> 20
+                h = await asyncio.wait_for(t.send("Runtime.getHeapUsage"), HEAP_QUERY_TIMEOUT)
+                return int(h["totalSize"] + h.get("backingStorageSize", 0)) >> 20
             except Exception:
                 return None                   # busy, crashed, or not a page; logged as such
         async def one(t):
-            tid = getattr(getattr(t, "target", None), "target_id", None)
-            return {"target": (tid or "")[:8], "owner": self.owners.get(tid),
-                    "heap_mb": await heap_mb(t),
-                    "url": (getattr(getattr(t, "target", None), "url", "") or "")[:60]}
+            return {"target": t.target_id[:8], "owner": self.owners.get(t.target_id),
+                    "heap_mb": await heap_mb(t), "url": (t.url or "")[:60]}
         return await asyncio.gather(*(one(t) for t in list(self.browser.tabs)))
     async def _open_target(self, url):
-        """browser.get(new_tab), bounded by NEWTAB_TIMEOUT (#29). A late answer still opens a tab,
+        """Target.createTarget, bounded by NEWTAB_TIMEOUT (#29). A late answer still opens a tab,
         so that tab is closed when it lands rather than left untagged."""
         async def get():
             if self.test_stalls > 0:
                 self.test_stalls -= 1
                 await asyncio.sleep(NEWTAB_TIMEOUT * 4)
             try:
-                return await self.browser.get(url, new_tab=True)
+                return await self.browser.new_tab(url)
             except Exception as e:
                 if "no browser is open" not in str(e):
                     raise
                 # Every window closed but Chrome still up (headless always; headed while it shuts
                 # down): a tab needs a window to go in, so open one (#35).
                 log("no_window", action="new_window")
-                return await self.browser.get(url, new_window=True)
+                return await self.browser.new_tab(url, new_window=True)
         task = asyncio.ensure_future(get())
         t0 = time.monotonic()
         try:
@@ -1094,8 +993,7 @@ class ND:
             # A tagged tab is its owner's, driven by tag. Making it current too meant its closing
             # took every untagged op down with it (#22).
             self.tab = t
-        await self._refresh()          # the cache may not list the tab we just opened yet
-        tid = getattr(getattr(t, "target", None), "target_id", None)
+        tid = t.target_id
         if tag:
             self.tags[tag] = tid
         if owner:
@@ -1109,9 +1007,8 @@ class ND:
         browser: pass it back as `tab` on later ops and they act on your page regardless of what
         anyone else does to the active tab."""
         t = await self._newtab_raw(url, tag, owner)
-        tid = getattr(getattr(t, "target", None), "target_id", None)
         return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"owner":owner,
-                "target_id":str(tid or "")}
+                "target_id":t.target_id}
     # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
     # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
     # single-tab crawler that opened 8 tabs/run and never closed them left 22 orphan renderers). These
@@ -1123,19 +1020,10 @@ class ND:
         except Exception: pass
         return -1
     async def _refresh(self):
-        """browser.tabs is a CACHED list (Browser._targets); nothing refreshes it on its own within a
-        request. Without this, a closed tab keeps appearing and urls come back blank — which made tab
-        hygiene silently unverifiable (closetab said closed:1, remaining:2, and the caller couldn't
-        tell whether cleanup worked). Call before reading, and after closing.
-
-        Whatever the refresh drops from the list is released here, see _release() (#23)."""
-        before = list(getattr(self.browser, "_targets", ()))
-        try: await self.browser.update_targets()
-        except Exception as e: log("refresh_err", e=str(e)[:60]); return
-        kept = {id(c) for c in self.browser._targets}
-        for c in before:
-            if id(c) not in kept:
-                await self._release(c)
+        """Re-read the tab list from Chrome. Target events keep it live, but an answer that callers
+        rely on (closetab's `remaining`) should come from Chrome itself."""
+        try: await self.browser.refresh()
+        except Exception as e: log("refresh_err", e=str(e)[:60])
     async def _tabs(self):
         """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
         use this to track what they opened and find tabs to close."""
@@ -1143,14 +1031,10 @@ class ND:
         by_id = {v: k for k, v in self.tags.items() if v}   # skip tombstones: None is not an id
         out=[]
         for i, t in enumerate(self.browser.tabs):
-            # url/title come off the TargetInfo, not an evaluate(): it works for BACKGROUND tabs too
-            # (evaluate only ever worked on the active one) and costs no round-trip per tab.
-            ti = getattr(t, "target", None)
-            tid = getattr(ti, "target_id", None)
-            out.append({"index":i,"url":getattr(ti,"url","") or "",
-                        "title":strip_owner(getattr(ti,"title","") or ""),
-                        "active":(t is self.tab),"tag":by_id.get(tid),
-                        "owner":self.owners.get(tid),"target_id":str(tid or "")})
+            # url/title from the TargetInfo: works for background tabs, no round trip per tab.
+            out.append({"index":i,"url":t.url or "","title":strip_owner(t.title or ""),
+                        "active":(t is self.tab),"tag":by_id.get(t.target_id),
+                        "owner":self.owners.get(t.target_id),"target_id":t.target_id})
         return {"tabs":out,"count":len(out)}
     def _forget_tags(self, ids):
         """Tombstone tags whose tab we just closed, and drop those tabs' owners.
@@ -1185,7 +1069,7 @@ class ND:
         deadline = asyncio.get_event_loop().time() + 2.0
         while asyncio.get_event_loop().time() < deadline:
             await self._refresh()
-            live = {getattr(getattr(t,"target",None),"target_id",None) for t in self.browser.tabs}
+            live = {t.target_id for t in self.browser.tabs}
             if not (ids & live): return
             await asyncio.sleep(0.05)
         log("close_timeout", ids=",".join(str(i) for i in ids))
@@ -1204,21 +1088,16 @@ class ND:
         for i, t in enumerate(tabs):
             if keep_first and i==0: continue
             if want_id is not None:
-                if getattr(getattr(t,"target",None),"target_id",None) == want_id:
+                if t.target_id == want_id:
                     targets.append((i,t))
                 continue
-            # t.url does not exist on a nodriver Tab, so the documented url-substring form matched
-            # NOTHING before this; the url lives on the target info.
-            turl = getattr(getattr(t,"target",None),"url","") or ""
             if index is not None and i==index: targets.append((i,t))
-            elif url is not None and url in turl: targets.append((i,t))
+            elif url is not None and url in (t.url or ""): targets.append((i,t))
         closed=0; ids=set()
         for i, t in targets:
             try:
-                tid = getattr(getattr(t,"target",None),"target_id",None)
                 await self._close_tab_obj(t)
-                await self._release(t)
-                closed+=1; ids.add(tid); self.crashed.pop(tid, None)
+                closed+=1; ids.add(t.target_id)
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
         await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
@@ -1246,13 +1125,11 @@ class ND:
             own = self.owner_of(t)
             mine = (own == owner) if owner else (own is None)
             if not (force or mine or not self.owner_alive(own)):
-                skipped.append({"owner": own,
-                                "url": (getattr(getattr(t,"target",None),"url","") or "")[:120]})
+                skipped.append({"owner": own, "url": (t.url or "")[:120]})
                 continue
             try:
-                ids.add(getattr(getattr(t,"target",None),"target_id",None))
+                ids.add(t.target_id)
                 await self._close_tab_obj(t); n+=1
-                await self._release(t)
             except Exception: pass
         await self._await_closed(ids)
         self._forget_tags(ids)   # else the owners keep handles to tabs this just destroyed (#14)
@@ -1271,11 +1148,12 @@ class ND:
         is also not valid inside a CDP evaluate, so an expression starting with it is wrapped in an
         async IIFE rather than being rejected."""
         t = await self._tab(tab)
-        raw = await t.evaluate(JS_WRAP % expr.strip().rstrip(";"),
-                               await_promise=True, return_by_value=True)
+        try:
+            raw = await t.evaluate(JS_WRAP % expr.strip().rstrip(";"), await_promise=True)
+        except cdp.JSError as e:
+            # The wrapper catches runtime throws, so this is a syntax error in the expression.
+            return {"error": f"js could not be evaluated: {str(e)[:300]}"}
         if not isinstance(raw, str):
-            # The wrapper always resolves to a string, so anything else means the driver could not
-            # evaluate it at all (usually a syntax error in the expression).
             return {"error": f"js could not be evaluated: {str(raw)[:300]}"}
         owner = self.owner_of(t)
         try:
@@ -1339,34 +1217,27 @@ class ND:
 
         async def load(i, url, tabs):
             check_headroom("a prefetch tab")
-            t = await self.browser.get("about:blank", new_tab=True)
+            t = await self.browser.new_tab("about:blank")
             tabs[i] = t                         # recorded so a timeout can still close it
-            tid = getattr(getattr(t, "target", None), "target_id", None)
             if owner:
-                self.owners[tid] = owner        # a batch tab is short-lived but still someone's
-            await t.get(url)
+                self.owners[t.target_id] = owner   # a batch tab is short-lived but still someone's
+            await t.navigate(url)
             await self._label(t)
-            await t.sleep(2)
+            await asyncio.sleep(2)
             state = await self._loaded(t)
             title = await t.evaluate("document.title")
-            html = await t.get_content()
+            html = await t.content()
             passed = None
             if solve and self._is_chal(title, html):
                 passed = False
                 for _ in range(tries):
                     title = await t.evaluate("document.title")
-                    html = await t.get_content()
+                    html = await t.content()
                     if not self._is_chal(title, html):
                         passed = True
                         break
-                    try:
-                        el = await t.find("verify you are human", best_match=True, timeout=3)
-                        if el:
-                            await el.mouse_click()
-                            await t.sleep(4)
-                    except Exception:
-                        pass
-                    await t.sleep(1)
+                    await self._click_challenge(t)
+                    await asyncio.sleep(1)
             try: href = await t.evaluate("location.href")
             except Exception: href = url
             slots[i] = {"status": "ready", "title": strip_owner(title), "html": html, "url": href,
@@ -1394,7 +1265,6 @@ class ND:
                     if t is not None:
                         try: await self._close_tab_obj(t)
                         except Exception: pass
-                        await self._release(t)
 
         await asyncio.gather(*(one(i, u) for i, u in enumerate(urls)), return_exceptions=True)
         await self._refresh()
@@ -1406,7 +1276,7 @@ class ND:
         if t is not None:
             try:
                 title = await asyncio.wait_for(t.evaluate("document.title"), timeout=5)
-                html = await asyncio.wait_for(t.get_content(), timeout=10)
+                html = await asyncio.wait_for(t.content(), timeout=10)
                 if html and len(html) > 500:      # enough to be a page, not a blank shell
                     return {"status": "ready", "title": title, "html": html, "url": url,
                             "requested": url, "partial": True}
@@ -1451,8 +1321,8 @@ class ND:
 
     async def _cookies(self):
         await self._ensure()
-        cks = await self.browser.cookies.get_all()
-        return {"cookies":[{"name":c.name,"value":c.value,"domain":getattr(c,"domain",None)} for c in cks]}
+        cks = await self.browser.cookies()
+        return {"cookies":[{"name":c["name"],"value":c["value"],"domain":c.get("domain")} for c in cks]}
     def do(self, op, a):
         m={"start":lambda:self._start(),
            # every driving op takes an optional `tab` (a tag, or an index) so concurrent callers
@@ -1482,7 +1352,7 @@ class ND:
         # nothing, so re-running it is safe. Dropping the dead handles first makes attempt 2 relaunch
         # via _ensure(). Any other error is returned on the first attempt, unretried.
         for attempt in (1, 2):
-            try: return self.run(self._guarded(m[op]()))
+            try: return self.run(m[op]())
             except Exception as e:
                 dead = _dead_conn(e)
                 if dead:
@@ -1552,7 +1422,7 @@ def _shutdown(code=0):
 
 async def _stop_browser():
     try:
-        B.browser.stop()          # nodriver's own teardown: closes tabs and the browser process
+        B.browser.stop()          # terminates Chrome's process group, removes a temp profile
     except Exception:
         pass
 

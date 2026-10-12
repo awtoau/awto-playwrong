@@ -28,16 +28,12 @@ that hits it usually reaches for curl instead of reporting it. So:
 - **Never make a diagnostic optimistic.** `/status` reporting `alive` from a stale handle turned
   `doctor.py` into a tool that certified a dead engine as healthy (issue #8).
 
-## Reviews: check the vendored nodriver's surroundings
+## Reviews: the CDP client against the installed Chrome
 
-We own `vendor/nodriver` (fork: `awto-au/nodriver`). Every review:
+`engine/cdp.py` is ours (#41); a Chrome update is what can break it. Every review:
 
-- `python scripts/upstream_check.py`. It compares against `vendor/UPSTREAM.json` (last reviewed
-  state): new upstream or fork commits, vendor files not in the fork, a new PyPI release, and new
-  active repos doing the same work (nodriver forks/successors, stealth-browser MCP servers).
-- Exit 1 = something to look at. File or update an issue with what changed and whether to act
-  (port upstream fixes, push local patches to the fork, compare an alternative). Then
-  `--update` to record the review.
+- `python scripts/cdp_smoke_test.py`. A failure after a Chrome update = file an issue naming the
+  Chrome version (`google-chrome --version`) and the failing check.
 
 ## Testing
 

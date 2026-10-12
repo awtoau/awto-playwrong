@@ -1,7 +1,7 @@
 """memcap.py — run this process under a hard systemd memory cap, so a leak kills it, not the host.
 
 Used by the engine (engine/server.py) and by crawl.run, which attaches to the shared Chrome with its
-own nodriver and leaked the same way (#23, #26). Stdlib only.
+own CDP client and leaked the same way (#23, #26). Stdlib only.
 
 - The process re-execs itself as `systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0
   -p OOMPolicy=<oom_policy> <same argv>`.

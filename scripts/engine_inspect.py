@@ -12,8 +12,8 @@ reports what the heap is made of, so the next growth is attributed instead of gu
     python scripts/engine_inspect.py --tracemalloc stop
 
 Reports: RSS, threads and their stacks, asyncio tasks by coroutine, object counts by type, the
-largest single objects, nodriver per-connection counters (handlers, transactions, pending futures,
-websocket receive buffers), prefetch jobs and the html bytes they still hold.
+largest single objects, CDP client counters (pending commands, sessions, tabs, handlers), prefetch
+jobs and the html bytes they still hold.
 
 The probe runs on the engine's main thread (the HTTP accept loop, which wakes every 0.5s), reads
 state, appends one JSON line to tmp/logs/engine-inspect.log, and returns. It changes nothing unless
@@ -113,32 +113,16 @@ try:
                     "slots": len(d.get("slots", {})),
                     "html_mb": sum(len(v.get("html") or "") for v in d.get("slots", {}).values()) // 2**20}
                    for j, d in B.jobs.items()]
-    # Connection objects anywhere in the heap, not just the ones the browser still lists — the
-    # ones it has forgotten are the leak (#23).
-    from nodriver.core.connection import Connection
-    conns = []
-    listed = set(id(c) for c in [B.browser] + list(getattr(B.browser, "_targets", []))) if B.browser else set()
-    for c in [o for o in gc.get_objects() if isinstance(o, Connection)]:
-        sock = getattr(c, "socket", None)
-        rm = getattr(sock, "recv_messages", None)
-        rd = getattr(getattr(sock, "protocol", None), "reader", None)
-        tx = list(getattr(c, "_transactions", ()))
-        conns.append({
-            "type": type(c).__qualname__, "listed": id(c) in listed,
-            "url": (getattr(getattr(c, "target", None), "url", "") or "")[:60],
-            "socket_open": bool(sock) and not getattr(sock, "close_code", None),
-            "handlers": sum(len(v) for v in getattr(c, "handlers", {}).values()),
-            "transactions": len(tx),
-            "tx_result_mb": sum(sys.getsizeof(getattr(t, "result", None) or 0) for t in tx) // 2**20,
-            "pending": len(getattr(c, "_mapper", ())),
-            "children": len(getattr(c, "_targets", ())),
-            "dom": getattr(c, "_dom", None) is not None,
-            "ws_frames": len(getattr(rm, "frames", ())),
-            "ws_reader_buf": len(getattr(rd, "buffer", b"")),
-        })
-    rep["connections"] = {"total": len(conns), "listed": sum(1 for c in conns if c["listed"]),
-                          "unlisted_sockets_open": sum(1 for c in conns if not c["listed"] and c["socket_open"]),
-                          "sample": conns[:TOP]}
+    # cdp.Browser objects anywhere in the heap: more than the current one is a leak (#23).
+    import cdp
+    browsers = [o for o in gc.get_objects() if isinstance(o, cdp.Browser)]
+    rep["browsers"] = [{
+        "current": b is B.browser, "closed": b.closed is not None,
+        "pending": len(b._pending), "sessions": len(b._sessions), "tabs": len(b._tabs),
+        "handlers": sum(len(v) for v in b._handlers.values()),
+        "tab_handlers": sum(len(v) for t in b._tabs.values() for v in t._handlers.values()),
+    } for b in browsers]
+    rep["tabs_in_heap"] = sum(1 for o in gc.get_objects() if isinstance(o, cdp.Tab))
 except Exception as e:
     rep["engine"] = repr(e) + " " + traceback.format_exc()[-300:]
 with open(OUT, "a") as f:

@@ -8,9 +8,8 @@
 > - **python** → `from engine import connect; connect.capture(url)` — same code path as both of the
 >   above.
 >
-> None of them need a server started first, and none need `PYTHONPATH` (server.py puts `vendor/` on
-> `sys.path` itself — snippets that export it are copying a step that hasn't been required in a long
-> time). This page is the raw HTTP contract: read it when you're building something that is none of
+> None of them need a server started first, and none need `PYTHONPATH`. This page is the raw HTTP
+> contract: read it when you're building something that is none of
 > the above, or need a verb those layers don't expose.
 
 How an app or agent uses the shared capture engine: it's an **HTTP server on a port**; you POST ops
@@ -63,9 +62,7 @@ page = connect.call("text")                       # or connect.op("text"), which
 whole = connect.capture("https://example.com")    # own tab, solve, extract, close  <- usually this
 ```
 
-The snippet below is kept as documentation of what `ensure()` does, for non-Python callers. Note it
-does **not** need `PYTHONPATH` — that line has been redundant since `server.py` started inserting
-`vendor/` into `sys.path` itself.
+The snippet below is kept as documentation of what `ensure()` does, for non-Python callers.
 
 ```python
 import os, sys, json, time, subprocess, urllib.request
@@ -122,7 +119,7 @@ python .../engine/client.py text         # html
 python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 ```
 
-## Endpoints (the real contract — nodriver engine/server.py)
+## Endpoints (the real contract — engine/server.py)
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}, pid, rss_mb, swap_mb, fds, cdp_sockets, tabs, threads, uptime_s, scope_current_mb, scope_peak_mb, scope_unreclaimable_mb, scope_max_mb, scope_oom_kills, memory_cap, rss_limit_mb, headless, display, display_mode}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live; the memory fields are the engine's own `/proc` reading (#23) |
@@ -204,9 +201,8 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
     renderers, GPU and utilities stay under the cap. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
   `rss_limit`, stops Chrome and exits 3 — the next call restarts it. `cdp_sockets` is the number to
   watch: it counts every process's connections to this Chrome, so the engine's own share tracks its
-  tab count (277 for 3 tabs was the leak) and a high count next to a small `fds` means a client
-  attached via `/cdp` is leaking the same way — it runs its own nodriver, so it needs the fixed
-  vendored copy too.
+  tab count (277 for 3 tabs was the nodriver-era leak; the engine now holds one socket) and a high
+  count next to a small `fds` means a client attached via `/cdp` is leaking sockets.
 - **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
   touches a database.
 - **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,
@@ -237,8 +233,8 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
   means `/start` (or a real op) was never actually called yet - see the `server` vs `alive` note
   above - not that anything is broken.
 
-## Full verb set (now all on the nodriver engine — tested)
-The nodriver `engine/server.py` now implements the full surface (verified live):
+## Full verb set
+`engine/server.py` implements the full surface (verified live):
 
 | Op | Body | Returns |
 |---|---|---|
@@ -258,7 +254,7 @@ The nodriver `engine/server.py` now implements the full surface (verified live):
 | `prefetch` | `{urls,concurrency?,solve?,tries?,timeout?}` | `{job,count,concurrency,timeout}` — starts loading all of them in parallel tabs and returns IMMEDIATELY. Per-url `timeout` (30s) so one stalled page cannot hold the batch |
 | `jobs` | `{job?}` | counts: `{ready,loading,pending,errors,urls}` — cheap to poll, never ships page bodies |
 | `collect` | `{job,drain?}` | `{results:[{status,title,html,url,partial?}],remaining}` — every READY result, removed from the engine once handed over |
-| `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`nodriver.start(host,port)`) to this SAME browser and open its own tabs (parallel sharding) |
+| `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`engine.cdp.attach(host, port)`) to this SAME browser and open its own tabs (parallel sharding) |
 | `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
 | `cookies` | — | `{cookies:[{name,value,domain}]}` — the whole browser, incl. cleared `cf_clearance`. Feed these to an HTTP client to download a file the browser cleared for you. |
 | `clearcookies` | — | `{cleared}` |
@@ -272,7 +268,7 @@ ollama vision) are convenience layers on top of the core ops.
 **playwrong is a single long-running process that many agents SHARE by opening their own tabs.** This
 is the core operating model — treat it accordingly:
 
-- **Never launch your own browser** (`uc.start()`) or `pkill` Chrome to "get a clean slate." That
+- **Never launch your own browser** (`cdp.launch()`) or `pkill` Chrome to "get a clean slate." That
   defeats the shared server (orphan windows, lost Turnstile session, competing browsers). Connect to
   the running server on its port; if it isn't up, `ensure_server()` starts THE one server.
 - **Never `shutdown` the server** to end your work. Shutdown stops it for everyone. Close YOUR tabs
@@ -283,12 +279,8 @@ is the core operating model — treat it accordingly:
   these verbs fix). Track what you open; close what you opened.
 - **Cleanup after a crash:** `closeextra` closes every tab except the base tab — the panic button when
   an aborted run left orphan tabs. It never touches the server process.
-- **`closed`/`remaining` are now trustworthy — they weren't always.** nodriver's `browser.tabs` is a
-  *cached* target list that `tab.close()` does not refresh, so the server used to answer
-  `{"closed":1,"remaining":2}` after closing one of two tabs, and `tabs` reported blank urls for
-  every tab. Cleanup was unverifiable and an MCP-layer `fetch` leaked a tab per call. The server now
-  refreshes the target list before reading it and after closing; if you write a new verb that touches
-  `browser.tabs`, call `_refresh()` first or you will reintroduce this.
+- **`closed`/`remaining` come from Chrome.** The server re-reads the target list (`_refresh()`)
+  before answering and waits for closed targets to go; a new verb reporting tab counts should too.
 - **The base tab (index 0) is protected** — `closetab` won't close it and `closeextra` keeps it, so the
   server always has a live tab (its `/status` stays alive).
 
@@ -324,16 +316,17 @@ each agent its own tagged tab. You only need the raw form when driving the port 
 ### Parallel sharding — attach to the same browser via `/cdp`
 The HTTP ops (`goto`/`text`/…) drive ONE active tab, serialised — fine for a single agent driving one
 page at a time. For a process that needs to drive MANY tabs in parallel (e.g. a crawler), don't fight
-the HTTP serialisation: read the browser's CDP endpoint from `/cdp` and attach your own nodriver to the
-same Chrome:
+the HTTP serialisation: read the browser's CDP endpoint from `/cdp` and attach your own CDP client to
+the same Chrome:
 
 ```python
-cdp = call("cdp")                       # {host, port, http}
-import nodriver as uc
-browser = await uc.start(host=cdp["host"], port=cdp["port"])   # host+port set => ATTACH, don't launch
-tab = await browser.get(url, new_tab=True)   # your own tab on the shared browser
-...                                          # drive N tabs in parallel via nodriver
-await tab.close()                            # CLOSE every tab you opened when done
+from engine import cdp
+ep = call("cdp")                                  # {host, port, http}
+browser = await cdp.attach(ep["host"], ep["port"])   # ATTACH, never launch
+tab = await browser.new_tab(url)                  # your own tab on the shared browser
+...                                               # tab.send("Method", {...}), tab.evaluate(...)
+await tab.close()                                 # CLOSE every tab you opened when done
+await browser.aclose()                            # your socket only; Chrome keeps running
 ```
 
 You now drive the shared browser directly (parallel tabs) while still respecting the contract: you
@@ -341,4 +334,4 @@ launched no new browser, you close your own tabs, and you never shut the server 
 coexist — one driving via HTTP ops, another attached via CDP for parallel work — on the one browser.
 
 _Connect over HTTP:port, auto-start with ensure_server(), drive with goto/solve/text/shot. The engine
-beats Cloudflare Turnstile (nodriver) and stays capture-only so any app/agent can share it._
+beats Cloudflare Turnstile (raw CDP) and stays capture-only so any app/agent can share it._

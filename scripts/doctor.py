@@ -14,7 +14,6 @@ import json
 import os
 import platform
 import py_compile
-import shutil
 import socket
 import sys
 import urllib.request
@@ -25,21 +24,11 @@ PORT = int(os.environ.get("PH_PORT", "8731"))
 # See check_engine_op(): 20s separates "busy" from "broken", it is not a hang budget.
 OP_BUDGET = 20
 
-# nodriver's own runtime deps. Everything else the engine + MCP server touch is stdlib, and nodriver
-# itself is vendored in-tree (vendor/nodriver), so this is the entire dependency surface.
-DEPS = [("websockets", "websockets", "CDP transport"),
-        ("deprecated", "Deprecated", "used by nodriver's generated CDP modules")]
+# Everything else the engine + MCP server touch is stdlib: this is the entire dependency surface.
+DEPS = [("websockets", "websockets", "CDP transport")]
 
-# Where Chrome actually lives, per platform. nodriver finds it itself; we check so a missing browser
-# is reported here instead of as a launch that silently never comes up.
-CHROME = {
-    "Linux": ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
-              "/usr/bin/google-chrome", "/snap/bin/chromium"],
-    "Darwin": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-               "/Applications/Chromium.app/Contents/MacOS/Chromium", "google-chrome"],
-    "Windows": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome"],
-}
+sys.path.insert(0, os.path.join(REPO, "engine"))
+import cdp  # noqa: E402  (stdlib-only at import; the engine's own Chrome lookup)
 
 RESULTS = []
 
@@ -75,40 +64,16 @@ def check_deps():
     return not missing
 
 
-def check_nodriver(deps_ok):
-    vend = os.path.join(REPO, "vendor", "nodriver")
-    if not os.path.isdir(vend):
-        check("vendored nodriver", "FAIL", f"{vend} missing",
-              "re-clone the repo — vendor/nodriver is committed, not downloaded")
-        return
-    if not deps_ok:
-        # It cannot import without those packages; reporting it as its own failure would send you
-        # chasing a second problem that does not exist.
-        check("vendored nodriver", "WARN", "not checked — install the dependencies above first")
-        return
-    sys.path.insert(0, os.path.join(REPO, "vendor"))
-    try:
-        import nodriver  # noqa: F401
-        check("vendored nodriver", "PASS", f"imports from {vend}")
-    except Exception as e:
-        check("vendored nodriver", "FAIL", f"import failed: {e!r}",
-              f"the checkout may be damaged; try: git -C {REPO} status")
-
-
 def check_chrome():
-    cands = CHROME.get(platform.system(), CHROME["Linux"])
-    for c in cands:
-        p = shutil.which(c) if not os.path.isabs(c) else (c if os.path.exists(c) else None)
-        if p:
-            check("chrome", "PASS", p)
-            return
-    fix = {"Linux": "install Google Chrome or Chromium (e.g. dnf install google-chrome-stable, "
-                    "apt install chromium-browser)",
-           "Darwin": "install Google Chrome from google.com/chrome",
-           "Windows": "install Google Chrome from google.com/chrome"}[platform.system()
-                                                                      if platform.system() in CHROME
-                                                                      else "Linux"]
-    check("chrome", "FAIL", f"no browser found (looked for: {', '.join(cands[:3])}…)", fix)
+    """The engine's own lookup (engine/cdp.py), so this cannot pass while the launch would fail."""
+    try:
+        check("chrome", "PASS", cdp.find_chrome())
+    except cdp.CDPLaunchError:
+        fix = ("install Google Chrome or Chromium (e.g. dnf install google-chrome-stable, "
+               "apt install chromium-browser)" if platform.system() not in ("Darwin", "Windows")
+               else "install Google Chrome from google.com/chrome")
+        check("chrome", "FAIL", f"no browser found (looked for: "
+              f"{', '.join(cdp.chrome_candidates()[:3])}…); or set PH_CHROME", fix)
 
 
 def check_display():
@@ -270,7 +235,7 @@ def main():
     os.makedirs(LOGDIR, exist_ok=True)
     print(f"playwrong doctor — repo {REPO}\n")
     check_python()
-    check_nodriver(check_deps())
+    check_deps()
     check_chrome()
     check_display()
     check_tmp()

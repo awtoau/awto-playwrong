@@ -4,6 +4,7 @@ Modern sites ship a script bundle + build the DOM client-side, often behind a co
 Capturing too early yields an empty shell. This module: dismisses the consent popup, then polls until
 the visible text mounts (or settles / times out). Consumers call these on the tab after navigating.
 """
+import asyncio
 
 # Accept-buttons for the common consent platforms + a generic text matcher (EN + DE, for .at/.de).
 DISMISS_JS = r"""(() => {
@@ -35,11 +36,9 @@ async def dismiss_overlays(tab):
     try:
         clicked = await tab.evaluate(DISMISS_JS)
         try:
-            from nodriver import cdp as _cdp
-            await tab.send(_cdp.input_.dispatch_key_event(type_="keyDown", key="Escape",
-                           windows_virtual_key_code=27))
-            await tab.send(_cdp.input_.dispatch_key_event(type_="keyUp", key="Escape",
-                           windows_virtual_key_code=27))
+            for ty in ("keyDown", "keyUp"):
+                await tab.send("Input.dispatchKeyEvent", {"type": ty, "key": "Escape",
+                                                          "windowsVirtualKeyCode": 27})
         except Exception:
             pass
         return clicked
@@ -65,7 +64,7 @@ async def wait_for_render(tab, min_chars=200, max_wait=8.0, poll=0.5):
         if n == last and n > 0:            # settled below the bar — no more coming
             return n
         last = n
-        await tab.sleep(poll)
+        await asyncio.sleep(poll)
     return last
 
 
@@ -92,5 +91,5 @@ async def wait_ready(tab, max_wait=10.0, poll=0.25):
             state = "loading"
         if state in ("interactive", "complete"):
             return state
-        await tab.sleep(poll)
+        await asyncio.sleep(poll)
     return state

@@ -9,17 +9,11 @@ description = "Turnstile-beating browser-capture engine + a reusable, ref-free c
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["crawler", "browser-automation", "cloudflare", "turnstile", "nodriver", "scraping"]
+keywords = ["crawler", "browser-automation", "cloudflare", "turnstile", "cdp", "scraping"]
 
-# BASE deps = what it takes to drive a browser, and nothing else. Two packages.
-#
-# `nodriver` is deliberately NOT listed. A patched copy is vendored (see [tool.hatch] below) because
-# upstream 0.50.x fails to import on CPython 3.14; declaring the dependency made pip install the
-# BROKEN copy into site-packages, where it shadowed the vendored one and killed the engine on its
-# first run. These two are nodriver's own runtime requirements, which the vendored copy still needs.
+# BASE deps = what it takes to drive a browser, and nothing else. engine/cdp.py is our own client.
 dependencies = [
-    "websockets>=12",      # nodriver's CDP websocket transport
-    "Deprecated>=1.2",     # imported by nodriver's generated cdp/* modules
+    "websockets>=13",      # CDP transport; engine/cdp.py uses the websockets.asyncio client (13+)
 ]
 
 # The crawl/ LIBRARY's deps. Optional, because `pip install awto-playwrong` to fetch a page should
@@ -42,36 +36,14 @@ crawl-report = "crawl.report:main"
 [project.urls]
 Homepage = "https://github.com/awtoau/awto-playwrong"
 
-# ── build: ship crawl/ + assets/ + the PATCHED vendored nodriver ────────────────────────────────
-# Upstream nodriver 0.50.3 has a non-UTF-8 byte in cdp/network.py: a bare \xb1 (Latin-1 ±) in a
-# comment, which CPython 3.14+ rejects while decoding the file. Through 3.13 an undeclared non-UTF-8
-# byte inside a COMMENT was tolerated; 3.14 rejects it anywhere. Not free-threading-specific —
-# measured failing on stable, GIL-enabled 3.14.7.
-#
-# PROVENANCE: vendor/nodriver is a snapshot of
-#     https://github.com/awto-au/nodriver @ 2017a44   (fork of ultrafunkamsterdam/nodriver)
-# which is 0.50.3 plus that character re-encoded AND generate_cdp.py given an explicit
-# encoding="utf-8" — the generator is the root cause: it writes with the platform default, so a
-# Windows/cp1252 box re-emits the bad byte on the next regeneration.
-#
-# Re-vendor with: git clone --depth 1 https://github.com/awto-au/nodriver && cp -r nodriver/. vendor/nodriver/
-# Do NOT hand-edit vendor/ — that is how it came to differ from the fork (issue #18).
-#
-# We ship it INSIDE the package (crawl/_vendor/nodriver) and prepend it to sys.path at import time
-# (see crawl/__init__.py), so a tool install carries the fix and no consumer PYTHONPATH juggling is
-# needed. It is prepended, so it also wins over a broken nodriver already installed on the machine.
-# Delete all of this when a fixed nodriver RELEASE ships — see issue #1.
+# ── build ───────────────────────────────────────────────────────────────────────────────────────
 [tool.hatch.build.targets.wheel]
 packages = ["crawl", "assets", "engine"]   # engine ships too: it provides the `playwrong` command
-
-[tool.hatch.build.targets.wheel.force-include]
-"vendor/nodriver" = "crawl/_vendor/nodriver"
 
 # ── lint: ruff, configured to match the code that is actually here ──────────────────────────────
 #   uvx ruff check .          (no install needed)
 [tool.ruff]
 line-length = 110              # the code is written to ~100; 110 leaves room for a trailing comment
-extend-exclude = ["vendor"]    # patched third-party source — not ours to restyle
 
 [tool.ruff.lint]
 # E4/E7/E9 + F is the correctness core (undefined names, unused imports, broken syntax); I sorts
@@ -90,9 +62,6 @@ ignore = [
 "engine/mcp_server.py" = ["E402"]
 "engine/cli.py" = ["E402"]
 "engine/client.py" = ["E402"]
-# Same reason: crawl/__init__.py must put the patched vendored nodriver on sys.path BEFORE the
-# submodule imports that use it.
-"crawl/__init__.py" = ["E402"]
 
 # ── uv tool install: force the pure-Python, no-GIL-safe builds ──────────────────────────────────
 # SQLAlchemy's cyextension silently re-enables the GIL; installing it from an sdist with the C ext

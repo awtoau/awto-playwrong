@@ -3,6 +3,7 @@
 - Local site: an index linking two ordinary pages and a "hog" that allocates ~1 GB/s.
 - Isolated engine under PH_MEMORY_MAX=1500M, so the kernel kills the hog's renderer (#28).
 - Before the fix the stall-abandon cleanup awaited the dead tab forever and the crawl never exited.
+- Also checks crawled pages record their HTTP status (#42).
 
     python scripts/crawl_stall_test.py              # isolated engine on :8739, stopped after
 
@@ -130,6 +131,10 @@ def main():
         ok("no crawl tab left open, the dead one included", after == before, f"{before} -> {after}")
         ok("the ordinary pages were crawled", "DONE: 3 ok" in out or "DONE: 4 ok" in out,
            next((ln for ln in out.splitlines() if ln.startswith("DONE")), "no DONE line"))
+        import sqlite3
+        with sqlite3.connect(os.path.join(WORK, "c.sqlite")) as db:
+            st = dict(db.execute("select url, scan_http_status from frontier where scan_status='ok'"))
+        ok("crawled pages record their HTTP status (#42)", bool(st) and set(st.values()) == {200}, st)
         if FAIL:
             say("--- crawl.run output ---\n" + out[-4000:])
     finally:

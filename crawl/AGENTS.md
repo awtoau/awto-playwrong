@@ -154,10 +154,11 @@ def sink(url, data, mime):
     m = imgmeta.probe(data)
     sa = store.store_asset(data, ASSET_ROOT, mime=mime, src_url=url, meta=m)
     d.upsert_asset(sa); d.link_page_asset(page_sha_for(url), url, asset_sha=sa.sha256)
-cache.harvest(sink, url_filter=lambda u: "mysite.com" in u)   # walks /tmp/uc_*/…/Cache_Data
+cache.harvest(sink, url_filter=lambda u: "mysite.com" in u)   # walks /tmp/playwrong-profile-*/…/Cache_Data
 ```
-Best right after a crawl (the cache is warm). The shared browser's profile is `/tmp/uc_*` — one 1GB+
-cache can hold thousands of images across all recent browsing.
+Best right after a crawl (the cache is warm). The shared browser's profile is
+`/tmp/playwrong-profile-*` (or the `PH_PROFILE` dir — pass `profiles_glob`) — one 1GB+ cache can hold
+thousands of images across all recent browsing.
 
 **2. Second-pass re-download (`assets.store`).** Iterate `page_asset` and fetch each `img_url` (browser
 or urllib), then store — for images that weren't cached, or a clean deduped mirror:

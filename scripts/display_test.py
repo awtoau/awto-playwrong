@@ -1,7 +1,7 @@
 """display_test.py — prove ensure_display() adopts the desktop session, or fails naming itself.
 
 Guards the regression where an engine spawned from a shell with no DISPLAY (ssh, remote editor,
-after a reboot) failed every launch with nodriver's misleading "running as root" hint.
+after a reboot) failed every launch with a misleading "running as root" hint.
 
 No browser, no real display: fake X11/run dirs under tmp/, driven with an explicit env dict.
 

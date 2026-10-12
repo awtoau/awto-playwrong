@@ -4,9 +4,10 @@ An engine that exits without closing its browser leaves a full Chrome running wi
 it. They are invisible (headed but easily lost behind other windows), they never exit on their own,
 and they are expensive: 14 of them were holding 15.7 GB here.
 
-Safety: this ONLY touches Chrome processes whose `--user-data-dir` is a nodriver temp profile
-(`/tmp/uc_*`) or a playwrong profile dir, AND only when no engine is currently serving. Your own
-browser uses a real profile directory and can never match. Nothing is killed without saying so.
+Safety: this ONLY touches Chrome processes whose `--user-data-dir` is an engine temp profile
+(`<tmp>/playwrong-profile-*`, or `/tmp/uc_*` from before #41) or a playwrong profile dir, AND only
+when no engine is currently serving. Your own browser uses a real profile directory and can never
+match. Nothing is killed without saying so.
 
     python scripts/cleanup_orphans.py            # report only
     python scripts/cleanup_orphans.py --kill     # close them
@@ -17,15 +18,18 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from engine import connect  # noqa: E402
+from engine import cdp, connect  # noqa: E402
 
-# nodriver's throwaway profiles, plus playwrong's named ones. Anything else is somebody's real
-# browser and is never a candidate.
-PROFILE_RE = re.compile(r"--user-data-dir=(/tmp/uc_[^\s]*|[^\s]*/playwrong/profiles/[^\s]*)")
+# Engine temp profiles (uc_* = nodriver's, pre-#41), plus playwrong's named ones. Anything else is
+# somebody's real browser and is never a candidate.
+TEMP_PROFILE = re.compile(rf"^{re.escape(tempfile.gettempdir())}/({cdp.PROFILE_PREFIX}|uc_)")
+PROFILE_RE = re.compile(rf"--user-data-dir=({re.escape(tempfile.gettempdir())}/"
+                        rf"(?:{cdp.PROFILE_PREFIX}|uc_)[^\s]*|[^\s]*/playwrong/profiles/[^\s]*)")
 PORTS = [8731] + [8739, 8741, 8799] + list(range(8740, 8790))
 
 
@@ -101,7 +105,7 @@ def main():
                 closed += 1
             except (ProcessLookupError, PermissionError):
                 pass
-        if prof.startswith("/tmp/uc_") and os.path.isdir(prof):
+        if TEMP_PROFILE.match(prof) and os.path.isdir(prof):
             subprocess.run(["rm", "-rf", prof], capture_output=True)
     print(f"closed {closed} processes across {len(groups)} browser(s)")
     print(f"cache/logs live in {connect.DATA}")

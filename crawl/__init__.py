@@ -20,31 +20,9 @@ Nothing here knows what the pages are ABOUT or where they get stored. Reuse it f
 sibling `assets/` package is the matching content-addressed store for image/binary bytes. `schema.sql`
 at the repo root is the recommended relational model both `db` and a consumer can adopt as-is.
 
-`parse`, `store`, `db`, `graph` are pure/stdlib and safe to import alone. `browser`, `netblock`,
-`render`, `run` pull in nodriver (a live browser) — import those only when actually crawling.
+`parse`, `store`, `db`, `graph` are pure/stdlib and safe to import alone. `browser`, `run` attach to
+a live browser (engine.cdp) — import those only when actually crawling.
 """
-
-def _use_vendored_nodriver():
-    """Ensure the PATCHED nodriver wins over any broken copy on the path.
-
-    Upstream nodriver 0.50.x has a non-UTF-8 byte in cdp/network.py that raises SyntaxError on import
-    under CPython 3.14+ — every build, not just free-threaded (measured on stable GIL 3.14.7); a
-    comment's bad byte stopped being tolerated in 3.14. When this package is installed, the fixed copy
-    ships at crawl/_vendor/nodriver; prepend it to sys.path so `import nodriver` picks it up. In a
-    source checkout the sibling `vendor/nodriver` is used instead. No-op if neither exists (a working
-    system nodriver is then used as-is)."""
-    import os
-    import sys
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, "_vendor"),                       # installed wheel/tool
-                 os.path.join(os.path.dirname(here), "vendor")):      # source checkout
-        if os.path.isdir(os.path.join(cand, "nodriver")) and cand not in sys.path:
-            if "nodriver" not in sys.modules:                         # don't fight an already-imported one
-                sys.path.insert(0, cand)
-            return
-
-
-_use_vendored_nodriver()
 
 from . import parse, store  # noqa: F401  (pure, always safe)
 
@@ -53,7 +31,7 @@ __all__ = ["parse", "store", "netblock", "render", "browser", "challenge",
 
 
 def __getattr__(name):
-    # Lazy so `from crawl import parse` (pure) never triggers the nodriver import chain.
+    # Lazy so `from crawl import parse` (pure) never triggers the browser import chain.
     if name in ("netblock", "render", "browser", "challenge", "run",
                 "db", "graph", "report", "drive"):
         import importlib

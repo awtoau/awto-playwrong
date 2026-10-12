@@ -26,7 +26,7 @@ Usage:
     stats = cache.harvest(sink, url_filter=lambda u: 'mysite.com' in u)
 
 CLI:
-    python -m assets.cache --profiles-glob '/tmp/uc_*' --root /path/assets --host mysite.com [--dry-run]
+    python -m assets.cache --profiles-glob '/tmp/playwrong-profile-*' --root /path/assets --host mysite.com [--dry-run]
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ import glob
 import io
 import os
 import struct
+import tempfile
 
 try:
     from PIL import Image
@@ -45,6 +46,8 @@ EOF_MAGIC_LE = struct.pack("<Q", 0xf4fa6f45970d41d8)   # SimpleFileEOF.final_mag
 HEADER_FMT = "<QIII I"                                  # magic u64|version u32|key_len u32|key_hash u32|pad u32
 HEADER_SIZE = 24
 IMG_EXT_HINT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
+# The engine's throwaway profiles (engine/cdp.py PROFILE_PREFIX). A PH_PROFILE one: pass its path.
+PROFILES_GLOB = f"{tempfile.gettempdir()}/playwrong-profile-*"
 # image magic bytes — so we recover even images served without a file extension in the URL.
 _SIGS = (
     (b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -109,7 +112,7 @@ def is_image(url, body):
         return False
 
 
-def iter_cached_images(profiles_glob="/tmp/uc_*", url_filter=None, junk_markers=()):
+def iter_cached_images(profiles_glob=PROFILES_GLOB, url_filter=None, junk_markers=()):
     """Yield (url, body, mime) for every decodable image in the Chrome caches matched by profiles_glob.
     url_filter(url)->bool scopes to your sites (default: all). junk_markers filters obvious non-content
     (e.g. sprites/pixels). Dedups by URL within the run."""
@@ -136,7 +139,7 @@ def iter_cached_images(profiles_glob="/tmp/uc_*", url_filter=None, junk_markers=
         yield url, body, sniff_mime(url, body)
 
 
-def harvest(sink, profiles_glob="/tmp/uc_*", url_filter=None, junk_markers=(), limit=None):
+def harvest(sink, profiles_glob=PROFILES_GLOB, url_filter=None, junk_markers=(), limit=None):
     """Walk the caches and call sink(url, data, mime) for each recovered image. Returns a stats dict.
     sink does the storing (e.g. assets.store.store_asset + your DB upsert). Never re-fetches anything."""
     n = stored = 0
@@ -158,7 +161,7 @@ def _main(argv=None):
     from . import imgmeta as _imgmeta
     from . import store as _store
     ap = argparse.ArgumentParser(description="Recover images from Chrome's Simple Cache into an asset store.")
-    ap.add_argument("--profiles-glob", default="/tmp/uc_*")
+    ap.add_argument("--profiles-glob", default=PROFILES_GLOB)
     ap.add_argument("--root", required=True, help="asset store root dir")
     ap.add_argument("--host", action="append", default=[], help="only URLs containing this host (repeatable)")
     ap.add_argument("--limit", type=int, default=None)

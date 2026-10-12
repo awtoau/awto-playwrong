@@ -1,10 +1,8 @@
 """release.py — build, PROVE the artifacts work, then optionally upload.
 
-The first wheel this project ever built was broken: it declared `nodriver` as a dependency, so pip
-installed the unpatched upstream copy, which shadowed the vendored patched one and killed the engine
-on its first run with a SyntaxError. `twine check` passed the whole time — it only validates
-metadata. The only thing that catches that class of bug is installing the artifact into a clean
-environment and running it, which is what this script does before it will upload anything.
+The first wheel this project ever built was broken (a dependency shadowed the code it shipped) and
+`twine check` passed the whole time — it only validates metadata. So this installs each artifact
+into a clean environment and runs it before it will upload anything.
 
     python scripts/release.py                 # build + verify wheel AND sdist. No upload.
     python scripts/release.py --test-pypi     # ...then upload to TestPyPI
@@ -86,14 +84,7 @@ def verify_artifact(artifact):
         if r.returncode != 0:
             say("install FAILED:", ((r.stdout or "") + (r.stderr or ""))[-1200:])
             return False
-        deps = run([pip, "list", "--format=freeze"], capture_output=True).stdout
-        if "nodriver==" in deps:
-            # The exact bug that shipped once: the vendored patched copy is the point, and a PyPI
-            # nodriver in site-packages shadows it.
-            say("FAIL: an unpatched `nodriver` came in as a dependency — it will shadow the "
-                "vendored patched copy")
-            return False
-        exe = os.path.join(venv, "bin", "playwrong")
+        exe =os.path.join(venv, "bin", "playwrong")
         if not os.path.exists(exe):
             say("FAIL: no `playwrong` command was installed")
             return False

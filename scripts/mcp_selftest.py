@@ -185,7 +185,7 @@ def live_tests(c):
     r = c.call("js", expr="document.title")
     ok("js evaluates in the page", "Example Domain" in text_of(r), text_of(r)[:80])
     # Regression guards. js used to hand back a bare Promise (serialised to null) for anything
-    # async, and nodriver's RemoteObject repr for anything non-primitive.
+    # async, and a RemoteObject repr for anything non-primitive.
     r = c.call("js", expr="await new Promise(r=>setTimeout(()=>r('resolved'),200))")
     ok("js awaits a promise", "resolved" in text_of(r), text_of(r)[:80])
     r = c.call("js", expr="({a:1,b:[2,3]})")
