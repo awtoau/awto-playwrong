@@ -599,7 +599,7 @@ class ND:
         how you get the pile of headed Chromes cleanup_orphans.py was written for — 12 of them
         holding 15.7 GB, from one afternoon."""
         try:
-            if not self.gone(): self.browser.stop()
+            if not self.gone(): await self.browser.close()
         except Exception as e:
             log("retire_err", e=repr(e)[:80])
     async def _ensure(self):
@@ -1422,7 +1422,7 @@ def _shutdown(code=0):
 
 async def _stop_browser():
     try:
-        B.browser.stop()          # terminates Chrome's process group, removes a temp profile
+        await B.browser.close()   # graceful (flushes the profile), then the process group goes
     except Exception:
         pass
 

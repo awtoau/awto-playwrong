@@ -24,7 +24,8 @@ import urllib.request
 LAUNCH_TIMEOUT = 3.5
 # Websocket upgrade to a local Chrome: ms. 2 s covers a loaded box; on expiry ConnectionLost.
 WS_OPEN_TIMEOUT = 2.0
-# SIGTERM -> exit for Chrome: ~0.3 s typical. On expiry: SIGKILL.
+# Browser.close or SIGTERM -> exit for Chrome: ~0.3 s typical. On expiry: the next step (SIGTERM,
+# then SIGKILL).
 STOP_TIMEOUT = 2.0
 
 # First hit wins. Names are looked up on PATH; absolute paths are checked as they are.
@@ -340,8 +341,23 @@ class Browser:
             pass
         self._lost(None)
 
+    async def close(self):
+        """Graceful stop: Browser.close lets Chrome flush cookies and profile state to disk (a
+        SIGTERM'd Chrome lost a persistent profile's cookies), then stop() as the fallback."""
+        p = self.process
+        if p is not None and p.poll() is None and not self.closed:
+            try:
+                await asyncio.wait_for(self.send("Browser.close"), STOP_TIMEOUT)
+            except Exception:
+                pass                                 # the socket closing under us is the success path
+            t0 = time.monotonic()
+            while p.poll() is None and time.monotonic() - t0 < STOP_TIMEOUT:
+                await asyncio.sleep(0.05)
+        self.stop()
+
     def stop(self):
-        """Terminate the owned Chrome and remove a temp profile. Sync: safe from any thread."""
+        """Terminate the owned Chrome and remove a temp profile. Sync: safe from any thread.
+        Prefer close(): this path can lose state Chrome had not yet written."""
         try:
             self.ws.transport.abort()
         except Exception:

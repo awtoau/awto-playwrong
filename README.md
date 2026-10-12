@@ -152,6 +152,7 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 |---|---|
 | `scripts/doctor.py` | preflight: Python, deps, Chrome, display, port. Prints the exact fix command for anything missing. |
 | `scripts/turnstile_click_test.py` | the engine's `solve` clicks a REAL interactive Turnstile (Cloudflare's test sitekey `3x…FF` on a local page): the checkbox sits in an out-of-process iframe, the click lands, the widget issues its token (#45). |
+| `scripts/profile_test.py` | a persistent profile (`PH_PROFILE_DIR`) on an isolated engine: a cookie survives a clean restart (graceful `Browser.close`), the profile is kept, and a SIGKILL'd engine + Chrome relaunch on the same profile (stale `SingletonLock` healed). |
 | `scripts/cdp_smoke_test.py` | `engine/cdp.py` against a real headless Chrome, no network: launch, tabs, evaluate, content, screenshot, find + click through an iframe and shadow root (the Turnstile layout), Fetch/dialog handling surviving navigation (#43), stop cleaning up its profile. |
 | `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup, and a local server that hangs up mid-download (must resume or fail by name, #31). `--cloudflare` adds a real Turnstile wall. |
 | `scripts/download_latency.py` | measures time-to-headers and the longest gap between socket reads on real downloads: the numbers `download()`'s per-read timeout is derived from (#30). `--runs N`. |

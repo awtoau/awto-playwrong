@@ -152,7 +152,7 @@ async def main():
         check("aclose leaves chrome", not b.stopped)
     finally:
         udd = b.user_data_dir
-        b.stop()
+        await b.close()
         left = os.listdir(udd) if os.path.exists(udd) else None
         check("stop", b.stopped and left is None, f"stopped={b.stopped} profile_left={left}")
     try:
