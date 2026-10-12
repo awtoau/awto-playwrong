@@ -5,7 +5,7 @@ dead challenge that never resolves). One browser does everything — clear Turns
 feed the viz screenshots — so there is no second browser and no orphan windows.
 
 Control port (POST JSON): goto{url} solve{tries} text shot js{expr} cookies clearcookies
-                          newtab closetab closeextra tabs cdp move click key shutdown
+                          newtab closetab closeextra tabs cdp window move click key shutdown
 GET: /status /tabs /viz /frame /markers ; POST /setmarkers
 
 You do not need to run this by hand — engine/connect.py starts it on demand. To run it in the
@@ -1322,6 +1322,20 @@ class ND:
         return {"job": job, "results": list(done.values()), "remaining": max(0, remaining),
                 "done": remaining <= 0}
 
+    async def _window(self, bounds=None, tab=None):
+        """The tab's browser window: {windowId, bounds}. With `bounds` ({left,top,width,height}),
+        move/resize it first; a maximised window is made normal, since Chrome refuses a size then."""
+        t = await self._tab(tab)
+        w = await self.browser.send("Browser.getWindowForTarget", {"targetId": t.target_id})
+        if bounds:
+            want = {k: int(v) for k, v in bounds.items() if k in ("left", "top", "width", "height")}
+            if w["bounds"].get("windowState") != "normal":
+                await self.browser.send("Browser.setWindowBounds",
+                                        {"windowId": w["windowId"], "bounds": {"windowState": "normal"}})
+            await self.browser.send("Browser.setWindowBounds",
+                                    {"windowId": w["windowId"], "bounds": want})
+            w = await self.browser.send("Browser.getWindowForTarget", {"targetId": t.target_id})
+        return {"windowId": w["windowId"], "bounds": w["bounds"]}
     async def _cookies(self):
         await self._ensure()
         cks = await self.browser.cookies()
@@ -1344,6 +1358,7 @@ class ND:
                                             a.get("tag")),
            "closeextra":lambda:self._closeextra(a.get("owner"), a.get("force", False)),
            "cdp":lambda:self._cdp_info(),
+           "window":lambda:self._window(a.get("bounds"),a.get("tab")),
            "prefetch":lambda:self._prefetch(a.get("urls"),a.get("concurrency",8),
                                             a.get("solve",True),a.get("tries",20),
                                             a.get("timeout",30),a.get("owner")),

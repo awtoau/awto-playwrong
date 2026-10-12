@@ -205,6 +205,24 @@ def t_owner_labelling():
     connect.call("closetab", port=PORT, tag=tag)
 
 
+def t_window():
+    """The `window` op reads and sets the tab's window bounds (#44: rightmon used to send raw CDP
+    to the `cdp` op, which ignored it)."""
+    tag = "stress-window"
+    connect.call("newtab", port=PORT, url="about:blank", tag=tag)
+    try:
+        r = connect.call("window", port=PORT, tab=tag)
+        ok("window reports its bounds", "windowId" in r and "width" in r.get("bounds", {}),
+           json.dumps(r)[:90])
+        want = {"left": 40, "top": 30, "width": 900, "height": 640}
+        r = connect.call("window", port=PORT, tab=tag, bounds=want)
+        got = r.get("bounds", {})
+        ok("window bounds are applied", (got.get("width"), got.get("height")) == (900, 640),
+           json.dumps(got)[:90])
+    finally:
+        connect.call("closetab", port=PORT, tag=tag)
+
+
 # ── protocol robustness ─────────────────────────────────────────────────────────────────────────
 
 def t_malformed():
@@ -269,7 +287,8 @@ def main():
 
     for fn in (t_duplicate_urls, t_bad_urls, t_empty_and_unknown, t_drain_once,
                t_more_than_concurrency, t_tabs_return_to_baseline, t_bad_tag, t_close_twice,
-               t_batch_plus_interactive, t_owner_labelling, t_malformed, t_parallel_ops, t_processes):
+               t_batch_plus_interactive, t_owner_labelling, t_window, t_malformed, t_parallel_ops,
+               t_processes):
         try:
             fn()
         except Exception as e:

@@ -255,6 +255,7 @@ python .../engine/client.py shutdown     # clean stop (never pkill the browser)
 | `jobs` | `{job?}` | counts: `{ready,loading,pending,errors,urls}` — cheap to poll, never ships page bodies |
 | `collect` | `{job,drain?}` | `{results:[{status,title,html,url,partial?}],remaining}` — every READY result, removed from the engine once handed over |
 | `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`engine.cdp.attach(host, port)`) to this SAME browser and open its own tabs (parallel sharding) |
+| `window` | `{bounds?, tab?}` | `{windowId, bounds}` — the tab's browser window; with `bounds` (`{left,top,width,height}`) move/resize it first (`client.py rightmon` uses this) |
 | `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
 | `cookies` | — | `{cookies:[{name,value,domain}]}` — the whole browser, incl. cleared `cf_clearance`. Feed these to an HTTP client to download a file the browser cleared for you. |
 | `clearcookies` | — | `{cleared}` |
