@@ -17,6 +17,7 @@ passes through this script or its output.
 Log: tmp/logs/release.log
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -84,7 +85,18 @@ def verify_artifact(artifact):
         if r.returncode != 0:
             say("install FAILED:", ((r.stdout or "") + (r.stderr or ""))[-1200:])
             return False
-        exe =os.path.join(venv, "bin", "playwrong")
+        mcp = os.path.join(venv, "bin", "awto-playwrong")
+        init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "release", "version": "0"}}}) + "\n"
+        # Answers from stdlib alone, no browser: ~0.3 s of interpreter start. 10 s = a hung server.
+        r = run([mcp], input=init, capture_output=True, cwd=tmp, timeout=10)
+        if '"name": "playwrong"' not in (r.stdout or ""):
+            say("FAIL: `awto-playwrong` (what `uvx awto-playwrong` runs) did not answer MCP initialize:")
+            say(((r.stdout or "") + (r.stderr or ""))[-800:])
+            return False
+        say("  `awto-playwrong` answers MCP initialize (the MCP Registry entry point)")
+        exe = os.path.join(venv, "bin", "playwrong")
         if not os.path.exists(exe):
             say("FAIL: no `playwrong` command was installed")
             return False

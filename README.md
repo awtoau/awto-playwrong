@@ -1,5 +1,7 @@
 # awto-playwrong
 
+<!-- mcp-name: io.github.awtoau/awto-playwrong -->
+
 **Fetch the pages that won't let you fetch them.**
 
 ```sh

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.awtoau/awto-playwrong",
+  "title": "playwrong",
+  "description": "Fetch, search, PDF and download through one shared headed Chrome that clears Cloudflare Turnstile",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/awtoau/awto-playwrong",
+  "repository": {
+    "url": "https://github.com/awtoau/awto-playwrong",
+    "source": "github",
+    "id": "1270724723"
+  },
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/awtoau/awto-playwrong/main/docs/logo-256.png",
+      "mimeType": "image/png",
+      "sizes": ["256x256"]
+    },
+    {
+      "src": "https://raw.githubusercontent.com/awtoau/awto-playwrong/main/docs/logo.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "awto-playwrong",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {"type": "stdio"}
+    }
+  ]
+}
