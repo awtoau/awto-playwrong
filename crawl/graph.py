@@ -64,10 +64,14 @@ def orphans(dbobj):
 
 
 def dead_links(dbobj, n=50):
-    """(href, times_linked) for hrefs linked but never captured — gaps / off-site / 404. High = prominent."""
+    """(href, times_linked) for hrefs linked but never captured — gaps / off-site / 404. High = prominent.
+    Captured = a page row with that url OR a frontier row that stored a page: two urls with the
+    same content share one page row, which keeps only one of them (#48)."""
+    captured = (select(frontier.c.url).where(frontier.c.url == page_link.c.href)
+                .where(frontier.c.sha256.is_not(None)).exists())
     j = page_link.outerjoin(page, page.c.url == page_link.c.href)
     stmt = (select(page_link.c.href, func.count().label("n")).select_from(j)
-            .where(page.c.url.is_(None))
+            .where(page.c.url.is_(None)).where(~captured)
             .group_by(page_link.c.href).order_by(func.count().desc(), page_link.c.href).limit(n))
     return _rows(dbobj, stmt)
 

@@ -182,6 +182,25 @@ def main():
            ["https://old.test/a"], str(got))
         d.close()
 
+    # #48: two urls with the same content share one page row; neither may be reported dead.
+    from crawl import graph, store
+    with tempfile.TemporaryDirectory() as tmp:
+        d = dbmod.open_db(f"sqlite:///{os.path.join(tmp, 'g.sqlite')}")
+        d.init_schema()
+        a, b, c, never = ("https://d.test/", "https://www.d.test", "https://d.test/c",
+                          "https://d.test/never")
+        same = store.store_page("<title>home</title><p>same body</p>", os.path.join(tmp, "p"))
+        other = store.store_page("<title>c</title><p>links</p>", os.path.join(tmp, "p"))
+        for u, sp in ((a, same), (b, same), (c, other)):
+            d.enqueue(u, 0)
+            d.upsert_page(sp, u, title=sp.title, text_chars=sp.text_chars)
+            d.scan(u, status="ok", http_status=200, sha256=sp.sha256)
+        d.add_links(other.sha256, [a, b, never])
+        dead = {h for h, _n in graph.dead_links(d)}
+        ok("a captured url sharing content is not a dead link (#48)", not dead & {a, b}, str(dead))
+        ok("a linked url never crawled is still a dead link", never in dead, str(dead))
+        d.close()
+
     say(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         say("failed: " + ", ".join(FAIL))
