@@ -347,6 +347,13 @@ class _ShortServer(http.server.BaseHTTPRequestHandler):
                                               "Content-Range": f"bytes {start}-{DL_SIZE-1}/{n}"})
         elif self.path == "/resume.bin":
             self._send(200, DL_BODY[:DL_CUT], {"Content-Length": n, "Accept-Ranges": "bytes"})
+        elif self.path == "/keyed.bin":           # #2: an API that refuses urllib and wants a key
+            if not self.headers.get("Sec-Fetch-Mode"):          # urllib -> bot block -> fallback
+                self._send(403, b"bot", {"Content-Length": "3"})
+            elif self.headers.get("X-Api-Key") != "k3y":
+                self._send(401, b"no key", {"Content-Length": "6"})
+            else:
+                self._send(200, DL_BODY[:4096], {"Content-Length": "4096"})
         elif self.path == "/mentions.html":       # #37: a page ABOUT bot checks is not one
             b = (b"<title>About bots</title><p>Sites ask you to verify you are human with "
                  b"Cloudflare Turnstile.</p>")
@@ -430,6 +437,23 @@ def short_transfer_tests(c):
         c.call("close_tab", close_extra=True)
 
 
+def extra_headers_test(port):
+    """#2: connect.download's browser fallback must send extra_headers (an API key) too."""
+    sys.path.insert(0, REPO)
+    from engine import connect
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ShortServer)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    path = os.path.join(REPO, "tmp", "selftest-short", "keyed.bin")
+    try:
+        r = connect.download(f"http://127.0.0.1:{srv.server_address[1]}/keyed.bin", path=path,
+                             port=port, extra_headers={"X-Api-Key": "k3y"})
+        ok("download fallback sends extra_headers", r.get("bytes") == 4096, str(r)[:120])
+    except connect.EngineError as e:
+        ok("download fallback sends extra_headers", False, str(e)[:160])
+    finally:
+        srv.shutdown()
+
+
 def slow_page_tests(c):
     """#32: a page still loading at capture must arrive whole, or say it is incomplete."""
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ShortServer)
@@ -511,6 +535,7 @@ def main():
         else:
             live_tests(c)
             short_transfer_tests(c)
+            extra_headers_test(a.port)
             slow_page_tests(c)
             if a.cloudflare:
                 cloudflare_test(c)

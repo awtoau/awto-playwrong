@@ -773,7 +773,7 @@ RESUME_TRIES = 8
 
 
 def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=20, profile=None,
-                         timeout=300.0):
+                         timeout=300.0, extra_headers=None):
     """Fetch `url` with the page's own fetch() from a same-origin tab and stream it to `path`.
 
     - For CDNs that stall or block urllib even with the cleared cookies + UA (st.com, issue #30).
@@ -798,7 +798,8 @@ def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=
             head = call("js", port=port, tab=tag, timeout=timeout + 10.0, expr=(
                 "(async () => { const c = new AbortController();"
                 f" const t = setTimeout(() => c.abort(), {ms});"
-                f" const r = await fetch({json.dumps(url)}, {{credentials: 'include', signal: c.signal}});"
+                f" const r = await fetch({json.dumps(url)}, {{credentials: 'include', signal: c.signal,"
+                f" headers: {json.dumps(extra_headers or {})}}});"
                 " const b = new Uint8Array(await r.arrayBuffer()); clearTimeout(t);"
                 " window.__playwrong_dl = b;"
                 " return {status: r.status, ok: r.ok, size: b.length, url: r.url,"
@@ -893,8 +894,8 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
     `final_url` is the url after redirects. A manifest wants that rather than the url you asked
     for — they differ exactly when a download went somewhere you did not expect.
 
-    extra_headers: added to the plain-HTTP request (an API key, say). The in-browser fallback
-    does not send them.
+    extra_headers: added to the request (an API key, say), on the plain-HTTP path and the
+    in-browser fallback alike.
 
     expect_sha256 / expect_size: raise if the bytes do not match what a publisher stated. This is
     the general form of the page-count check on pdf() — the way a silent wrong answer (block page,
@@ -902,7 +903,7 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
     """
     headers = session_headers(url, port=port, on_start=on_start, solve=solve, tries=tries,
                               profile=profile)
-    headers.update(extra_headers or {})       # e.g. an API key header; plain-HTTP path only
+    headers.update(extra_headers or {})       # e.g. an API key header; the fallback sends it too
     if on_start:
         on_start(f"downloading with the cleared session ({len(headers.get('Cookie',''))} B of cookies)")
     if path is None:
@@ -934,7 +935,8 @@ def download(url, path=None, port=None, on_start=None, solve=True, tries=20, pro
             on_start(f"plain HTTP refused ({refused}); downloading inside the browser tab")
         try:
             total, ctype, final, sha = _download_in_browser(url, path, port=port, on_start=on_start,
-                                                            solve=solve, tries=tries, profile=profile)
+                                                            solve=solve, tries=tries, profile=profile,
+                                                            extra_headers=extra_headers)
         except EngineError as e:
             if refused.startswith("short transfer") and os.path.exists(path):
                 # Off the requested path: a later "does sources/fw.bin exist?" must not see it.
