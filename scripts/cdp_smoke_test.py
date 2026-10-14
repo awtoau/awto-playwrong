@@ -93,6 +93,11 @@ async def main():
     t0 = time.monotonic()
     b = await cdp.launch(headless=True, log_path=os.path.join(REPO, "tmp", "logs", "cdp-smoke-chrome.log"))
     check("launch", b.process is not None and not b.stopped, f"{time.monotonic() - t0:.2f}s port={b.port}")
+    # The endpoint fallback for a Chrome whose stderr is not readable (Windows): /json/version.
+    url = cdp._version_url(b.port)
+    check("/json/version fallback names this browser", bool(url) and f":{b.port}/devtools/browser/" in url,
+          url)
+    check("/json/version fallback: nothing listening -> None", cdp._version_url(cdp._free_port()) is None)
     try:
         check("initial tab", len(b.tabs) >= 1, f"tabs={len(b.tabs)}")
         t = await b.new_tab("about:blank")

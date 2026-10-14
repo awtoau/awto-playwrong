@@ -48,7 +48,7 @@ tab.
 | Op | Body | Returns |
 |---|---|---|
 | `start` | — | `{started}`: launch Chrome and block until it is ready |
-| `newtab` | `{url?, tag?, owner?}` | `{ok, url, index, tag, owner, target_id}`. A tagged tab doesn't become active. `owner` (`agent@repo:pid`) prefixes the tab title. |
+| `newtab` | `{url?, tag?, owner?}` | `{ok, url, index, tag, owner, target_id}`. A tagged tab doesn't become active. `owner` (`agent@repo:pid`) is listed by `tabs`; with `PH_TAB_LABEL=1` it also prefixes the tab title. |
 | `goto` | `{url, tab?, no_js?}` | `{title, url, requested, ready_state}`. `url` is where the page **landed**. Waits a 2 s settle, then up to `LOAD_WAIT` (5 s) for `complete` (#32). `no_js` disables page scripts. |
 | `text` | `{tab?}` | `{title, url, html}` |
 | `solve` | `{tries?, tab?}` | `{passed, iter}`: find and click the Turnstile checkbox (through its OOPIF), poll until clear |

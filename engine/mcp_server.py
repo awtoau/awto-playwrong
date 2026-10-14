@@ -541,6 +541,10 @@ def handle(msg):
 
 
 def main():
+    # The wire is UTF-8 with \n framing on every OS; Windows defaults are cp1252 and \r\n.
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     elog(f"[{NAME}] mcp stdio server up — repo={REPO} engine_port={PORT}")
     out = sys.stdout
     for line in sys.stdin:

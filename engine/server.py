@@ -87,8 +87,9 @@ TMP = connect.DATA                               # checkout tmp/, or the XDG cac
 LOG = os.path.join(TMP, "nd-server.log")
 CHROME_LOG = os.path.join(TMP, "chrome.log")     # Chrome's stdout/stderr, truncated per launch
 
-# Owner label in the tab title, for whoever watches the shared browser. The rare ⟦⟧ pair makes
-# stripping it from returned titles exact (#16).
+# Owner label in the tab title, for whoever watches the shared browser. Opt-in: document.title is
+# page-visible and analytics send it off-site (#55). The rare ⟦⟧ pair makes stripping exact (#16).
+TAB_LABEL = os.environ.get("PH_TAB_LABEL") == "1"
 OWNER_L, OWNER_R = "\u27e6", "\u27e7"
 OWNER_TITLE_RE = re.compile(rf"^{OWNER_L}[^{OWNER_R}]*{OWNER_R}\s*")
 
@@ -111,12 +112,11 @@ def strip_owner(title):
     """The page's own title: the owner label is for the human watching, never for callers."""
     return OWNER_TITLE_RE.sub("", title or "")
 
-# Serialise the caller's expression IN THE PAGE and hand back a JSON string: undefined, promises and
-# thrown errors (with stack) all arrive as one plain string. `await (…)` covers sync and async.
+# Serialise the caller's expression IN THE PAGE and hand back a JSON string: [1, value] or
+# [0, error with stack]. `await (…)` covers sync and async. No branded names: the page can see it (#55).
 JS_WRAP = ("(async () => { try { const v = await (%s);"
-           " return JSON.stringify(v === undefined ? null : v); }"
-           " catch (e) { return JSON.stringify("
-           "{__playwrong_error: String((e && e.stack) || e)}); } })()")
+           " return JSON.stringify([1, v === undefined ? null : v]); }"
+           " catch (e) { return JSON.stringify([0, String((e && e.stack) || e)]); } })()")
 
 PID = os.getpid()
 STARTED = time.monotonic()
@@ -126,7 +126,7 @@ def log(a, **k):
     ts = datetime.now(UTC).isoformat(timespec="milliseconds")
     try:
         logroll.roll(LOG)                 # every engine on this checkout shares the file (#39)
-        with open(LOG, "a") as f:
+        with open(LOG, "a", encoding="utf-8") as f:
             f.write(f"{ts} pid={PID} rss_mb={proc_status_mb('VmRSS')} {a} "
                     + " ".join(f"{x}={y}" for x,y in k.items()) + "\n")
     except Exception:
@@ -397,16 +397,9 @@ def heal_profile(profile_dir):
         pid = int(os.readlink(lock).rsplit("-", 1)[-1])
     except (OSError, ValueError):
         pass
-    if pid and pid > 0:
-        try:
-            os.kill(pid, 0)              # signal 0 = existence check only, never touches the process
-            log("profile_lock_live", pid=pid)
-            return                        # a real browser is using this profile; leave it alone
-        except PermissionError:
-            log("profile_lock_live", pid=pid)      # exists, just owned by another user
-            return
-        except (ProcessLookupError, OverflowError, OSError):
-            pass                          # owner gone (or an unparseable pid) -> treat as stale
+    if pid and pid > 0 and connect.pid_alive(pid):
+        log("profile_lock_live", pid=pid)
+        return                            # a real browser is using this profile; leave it alone
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         p = os.path.join(profile_dir, name)
         if not os.path.lexists(p):
@@ -495,13 +488,7 @@ class ND:
             pid = int(owner.rsplit(":", 1)[1])
         except ValueError:
             return True
-        try:
-            os.kill(pid, 0)          # signal 0: existence check, sends nothing
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True              # exists, owned by another user
-        return True
+        return connect.pid_alive(pid)
     def chrome_pid(self):
         """PID of our Chrome, or None. Tests kill exactly this one, never a pgrep match."""
         p = self.browser.process if self.browser is not None else None
@@ -563,7 +550,7 @@ class ND:
             self.browser = self.tab = None
             self._dead = False
             heal_profile(PROFILE_DIR)   # a stale lock would hang the launch below forever
-            if not HEADLESS:
+            if not HEADLESS and sys.platform.startswith("linux"):   # Windows/macOS need no DISPLAY
                 adopted = ensure_display()
                 if adopted: log("display_adopted", **adopted)
             kills = memcap.oom_kills()
@@ -729,7 +716,7 @@ class ND:
         """Prefix this tab's title with its owner. Best effort: an SPA rewrites its title at will,
         and a failed label must never fail the navigation."""
         owner = self.owners.get(t.target_id)
-        if not owner:
+        if not owner or not TAB_LABEL:
             return
         try:
             await t.evaluate(
@@ -1014,9 +1001,11 @@ class ND:
             val = json.loads(raw)
         except ValueError:
             return {"result": unlabel(raw, owner)}
-        if isinstance(val, dict) and "__playwrong_error" in val:
-            return {"error": f"js exception: {val['__playwrong_error']}"}
-        return {"result": unlabel(val, owner)}
+        if not (isinstance(val, list) and len(val) == 2):
+            return {"result": unlabel(val, owner)}
+        if not val[0]:
+            return {"error": f"js exception: {val[1]}"}
+        return {"result": unlabel(val[1], owner)}
     # ── prefetch: load many urls in parallel tabs; collect each as it lands ─────────────────────
     async def _prefetch(self, urls, concurrency=8, solve=True, tries=20, timeout=30, owner=None):
         """Start a batch; returns a job id immediately."""

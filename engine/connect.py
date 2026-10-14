@@ -85,6 +85,30 @@ def owner_label():
 
 OWNER = owner_label()
 
+
+def pid_alive(pid):
+    """Does this pid exist? Never os.kill(pid, 0) on Windows: there it TerminateProcess-es the pid."""
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p        # a HANDLE, not a C int
+        k32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k32.OpenProcess(0x1000, False, int(pid))    # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5          # access denied: exists, another user's
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259            # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)                             # signal 0: existence check, sends nothing
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OverflowError, ValueError, OSError):
+        return False
+    return True
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -159,10 +183,18 @@ def spawn(port=None, profile=None):
     if profile:
         env["PH_PROFILE"] = profile      # engine/server.py turns the NAME into a user-data-dir
     logroll.roll(SERVER_LOG)             # the engine holds it open for life: roll at spawn (#39)
-    with open(SERVER_LOG, "a") as log_f:
-        return subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
-                                env=env, stdout=log_f, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+    cmd = [sys.executable, os.path.join(REPO, "engine", "server.py")]
+    with open(SERVER_LOG, "a", encoding="utf-8") as log_f:
+        kw = dict(env=env, stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        if os.name != "nt":
+            return subprocess.Popen(cmd, start_new_session=True, **kw)
+        # Windows: no console window, own process group, and out of the MCP client's job object so
+        # the shared engine outlives the agent that started it. Breakaway can be refused: retry without.
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        try:
+            return subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kw)
+        except OSError:
+            return subprocess.Popen(cmd, creationflags=flags, **kw)
 
 
 def _log_tail(path, n=1200):
@@ -620,7 +652,7 @@ def _log_search(engine, query, outcome, n=0):
     try:
         os.makedirs(LOGDIR, exist_ok=True)
         logroll.roll(SEARCH_LOG)
-        with open(SEARCH_LOG, "a") as f:
+        with open(SEARCH_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engine": engine,
                                 "outcome": outcome, "n": n, "owner": OWNER, "q": query[:200]}) + "\n")
     except OSError:

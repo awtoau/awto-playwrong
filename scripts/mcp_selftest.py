@@ -199,6 +199,9 @@ def live_tests(c):
     # caller — it did through js and through mode=html, while the title field beside them was clean.
     r = c.call("js", expr="document.title")
     ok("js title has no engine label", "\u27e6" not in text_of(r), text_of(r)[:70])
+    # Booleans are not unlabelled: this is what the PAGE's own scripts see (#55).
+    r = c.call("js", expr="document.title.includes('\\u27e6') || /playwrong/i.test(document.title)")
+    ok("the page sees no engine label in its title (#55)", text_of(r).strip() == "false", text_of(r))
     r = c.call("js", expr="[document.title, {t: document.title}]")
     ok("js strips the label inside nested results", "\u27e6" not in text_of(r), text_of(r)[:70])
     r = c.call("read", mode="html")

@@ -43,6 +43,17 @@ Restart the MCP client. The tools appear as `mcp__playwrong__fetch` and so on. R
 listed in the [README](../README.md#install); `python scripts/doctor.py` checks them all and prints
 the fix command for anything missing.
 
+**Windows:**
+```powershell
+py -3.14 -m venv .venv
+.venv\Scripts\python scripts\install.py --deps --register --vscode
+.venv\Scripts\python scripts\mcp_selftest.py --offline
+.venv\Scripts\python -m pip install -e .            # the `playwrong` command (--link symlinks need admin)
+```
+- Chrome: Program Files, `%LOCALAPPDATA%`, or `PH_CHROME`. No display setup; no memory cap (systemd only).
+- The engine starts with no console window, outside the MCP client's job object, so it outlives the agent.
+- Not yet verified on real Windows hardware: report what breaks against `awtoau/awto-playwrong`.
+
 From an installed package, the entry point is `awto-playwrong` (or `playwrong-mcp`), e.g.
 `uvx awto-playwrong`.
 
@@ -232,8 +243,9 @@ Chrome's worth of memory. Each agent gets its own **tagged tab** automatically:
   wrong page with no error. `scripts/concurrency_test.py` guards this.
 - The owner label is `agent@repo:pid`, guessed from the program and git repo. Override it with
   `PLAYWRONG_AGENT` in the entry's env, or `playwrong --agent NAME`.
-- The label is prefixed to the **browser tab title** (`⟦claude@awto-vyvanse:41792⟧ AWTO | …`) for the
-  human watching, and stripped from every title the API returns.
+- `PH_TAB_LABEL=1` on the engine also prefixes it to the **browser tab title**
+  (`⟦claude@awto-vyvanse:41792⟧ AWTO | …`). Off by default: `document.title` is visible to the page
+  and its analytics (#55). The API strips it from every title it returns.
 
 ```
 $ playwrong --tabs

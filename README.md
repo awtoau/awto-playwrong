@@ -33,7 +33,7 @@ Repo: <https://github.com/awtoau/awto-playwrong> · MIT
 - `goto`, `read`, `js` (resolves promises, returns objects as JSON), `click`, `key`, `screenshot`,
   `cookies`, window placement, tabs.
 - **Many agents, one browser**: each caller gets its own tagged tab, so no agent ever reads another
-  agent's page. Each tab title shows its owner.
+  agent's page. `playwrong --tabs` shows who owns each tab.
 - **Full Chrome DevTools Protocol**: a raw `cdp` passthrough op, a CDP endpoint your own client can
   attach to, and the DevTools frontend. See [Chrome debugging surface](#chrome-debugging-surface).
 
@@ -46,6 +46,10 @@ Repo: <https://github.com/awtoau/awto-playwrong> · MIT
 - Uses its own minimal CDP client (`engine/cdp.py`, one file, MIT). No Playwright, no chromedriver,
   no `--enable-automation`, and it never calls `Runtime.enable`. `navigator.webdriver` stays false.
 - The engine reads pages from an isolated world that page scripts cannot hook.
+- No `Debugger.enable`, so a page's `debugger;` timing traps never pause. Without `Runtime.enable`,
+  console-getter DevTools detection never fires. Nothing is written into the page (#55).
+- Not hidden: the `js` op runs your expression in the page's own world, and CDP mouse input
+  (see #55).
 
 **Reliability**
 - Starts the engine and Chrome automatically. Reattaches to a live Chrome, or relaunches a dead one.
@@ -129,7 +133,7 @@ playwrong --status | --stop
 | `--json` | `{text, title, url, challenge, partial}` per page |
 | `--no-solve` / `--tries N` | don't auto-clear Cloudflare / max solve iterations (default 20) |
 | `--profile NAME` | persistent profile; each name gets its own engine on a stable port |
-| `--agent NAME` | how this caller is labelled in tab titles (default: guessed; `PLAYWRONG_AGENT`) |
+| `--agent NAME` | how this caller is labelled in `--tabs` (default: guessed; `PLAYWRONG_AGENT`) |
 | `--tabs` | list every open tab with its owner |
 | `--port N` | use/start an engine on another port (a second, isolated browser) |
 | `-q`, `--quiet` | no progress notes on stderr |
@@ -231,6 +235,7 @@ resolves. A real Chrome over raw CDP passes. See [docs/lessons.md](docs/lessons.
 | `PH_DISPLAY` | desktop | `xvfb`: headed Chrome on the engine's own Xvfb |
 | `PH_HEADLESS` | off | `1`: headless. DuckDuckGo and Turnstile block it (#34). |
 | `PLAYWRONG_AGENT` | guessed | the owner label on your tabs |
+| `PH_TAB_LABEL` | off | `1`: also write the owner into the tab title. The page can read it (#55). |
 | `PH_MEMORY_MAX`, `PH_MEMORY_HIGH_WATER`, `PH_RSS_LIMIT`, `PH_CHROME_MAX_TABS`, `PH_CHROME_MAX_FETCHES`, `PH_CRAWL_MEMORY_MAX` | see [Memory](#memory) | |
 | `PH_RIGHTMON_BOUNDS` | `0,0,1280,720` | `client.py rightmon` window placement, `x,y,w,h` |
 | `PH_OUT_DIR` | `./tmp` | `crawl.drive` screenshots |

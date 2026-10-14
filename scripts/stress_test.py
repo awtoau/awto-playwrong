@@ -307,6 +307,7 @@ def main():
     if not a.headed:
         os.environ["PH_DISPLAY"] = "xvfb"     # headed Chrome on its own Xvfb, off the desktop
     PORT = a.port
+    os.environ["PH_TAB_LABEL"] = "1"          # the title-label checks below need the opt-in (#55)
     os.makedirs(os.path.join(connect.DATA, "logs"), exist_ok=True)
     _fh = open(os.path.join(connect.DATA, "logs", "stress-test.log"), "w")
 

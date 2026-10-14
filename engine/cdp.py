@@ -25,6 +25,9 @@ import urllib.request
 # (`op_done op=start`, #41). On expiry: CDPLaunchError with the tail of Chrome's log.
 LAUNCH_TIMEOUT = 3.5
 LISTENING = re.compile(rb"DevTools listening on (ws://\S+)")
+# Past this with no stderr line, also poll /json/version (Windows may not surface stderr). Linux
+# launches print within ~0.2 s, so 0.5 s keeps the stderr path primary where it works.
+STDERR_GRACE = 0.5
 # Websocket upgrade to a local Chrome: ms. 2 s covers a loaded box; on expiry ConnectionLost.
 WS_OPEN_TIMEOUT = 2.0
 # Browser.close or SIGTERM -> exit for Chrome: ~0.3 s typical. On expiry: the next step (SIGTERM,
@@ -42,7 +45,9 @@ CHROME_CANDIDATES = {
     "Darwin": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                "/Applications/Chromium.app/Contents/MacOS/Chromium", "google-chrome"],
     "Windows": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome"],
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
+                "chrome"],
 }
 
 # Run stealth_check.py and cdp_surface_check.py after any change here. Set per launch in launch():
@@ -112,6 +117,16 @@ def _log_tail(path, n=600):
         return ""
 
 
+def _version_url(port):
+    """ws url from the port's /json/version, or None while nothing listens. The fallback when
+    Chrome's stderr line is not readable (Windows); DevToolsActivePort only exists for port 0 (#47)."""
+    try:
+        url = _version("127.0.0.1", port).get("webSocketDebuggerUrl") or ""
+    except (OSError, ValueError):
+        return None
+    return url if url.startswith(f"ws://127.0.0.1:{port}/devtools/browser/") else None
+
+
 def _free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -159,6 +174,10 @@ async def launch(headless=False, user_data_dir=None, extra_args=None, log_path=N
             if m:
                 ws_url = m.group(1).decode()
                 break
+            if time.monotonic() - t0 > STDERR_GRACE:
+                ws_url = await asyncio.to_thread(_version_url, port)   # stderr silent: ask the port
+                if ws_url:
+                    break
             await asyncio.sleep(0.02)
         if ws_url is None or f"127.0.0.1:{port}/" not in ws_url:
             why = (f"exited with code {proc.returncode}" if proc.poll() is not None else
@@ -172,7 +191,10 @@ async def launch(headless=False, user_data_dir=None, extra_args=None, log_path=N
             raise CDPLaunchError(f"Chrome {why}: {args[0]}" + (f"\n{tail}" if tail else ""))
     finally:
         if own_log:
-            os.unlink(log_path)               # Chrome keeps writing to the unlinked file; harmless
+            try:
+                os.unlink(log_path)           # Chrome keeps writing to the unlinked file; harmless
+            except OSError:
+                pass                          # Windows: open files can't be unlinked; temp dir keeps it
     b = await _connect(ws_url, "127.0.0.1", port)
     b.process, b.user_data_dir, b._temp_profile = proc, udd, temp
     return b
