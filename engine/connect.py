@@ -111,7 +111,11 @@ SERVER_LOG = os.path.join(LOGDIR, "playwrong-engine.log")
 
 
 def default_port():
-    return int(os.environ.get("PH_PORT", "8731"))
+    """PH_PORT, else PH_PROFILE's own port (same as --profile NAME), else 8731 (#54)."""
+    if os.environ.get("PH_PORT"):
+        return int(os.environ["PH_PORT"])
+    name = (os.environ.get("PH_PROFILE") or "").strip()
+    return profile_port(name) if name else 8731
 
 
 def profile_port(name):

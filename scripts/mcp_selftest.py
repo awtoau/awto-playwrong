@@ -508,6 +508,22 @@ def cloudflare_test(c):
     c.call("close_tab", close_extra=True)
 
 
+def port_resolution_tests():
+    """PH_PROFILE in an MCP entry's env must reach that profile's engine, not the shared one (#54)."""
+    def port_with(**env):
+        base = {k: v for k, v in os.environ.items() if k not in ("PH_PORT", "PH_PROFILE")}
+        r = subprocess.run([sys.executable, "-c", "from engine import connect; "
+                            "print(connect.default_port(), connect.profile_port('work'))"],
+                           cwd=REPO, env={**base, **env}, capture_output=True, text=True)
+        return [int(x) for x in r.stdout.split()]
+    got, work = port_with()
+    ok("no PH_PORT/PH_PROFILE -> 8731", got == 8731, str(got))
+    got, work = port_with(PH_PROFILE="work")
+    ok("PH_PROFILE=work -> the profile's own port (#54)", got == work, f"{got} vs {work}")
+    got, _ = port_with(PH_PROFILE="work", PH_PORT="8799")
+    ok("PH_PORT wins over PH_PROFILE", got == 8799, str(got))
+
+
 def main():
     global _log_fh
     ap = argparse.ArgumentParser()
@@ -530,6 +546,7 @@ def main():
     c = Client(a.port)
     try:
         protocol_tests(c)
+        port_resolution_tests()
         if a.offline:
             say("\n(--offline: skipped the live browser tests)")
         else:
