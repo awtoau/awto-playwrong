@@ -28,7 +28,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from engine import cdp
+from engine import cdp, connect
 
 from . import browser, db, graph, netblock, parse, rank, ratelimit, render, store
 
@@ -421,7 +421,7 @@ MAX_TABS = int(os.environ.get("CRAWL_MAX_TABS", "32"))
 
 class Config:
     def __init__(self, seeds, db_dsn, store_root, max_pages=200, tabs=8,
-                 depth=3, nav_timeout=12.0, port=8731, hosts=None, keep_js=True,
+                 depth=3, nav_timeout=12.0, port=None, hosts=None, keep_js=True,
                  rate_delay=1.5, shuffle=True, host_diverse=True, stall_ceiling=0.0,
                  max_per_host=0, exclude=None, rank=False, prefer=(), avoid=(),
                  min_priority=None):
@@ -445,7 +445,7 @@ class Config:
         self.depth = depth
         self.nav_timeout = nav_timeout
         self.stall_ceiling = stall_ceiling   # hard whole-fetch cap; 0 => auto, see stall_ceiling_s
-        self.port = port
+        self.port = port or connect.default_port()
         # default: stay on the seeds' own hosts (boundary match, see _same_site)
         self.hosts = hosts or sorted({urlsplit(s).netloc.lower().split(":")[0] for s in seeds})
         self.block_types = netblock.TEXT_ONLY_KEEP_JS if keep_js else netblock.TEXT_ONLY
@@ -486,7 +486,8 @@ def _parse_args(argv):
                    help="Hard cap (s) on the WHOLE fetch (nav+render+capture) before abandoning the page + tab. "
                         "0 = auto (max(45, nav*4)). LOWER it to cut losses on slow pages sooner — a faster "
                         "abandon means the next fresh tab starts sooner (aggressive mode; e.g. 25).")
-    p.add_argument("--port", type=int, default=int(os.environ.get("PH_PORT", "8731")))
+    p.add_argument("--port", type=int, default=connect.default_port(),
+                   help="engine port (default: PH_PORT, PH_PROFILE's port, or 8731)")
     p.add_argument("--host", action="append", help="Extra host to allow (repeatable)")
     p.add_argument("--exclude", action="append", metavar="REGEX",
                    help="Never queue a discovered link whose URL matches REGEX (re.search; "

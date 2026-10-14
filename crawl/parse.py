@@ -1,11 +1,13 @@
 """crawl.parse — pure HTML parsing: visible text, page links, image references.
 
-Zero dependencies beyond the stdlib, zero project references. Deterministic, side-effect-free
+Stdlib plus the sibling assets.classify, zero project references. Deterministic, side-effect-free
 functions. Consumers call these on the raw HTML the engine captured.
 """
 import html as _html
 import re
 from urllib.parse import urldefrag, urljoin, urlsplit
+
+from assets.classify import is_junk_url
 
 # ── visible text ──────────────────────────────────────────────────────────────────────────────
 # One open-tag + one close-tag pattern PER stripped element (no backreference, no `.*?` spanning the
@@ -124,10 +126,6 @@ def _img_attr(tag, name):
     return m.group(1) if m else None
 
 
-# Ad / tracker beacon URL markers: an image whose URL matches is 'junk' (an ad was once classed
-# 'photo'). Minimal and generic.
-_JUNK_IMG_MARKERS = ("doubleclick", "googlesyndication", "google-analytics", "adspeed", "/ads/",
-                     "ad.php", "/pixel", "/beacon", "quantserve", "scorecardresearch")
 # Generic kinds only. Consumers pass `extra_rules` [(regex, kind)] for their own vocabulary.
 # Order: junk -> consumer rules -> generic. `unhandled_cb(url, alt)` fires when only the 'photo'
 # fallback matched, for the consumer's improvement report.
@@ -143,8 +141,7 @@ def image_kind(url, alt, extra_rules=None, unhandled_cb=None):
     a consumer supplies `extra_rules` [(regex, kind), …] for vertical kinds. Returns the kind; calls
     `unhandled_cb(url, alt)` (if given) when it falls through to the 'photo' default so the consumer can
     record it as an improvement signal."""
-    low = url.lower()
-    if any(m in low for m in _JUNK_IMG_MARKERS):
+    if is_junk_url(url):                 # ad / tracker beacon: one list, shared with assets
         return "junk"
     s = f"{url} {alt}".lower()
     for rx, kind in (extra_rules or ()):

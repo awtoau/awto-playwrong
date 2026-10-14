@@ -14,8 +14,9 @@ EXT_BY_MIME = {
 }
 
 # URL substrings that mark a request as an ad / analytics / tracker beacon — never a content asset.
-JUNK_URL_MARKERS = ("ad.php", "/ads/", "doubleclick", "googlesyndication", "google-analytics",
-                    "/pixel", "/beacon", "/imp?", "quantserve", "scorecardresearch", "/telemetry")
+JUNK_URL_MARKERS = ("ad.php", "/ads/", "adspeed", "doubleclick", "googlesyndication",
+                    "google-analytics", "/pixel", "/beacon", "/imp?", "quantserve", "scorecardresearch",
+                    "/telemetry")
 
 
 def ext_for_mime(mime, default="bin"):
