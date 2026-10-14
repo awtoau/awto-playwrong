@@ -12,6 +12,52 @@ One shared, long-lived, headed Chrome — driven over a local port — that clea
 and stays warm between calls. A CLI, an AI agent (via **MCP**), and your own scripts all drive the
 same browser and reuse the same cleared session.
 
+Repo: <https://github.com/awtoau/awto-playwrong> · MIT
+
+## Features
+
+**Getting pages**
+- **Fetch any page as readable text** (or HTML, or text with links): one call, nothing to start first.
+- **Cloudflare Turnstile cleared**, including the click-the-checkbox challenge inside its
+  out-of-process iframe. Clearance cookies are reused by every later call.
+- **Web search** that works where curl gets a CAPTCHA: DuckDuckGo, with automatic fallback to Brave.
+- **PDFs** as text with a page count (a truncated document shows itself), and the file kept on disk.
+- **Downloads** of any file through the cleared session: resumes with Range, falls back to the
+  browser's own fetch, verifies sha256/size, and never passes a short transfer off as complete.
+- **Batch prefetch**: many urls in parallel tabs, read as each one finishes; one slow page costs
+  one slot, never the batch.
+- **Logins**: a headed browser the user can sign in to; persistent named profiles (`--profile`)
+  keep the session across restarts.
+
+**Driving a page**
+- `goto`, `read`, `js` (promises resolved, objects returned as JSON), `click`, `key`, `screenshot`,
+  `cookies`, window placement, tabs.
+- **Many agents, one browser**: each caller gets its own tagged tab, so concurrent agents never
+  read each other's pages; tabs show their owner in the title.
+
+**Interfaces**
+- **MCP server** (stdio, stdlib-only) for Claude Code / VS Code and other agents.
+- **`playwrong` CLI**, an interactive client, and a plain HTTP API on `127.0.0.1:<port>`.
+- **Python**: `from engine import connect; connect.capture(url)`.
+
+**Stealth by omission**
+- Our own minimal CDP client (`engine/cdp.py`, one file, MIT): no Playwright, no chromedriver,
+  no `--enable-automation`, never `Runtime.enable`; `navigator.webdriver` stays false.
+- The engine's own page reads run in an isolated world the page cannot hook.
+
+**Reliability**
+- Auto-starts the engine and Chrome; reattaches to a live Chrome or relaunches a dead one, keeping
+  the cleared session when it can.
+- Bounded everything: tab open/close timeouts, a crashed renderer fails only its own tab by name,
+  memory capped per engine (systemd scope), RSS self-restart, Chrome recycling, size-capped logs.
+- `scripts/doctor.py` preflight; `/status` that never reports a dead browser as alive.
+
+**Crawling (optional `crawl/` library)**
+- Point-and-go site crawler: resource blocking, consent dismissal, render waits, HTTP status and
+  429/503 backoff, per-host caps, resumable frontier in SQLite / Postgres / MySQL.
+- Importance ranking (sitemaps, url shape, OpenPageRank) and a site-shape report (hubs, orphans,
+  dead links).
+
 **Why not just `curl`?** Because more and more pages don't answer it. Cloudflare serves a challenge;
 DuckDuckGo now returns `HTTP 202` and an image CAPTCHA. A real browser isn't asked. Nothing here
 solves or breaks a CAPTCHA — it drives a real browser that isn't given one, and hands you the result.
@@ -25,7 +71,7 @@ HTTP fetching could not.
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
 python3 -m venv .venv                                            # optional but recommended
 .venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
-.venv/bin/python scripts/mcp_selftest.py                               # prove it (50 assertions)
+.venv/bin/python scripts/mcp_selftest.py                               # prove it end to end
 ```
 
 You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
