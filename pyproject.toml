@@ -7,7 +7,7 @@ name = "awto-playwrong"
 version = "0.1.0"
 description = "Turnstile-beating browser-capture engine + a reusable, ref-free crawl library (content-addressed store, SQLAlchemy DB, reference-graph reports)."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"   # free-threaded (3.14t) recommended; the GIL build is tested too
 license = "MIT"
 keywords = ["crawler", "browser-automation", "cloudflare", "turnstile", "cdp", "scraping"]
 

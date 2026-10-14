@@ -42,14 +42,15 @@ def check(name, status, detail, fix=None):
 
 
 def check_python():
-    v = sys.version_info
+    """3.14+ required. Free-threaded recommended: the engine runs an HTTP thread per request beside
+    its asyncio loop, and crawls parse pages in parallel; a GIL build works, serialised."""
     where = f"{platform.python_implementation()} {platform.python_version()} at {sys.executable}"
-    if v < (3, 11):
-        check("python", "FAIL", f"{where} — the engine needs 3.11+", "install a newer Python")
-    elif v < (3, 13):
-        check("python", "WARN", f"{where} — engine ok; the crawl/ library wants 3.13+ (pyproject)")
+    if sys.version_info < (3, 14):
+        check("python", "FAIL", f"{where} — needs Python 3.14+", "install Python 3.14+ (3.14t recommended)")
+    elif sys._is_gil_enabled():
+        check("python", "WARN", f"{where} — works; a free-threaded build (3.14t) is recommended")
     else:
-        check("python", "PASS", where)
+        check("python", "PASS", f"{where} (free-threaded)")
 
 
 def check_deps():
