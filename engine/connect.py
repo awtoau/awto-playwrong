@@ -15,6 +15,7 @@ Stdlib only, so importing it costs nothing and it can report a broken engine as 
 an ImportError.
 """
 import base64
+import contextlib
 import hashlib
 import html as htmlmod
 import http.client
@@ -25,7 +26,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -155,38 +155,34 @@ def spawn(port=None, profile=None):
     if profile:
         env["PH_PROFILE"] = profile      # engine/server.py turns the NAME into a user-data-dir
     logroll.roll(SERVER_LOG)             # the engine holds it open for life: roll at spawn (#39)
-    subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
-                     env=env,
-                     stdout=open(SERVER_LOG, "a"), stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True)
+    with open(SERVER_LOG, "a") as log_f:
+        return subprocess.Popen([sys.executable, os.path.join(REPO, "engine", "server.py")],
+                                env=env, stdout=log_f, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def _log_tail(path, n=1200):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode(errors="replace").strip()
+    except OSError:
+        return ""
 
 
 def _confirm_absent(port):
-    """Decide 'there is really no engine here' CAREFULLY.
-
-    A single 2s probe is not evidence of absence. Under load — say a dozen agents starting at once —
-    a live engine can miss that deadline, every caller concludes it must start one, and each new
-    browser loads the machine further so the next probe is even slower. That feedback loop is not
-    theoretical: one 12-process run spawned 1204 servers and 255 Chrome instances before it was
-    stopped. So: probe again, patiently, before spawning anything.
-    """
+    """No engine here, decided patiently: under load a live engine can miss a short probe, and
+    every caller then spawns another (a feedback loop that has spawned hundreds)."""
     return not reachable(port, timeout=8.0)
 
 
 def ensure(port=None, want_browser=True, on_start=None, profile=None):
-    """Guarantee an engine on `port`, and by default a launched Chrome behind it. Idempotent and
-    cheap when everything is already up (one /status round-trip).
-
-    Concurrency-safe: the check-and-spawn is held under a file lock, so when N processes start at
-    once exactly ONE launches the engine and the rest wait for it. Without the lock they all spawn,
-    which is how you end up with a browser per caller instead of a shared one.
-
-    Two waits for two different things:
-      1. the HTTP process binding the port — a Python import plus a bind, no browser, so 30s is
-         generous even on a loaded machine; polled at 0.25s to keep first-call latency low.
-      2. Chrome launching — done by POSTing /start, which BLOCKS until the browser is up, so there is
-         nothing to poll. Cold start is the slow part, hence 120s.
-    """
+    """An engine on `port`, and by default a launched Chrome behind it. Idempotent; one /status
+    round trip when everything is up.
+    - Check-and-spawn under a file lock: N callers at once start exactly one engine.
+    - Waits: the HTTP bind (an import + bind, 30 s, polled every 0.25 s; a spawn that exits fails at
+      once with its log), then /start, which blocks until Chrome is up (120 s)."""
     port = port or (profile_port(profile) if profile else default_port())
     if reachable(port):                       # fast path: already up, no lock needed
         if want_browser:
@@ -198,11 +194,15 @@ def ensure(port=None, want_browser=True, on_start=None, profile=None):
         if _confirm_absent(port):
             if on_start:
                 on_start("starting the capture engine")
-            spawn(port, profile=profile)
+            proc = spawn(port, profile=profile)
             deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
                 if reachable(port, timeout=1.0):
                     break
+                if proc.poll() is not None:          # it died starting: say so now, not in 30 s
+                    raise EngineError(
+                        f"the engine on 127.0.0.1:{port} exited during startup (code "
+                        f"{proc.returncode}). The end of {SERVER_LOG}:\n{_log_tail(SERVER_LOG)}")
                 time.sleep(0.25)
             else:
                 raise EngineError(
@@ -235,7 +235,6 @@ def _spawn_lock(port):
     try:
         import fcntl
     except ImportError:
-        import contextlib
         return contextlib.nullcontext()
 
     class _Lock:
@@ -414,8 +413,9 @@ INCOMPLETE_NOTE = ("[INCOMPLETE: the page was still loading when captured, so th
                    "off. For a large file use `download`, which checks Content-Length.]")
 
 
+# Title markers of a bot wall. The ONE challenge check: server, client and crawl import it (#53).
 CHALLENGE = ("just a moment", "verify you are human", "checking your browser",
-             "cf-chl", "challenge-platform")
+             "attention required", "cf-chl", "challenge-platform")
 
 
 # Cloudflare's challenge MARKUP, as attributes: words are not enough. Pages ABOUT Cloudflare (the
@@ -425,11 +425,26 @@ CF_MARKUP = re.compile(r"""(src|action)=["'][^"']*(challenges\.cloudflare\.com|/
                        r"""platform/)|id=["']cf-chl|name=["']cf-turnstile-response""", re.I)
 
 
-def is_challenge(page):
-    t = (page.get("title") or "").lower()
-    h = page.get("html") or ""
+_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+
+
+def title_of(page_html):
+    """The <title> text of an HTML document, unescaped and stripped; "" if there is none."""
+    m = _TITLE.search(page_html or "")
+    return htmlmod.unescape(m.group(1)).strip() if m else ""
+
+
+def title_is_challenge(title, html):
+    """A bot wall: a challenge title, or the checkbox text inside Cloudflare's own markup."""
+    t = (title or "").lower()
+    h = html or ""
     return any(k in t for k in CHALLENGE) or (
         "verify you are human" in h.lower() and CF_MARKUP.search(h) is not None)
+
+
+def is_challenge(page):
+    """title_is_challenge() for a {title, html} page dict."""
+    return title_is_challenge(page.get("title"), page.get("html"))
 
 
 def solve_timeout(tries):
@@ -440,23 +455,38 @@ def solve_timeout(tries):
 
 # ── the one-shot capture ────────────────────────────────────────────────────────────────────────
 
-# The engine has ONE globally-active tab, and a capture is several ops against it, so two interleaved
-# captures would steal each other's tab. This serialises them within a process. Across processes it
-# does not help — use a second PH_PORT, or attach via /cdp (see docs/AGENT-API.md).
-_lock = threading.Lock()
+# A JS-rendered page can still be empty after goto's settle: re-read up to this long for visible
+# text. Past it, empty is the answer (a blank page or a hard block).
+RENDER_WAIT = 5.0
+# One navigation op (goto, shot): a slow real page loads in tens of seconds; past this it is wedged.
+GOTO_TIMEOUT = 90.0
+
+
+@contextlib.contextmanager
+def _own_tab(port):
+    """A fresh tab tagged for this call, always closed afterwards: yields its tag."""
+    tag = f"{SESSION}-{next(_seq)}"
+    call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER)
+    try:
+        yield tag
+    finally:
+        _close_tab(tag, port)
+
+
+def _clear_challenge(port, tag, page, tries, on_start=None):
+    """Run the engine's solve loop if `page` is a challenge: (page, "cleared"/"NOT cleared"/None)."""
+    if not is_challenge(page):
+        return page, None
+    if on_start:
+        on_start("clearing a Cloudflare challenge")
+    r = call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
+    return call("text", port=port, tab=tag), ("cleared" if r.get("passed") else "NOT cleared")
 
 
 def _settled_text(port, page=None, tab=None):
-    """Read the page, waiting for it to have actually rendered.
-
-    /goto settles for a fixed 2s, which is a guess, and on a JS-rendered page it is sometimes short:
-    an MCP fetch of a heavy reviews page returned an EMPTY body once and 44k chars on the immediate
-    retry. So rather than trusting a constant, re-read until the document has visible text. Poll at
-    250ms for up to 5s beyond goto's own wait; past that, empty is the honest answer (a genuinely
-    blank page, or a hard block) and not something more waiting fixes.
-    """
+    """The page, re-read every 250 ms for up to RENDER_WAIT until it has visible text."""
     page = page if page is not None else call("text", port=port, tab=tab)
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + RENDER_WAIT
     while time.monotonic() < deadline:
         if html_to_text(page.get("html")).strip():
             return page
@@ -467,76 +497,34 @@ def _settled_text(port, page=None, tab=None):
 
 def capture(url, mode="text", solve=True, max_chars=40000, tries=20, port=None, shot=False,
             on_start=None, profile=None, no_js=False):
-    """Everything needed to get one page, in one call: start the engine and Chrome if they are down,
-    open OUR OWN tab, navigate, clear a Cloudflare challenge if one appears, extract, close the tab.
-
-    The tab is opened and closed inside this function, so it cannot leak — that is the whole reason
-    this is a function and not a documented sequence of ops.
-
-    Returns {text, title, url, challenge, b64?}.
-    """
+    """One page in one call, in a tab of its own that cannot leak: start the engine if needed,
+    navigate, clear a challenge, extract, close. Returns {text, title, url, challenge, partial, b64?}."""
     port = ensure(port, on_start=on_start, profile=profile)
-    with _lock:
-        tag = f"{SESSION}-{next(_seq)}"
-        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
-        final_url, out = None, {}
-        try:
-            landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
-            # Chrome's first-run/profile page can occupy a brand-new tab, so the navigation lands
-            # somewhere internal and we would return THAT page's text as if it were the url asked
-            # for — a silently wrong answer, seen once on the very first launch of a fresh profile.
-            # Only an internal url counts as wrong here; a cross-host redirect is legitimate.
-            if str(landed.get("url", "")).startswith(("chrome://", "about:")):
-                landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=90.0)
-            page = _settled_text(port, tab=tag)
-            challenge = None
-            if solve and is_challenge(page):
-                if on_start:
-                    on_start("clearing a Cloudflare challenge")
-                r = call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
-                challenge = "cleared" if r.get("passed") else "NOT cleared"
-                page = call("text", port=port, tab=tag)
-            page = _settled_text(port, page, tab=tag)  # a solve navigates again; re-settle after it
-            if landed.get("ready_state") not in (None, "complete"):
-                page["partial"] = True
-            final_url = page.get("url")
-            out = {"text": render(page, mode, max_chars), "title": page.get("title"),
-                   "url": final_url, "challenge": challenge, "partial": bool(page.get("partial"))}
-            if shot:
-                out["b64"] = call("shot", port=port, tab=tag, timeout=90.0)["b64"]
-            return out
-        finally:
-            _close_tab(idx, final_url, port, tag=tag)
+    with _own_tab(port) as tag:
+        landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=GOTO_TIMEOUT)
+        # A fresh profile's first-run page can take the new tab: an internal url means retry.
+        if str(landed.get("url", "")).startswith(("chrome://", "about:")):
+            landed = call("goto", port=port, url=url, tab=tag, no_js=no_js, timeout=GOTO_TIMEOUT)
+        page = _settled_text(port, tab=tag)
+        challenge = None
+        if solve:
+            page, challenge = _clear_challenge(port, tag, page, tries, on_start)
+        page = _settled_text(port, page, tab=tag)  # a solve navigates again; re-settle after it
+        if landed.get("ready_state") not in (None, "complete"):
+            page["partial"] = True
+        out = {"text": render(page, mode, max_chars), "title": page.get("title"),
+               "url": page.get("url"), "challenge": challenge, "partial": bool(page.get("partial"))}
+        if shot:
+            out["b64"] = call("shot", port=port, tab=tag, timeout=GOTO_TIMEOUT)["b64"]
+        return out
 
 
-def _close_tab(index, url=None, port=None, tag=None):
-    """Close the tab we opened, and VERIFY it went. Indices shift when a LOWER-indexed tab closes, so
-    an exact url match is preferred with the index as fallback. Tab 0 is protected by the engine."""
+def _close_tab(tag, port=None):
+    """Close the tab we opened, by its tag only: an index or url could name another agent's tab."""
     try:
-        if tag:
-            # Closing by tag is exact and race-free; index/url are the fallbacks for tabs opened
-            # without one.
-            r = call("closetab", port=port, tag=tag)
-            if r.get("closed"):
-                return r
-        before = call("tabs", port=port, method="GET")
-        target = None
-        if url:
-            for t in before.get("tabs", []):
-                if t["index"] != 0 and t.get("url") == url:
-                    target = t["index"]
-                    break
-        if target is None and index and index > 0:
-            target = index
-        if target is None:
-            return {"closed": 0}
-        r = call("closetab", port=port, index=target)
-        if r.get("remaining", 0) >= before.get("count", 0):
-            print(f"warning: leaked tab {target} (count still {r.get('remaining')})",
-                  file=sys.stderr)
-        return r
+        return call("closetab", port=port, tag=tag)
     except EngineError as e:
-        print(f"warning: tab cleanup failed, leaked tab {index}: {e}", file=sys.stderr)
+        print(f"warning: could not close tab {tag}: {e}", file=sys.stderr)
         return {"closed": 0}
 
 
@@ -647,11 +635,10 @@ def _ddg(query, max_results, port, on_start, profile):
         return "blocked", []
     if DDG_EMPTY.search(html):
         return "empty", []          # the search RAN and matched nothing. A fact, not a failure.
-    m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
     _log_search("duckduckgo", query, "parse_error")
     raise EngineError(
         f"could not parse DuckDuckGo's response, and it is not their no-results page either — "
-        f"{len(html)} bytes, title {(m.group(1).strip()[:80] if m else 'none')!r}. Their markup has "
+        f"{len(html)} bytes, title {title_of(html)[:80] or 'none'!r}. Their markup has "
         f"probably changed; parse_ddg() needs updating. The query was NOT answered.")
 
 
@@ -663,8 +650,7 @@ def _brave(query, max_results, port, on_start, profile):
     hits = parse_brave(html)[:max_results]
     if hits:
         return "results", hits
-    m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
-    title = (m.group(1) if m else "").lower()
+    title = title_of(html).lower()
     if "brave search" in title and "captcha" not in title:
         return "empty", []
     return "blocked", []
@@ -722,34 +708,16 @@ def _cookie_applies(domain, host):
 
 
 def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile=None):
-    """Clear the wall for this url's origin in the real browser, then hand back the headers that let
-    a plain HTTP client through as that same cleared session: Cookie (incl. cf_clearance) + the
-    browser's exact User-Agent.
-
-    This is the missing half of "don't open PDFs in the browser". Curl alone fails on a bot-walled
-    file, and Chrome's built-in PDF viewer cannot be driven reliably — so neither tool works on its
-    own. Clearing in the browser and downloading with the cleared session works, and is what
-    download() does.
-    """
+    """Clear the wall for this url's ORIGIN in the browser, then return the headers that let a plain
+    HTTP client through as that cleared session: Cookie (incl. cf_clearance), User-Agent, Referer.
+    The origin, not the file: challenges are per origin, and Chrome's PDF viewer can't be driven."""
     port = ensure(port, on_start=on_start, profile=profile)
-    with _lock:
-        tag = f"{SESSION}-{next(_seq)}"
-        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
-        final_url = None
-        try:
-            # Navigate to the ORIGIN, not the file: a challenge is served per-origin, and going
-            # straight at a PDF drops us in Chrome's PDF viewer where evaluate() is unreliable.
-            call("goto", port=port, url=_origin(url), tab=tag, timeout=90.0)
-            page = call("text", port=port, tab=tag)
-            if solve and is_challenge(page):
-                if on_start:
-                    on_start("clearing a Cloudflare challenge")
-                call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
-            final_url = call("text", port=port, tab=tag).get("url")
-            ua = call("js", port=port, expr="navigator.userAgent", tab=tag).get("result") or ""
-            cookies = call("cookies", port=port).get("cookies", [])
-        finally:
-            _close_tab(idx, final_url, port, tag=tag)
+    with _own_tab(port) as tag:
+        call("goto", port=port, url=_origin(url), tab=tag, timeout=GOTO_TIMEOUT)
+        if solve:
+            _clear_challenge(port, tag, call("text", port=port, tab=tag), tries, on_start)
+        ua = call("js", port=port, expr="navigator.userAgent", tab=tag).get("result") or ""
+        cookies = call("cookies", port=port).get("cookies", [])
     host = urllib.parse.urlparse(url).netloc.split(":")[0]
     jar = "; ".join(f"{c['name']}={c['value']}" for c in cookies
                     if _cookie_applies(c.get("domain"), host))
@@ -763,6 +731,8 @@ def session_headers(url, port=None, on_start=None, solve=True, tries=20, profile
 
 # Raw bytes per js round-trip; base64 makes the JSON reply ~5.6 MB, well within CDP's limits.
 BROWSER_CHUNK = 4 << 20
+# Copying one BROWSER_CHUNK out of the tab is local work (well under a second); past this it is wedged.
+CHUNK_TIMEOUT = 30.0
 # HTTP statuses a CDN uses to turn away a non-browser client; worth retrying from inside the page.
 BOT_BLOCK_STATUSES = (403, 429, 503)
 # Seconds per urllib socket op (connect, TTFB, each read). Derivation + measurements: issue #30.
@@ -783,48 +753,35 @@ def _download_in_browser(url, path, port=None, on_start=None, solve=True, tries=
     """
     port = ensure(port, on_start=on_start, profile=profile)
     digest, total = hashlib.sha256(), 0
-    with _lock:
-        tag = f"{SESSION}-{next(_seq)}"
-        idx = call("newtab", port=port, url="about:blank", tag=tag, owner=OWNER).get("index", -1)
-        final_url = None
-        try:
-            call("goto", port=port, url=_origin(url), tab=tag, timeout=90.0)
-            if solve and is_challenge(call("text", port=port, tab=tag)):
-                if on_start:
-                    on_start("clearing a Cloudflare challenge")
-                call("solve", port=port, tries=tries, tab=tag, timeout=solve_timeout(tries))
-            final_url = call("text", port=port, tab=tag).get("url")
-            ms = int(timeout * 1000)
-            head = call("js", port=port, tab=tag, timeout=timeout + 10.0, expr=(
-                "(async () => { const c = new AbortController();"
-                f" const t = setTimeout(() => c.abort(), {ms});"
-                f" const r = await fetch({json.dumps(url)}, {{credentials: 'include', signal: c.signal,"
-                f" headers: {json.dumps(extra_headers or {})}}});"
-                " const b = new Uint8Array(await r.arrayBuffer()); clearTimeout(t);"
-                " window.__playwrong_dl = b;"
-                " return {status: r.status, ok: r.ok, size: b.length, url: r.url,"
-                " type: r.headers.get('content-type') || ''}; })()")).get("result") or {}
-            if not head.get("ok"):
-                raise EngineError(f"download failed in the browser too: HTTP {head.get('status')} "
-                                  f"for {url}")
-            with open(path, "wb") as f:
-                for off in range(0, head["size"], BROWSER_CHUNK):
-                    b64 = call("js", port=port, tab=tag, timeout=30.0, expr=(
-                        f"(() => {{ const s = window.__playwrong_dl.subarray({off}, {off + BROWSER_CHUNK});"
-                        " let bin = ''; for (let i = 0; i < s.length; i += 0x8000)"
-                        " bin += String.fromCharCode.apply(null, s.subarray(i, i + 0x8000));"
-                        " return btoa(bin); })()")).get("result") or ""
-                    chunk = base64.b64decode(b64)
-                    f.write(chunk); digest.update(chunk); total += len(chunk)
-            if total != head["size"]:
-                raise EngineError(f"browser download truncated: {total} of {head['size']} bytes "
-                                  f"copied out for {url}")
-        finally:
-            try:
-                call("js", port=port, tab=tag, expr="delete window.__playwrong_dl")
-            except EngineError:
-                pass
-            _close_tab(idx, final_url, port, tag=tag)
+    with _own_tab(port) as tag:         # closing the tab frees the buffered body
+        call("goto", port=port, url=_origin(url), tab=tag, timeout=GOTO_TIMEOUT)
+        if solve:
+            _clear_challenge(port, tag, call("text", port=port, tab=tag), tries, on_start)
+        # The js op is bounded a little past the in-page AbortController, so the page reports first.
+        head = call("js", port=port, tab=tag, timeout=timeout + 10.0, expr=(
+            "(async () => { const c = new AbortController();"
+            f" const t = setTimeout(() => c.abort(), {int(timeout * 1000)});"
+            f" const r = await fetch({json.dumps(url)}, {{credentials: 'include', signal: c.signal,"
+            f" headers: {json.dumps(extra_headers or {})}}});"
+            " const b = new Uint8Array(await r.arrayBuffer()); clearTimeout(t);"
+            " window.__playwrong_dl = b;"
+            " return {status: r.status, ok: r.ok, size: b.length, url: r.url,"
+            " type: r.headers.get('content-type') || ''}; })()")).get("result") or {}
+        if not head.get("ok"):
+            raise EngineError(f"download failed in the browser too: HTTP {head.get('status')} "
+                              f"for {url}")
+        with open(path, "wb") as f:
+            for off in range(0, head["size"], BROWSER_CHUNK):
+                b64 = call("js", port=port, tab=tag, timeout=CHUNK_TIMEOUT, expr=(
+                    f"(() => {{ const s = window.__playwrong_dl.subarray({off}, {off + BROWSER_CHUNK});"
+                    " let bin = ''; for (let i = 0; i < s.length; i += 0x8000)"
+                    " bin += String.fromCharCode.apply(null, s.subarray(i, i + 0x8000));"
+                    " return btoa(bin); })()")).get("result") or ""
+                chunk = base64.b64decode(b64)
+                f.write(chunk); digest.update(chunk); total += len(chunk)
+        if total != head["size"]:
+            raise EngineError(f"browser download truncated: {total} of {head['size']} bytes "
+                              f"copied out for {url}")
     return total, head.get("type", ""), head.get("url") or url, digest.hexdigest()
 
 
@@ -1084,7 +1041,7 @@ def fetch_many(urls, concurrency=8, mode="text", max_chars=40000, solve=True, tr
 
 
 def save_shot(path, port=None, on_start=None):
-    b64 = op("shot", port=port, on_start=on_start, timeout=90.0)["b64"]
+    b64 = op("shot", port=port, on_start=on_start, timeout=GOTO_TIMEOUT)["b64"]
     with open(path, "wb") as f:
         f.write(base64.b64decode(b64))
     return path

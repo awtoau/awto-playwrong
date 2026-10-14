@@ -45,7 +45,7 @@ def check_python():
     """3.14+ required. Free-threaded recommended: the engine runs an HTTP thread per request beside
     its asyncio loop, and crawls parse pages in parallel; a GIL build works, serialised."""
     where = f"{platform.python_implementation()} {platform.python_version()} at {sys.executable}"
-    if sys.version_info < (3, 14):
+    if sys.version_info < (3, 14):  # noqa: UP036 — doctor must run on an old Python to say so
         check("python", "FAIL", f"{where} — needs Python 3.14+", "install Python 3.14+ (3.14t recommended)")
     elif sys._is_gil_enabled():
         check("python", "WARN", f"{where} — works; a free-threaded build (3.14t) is recommended")

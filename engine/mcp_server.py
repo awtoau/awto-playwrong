@@ -1,27 +1,13 @@
-"""engine/mcp_server.py — MCP (stdio) front-end for the playwrong capture engine.
+"""engine/mcp_server.py — MCP (stdio) front-end for the playwrong engine.
 
-WHY THIS EXISTS
-An agent that wants one bot-walled page used to have to: read docs/AGENT-API.md, write a script with
-ensure_server(), know PH_PORT, understand lazy Chrome launch, do
-goto -> sniff title -> solve -> text, then remember to close its tab — and then swallow ~500KB of raw
-HTML. This file removes all of that: the ops arrive in the agent's tool list already described, the
-engine is auto-started, the Turnstile dance is collapsed into ONE `fetch` call, tabs are opened and
-closed inside that call so they cannot leak, and HTML comes back as readable text.
+- A thin JSON-RPC-over-stdio proxy: each tool is one or a few HTTP ops on engine/server.py, via
+  engine/connect.py (the same code the `playwrong` CLI uses). The engine auto-starts.
+- Stdlib only, so it starts instantly and reports a broken engine install as a tool error.
+- STDOUT IS THE WIRE: diagnostics go to stderr; the engine's output to its log file.
 
-WHAT IT IS NOT
-Not a rewrite. The real engine is still engine/server.py (raw CDP, one shared headed Chrome, HTTP on
-PH_PORT). This is a thin JSON-RPC-over-stdio proxy in front of it. Every tool here is one or a few
-HTTP POSTs to that engine.
-
-DEPENDENCIES: stdlib only. The engine itself needs `websockets` — see scripts/doctor.py. This file
-needs nothing, so it starts instantly and can report a broken engine install as a tool error
-instead of failing to load.
-
-PROTOCOL: MCP over stdio = newline-delimited JSON-RPC 2.0 on stdin/stdout. STDOUT IS THE WIRE —
-nothing may print to it except protocol messages (all diagnostics go to stderr, and the engine
-child's output is redirected to tmp/logs/). Run manually with:
-    python engine/mcp_server.py            # then type JSON-RPC lines, or use scripts/mcp_selftest.py
+    python engine/mcp_server.py      # then JSON-RPC lines on stdin; or scripts/mcp_selftest.py
 """
+import importlib.metadata
 import json
 import os
 import sys
@@ -32,7 +18,11 @@ from engine import connect  # noqa: E402
 from engine.connect import EngineError, call, capture, is_challenge, render  # noqa: E402
 
 PORT = connect.default_port()
-NAME, VERSION = "playwrong", "0.1.0"
+NAME = "playwrong"
+try:
+    VERSION = importlib.metadata.version("awto-playwrong")
+except importlib.metadata.PackageNotFoundError:
+    VERSION = "0.0.0+checkout"        # running from a checkout that was never pip-installed
 
 # Newest protocol revision we implement. If the client asks for a different one we echo THEIRS back
 # (the spec's negotiation rule) — every revision so far is wire-compatible for tools-only servers.
@@ -45,14 +35,8 @@ def elog(*a):
 
 
 def op(name, **body):
-    """Every engine op goes through here: the engine and Chrome are guaranteed up first.
-
-    An op aimed at THIS agent's tab is retried once if that tab has gone. A tab can disappear from
-    under a caller — the page closes it, another agent runs close_extra, the browser is relaunched
-    after dying — and the engine then raises KeyError: no such tab. That is correct for a bad
-    reference and wrong for our own tag: the tab is re-openable, and every interactive op stayed
-    wedged until someone guessed the close_extra workaround (issue #13).
-    """
+    """An engine op, with the engine up first. An op on THIS agent's tab that finds the tab gone
+    (page closed it, close_extra, browser relaunch) re-opens it under the same tag and retries (#13)."""
     global _have_tab
     try:
         return connect.op(name, **body)
@@ -64,10 +48,8 @@ def op(name, **body):
         return connect.op(name, **body)
 
 
-# THIS agent's own tab inside the shared browser. Interactive tools (goto/read/js/click/key) drive it
-# BY TAG rather than "whatever tab is active", so several agents can work in one browser at once
-# without moving each other's pages out from under them. fetch/pdf/search don't need it — each opens
-# and closes a tagged tab of its own per call.
+# This agent's own tab: interactive tools (goto/read/js/click/key/solve/screenshot) drive it by tag,
+# so agents sharing the browser never move each other's pages. fetch/pdf/search open their own.
 _MY_TAB = f"{connect.SESSION}-mcp"
 _have_tab = False
 
@@ -76,16 +58,13 @@ def my_tab():
     """The tag of this agent's tab, opened on first use."""
     global _have_tab
     if not _have_tab:
-        # owner=, so `playwrong --tabs` can answer "who opened that one?" for MCP callers too — it
-        # showed "-" for every agent tab before — and so close_extra can tell whose tab is whose.
+        # owner=: shown by `playwrong --tabs`, and how close_extra tells whose tab is whose.
         op("newtab", url="about:blank", tag=_MY_TAB, owner=connect.OWNER)
         _have_tab = True
     return _MY_TAB
 
 
-# ── tools ───────────────────────────────────────────────────────────────────────────────────────
-# Each tool is a thin shim over engine/connect.py, which is also what the `playwrong` CLI uses — one
-# implementation of "start the engine, drive it, clean up", not two that drift apart.
+# ── tools: thin shims over engine/connect.py ────────────────────────────────────────────────────
 
 def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20, no_js=False):
     r = capture(url, mode=mode, solve=solve, max_chars=max_chars, tries=tries, no_js=no_js)
@@ -97,9 +76,7 @@ def t_fetch(url, mode="text", solve=True, max_chars=40000, tries=20, no_js=False
 
 def t_pdf(url, path=None, max_chars=40000):
     r = connect.pdf(url, path=path)
-    # The file is always written, so always say where and what — a caller keeping the document needs
-    # the path, and one checking it got the whole thing needs the page count. Reporting these only in
-    # the failure branches (as this used to) hands back a saved file nobody is told about.
+    # Always where and how many pages: the path to keep it, the count to see it is whole.
     saved = f"Saved: {r['path']} ({r['bytes']} bytes"
     if r.get("pages"):
         saved += f", {r['pages']} pages"
@@ -182,20 +159,15 @@ def t_search(query, max_results=10):
             if brave else "")
     if hits:
         return note + _numbered(hits)
-    # An empty result set is a RESULT. This used to say "no results parsed — DuckDuckGo may have
-    # changed its markup", which reads as "the search did not run" and had agents recording "no such
-    # thing exists" for queries that simply matched nothing (#10, #12). A genuine parse failure
-    # raises from connect.search() instead, and says what arrived.
+    # Zero hits is a result, said as one (#10, #12); a parse failure raises in connect.search().
     head = (f"No results. The search ran; {'Brave Search' if brave else 'DuckDuckGo'} matched "
             f"nothing for: {query}")
     loose = connect.relax(query)
     if not loose:
         return (f"{head}\nNothing to relax — no quotes or operators to drop. The terms themselves "
                 f"are what matched nothing; try different or fewer words.")
-    # Run the relaxation here rather than telling the caller to. Zero results is exactly the moment
-    # an agent concludes "this does not exist" and stops, and the retry it should have made is
-    # mechanical. Kept LOUDLY separate: answering a question nobody asked, unlabelled, is the same
-    # silent-wrong-answer failure this project exists to prevent.
+    # Retry relaxed here (zero hits is when an agent wrongly concludes "doesn't exist"), and label
+    # the hits as answering the relaxed query, not the caller's.
     loose_hits = connect.search(loose, max_results=max_results)
     if not loose_hits:
         return (f"{head}\nAlso retried relaxed (quotes and operators dropped): {loose}\n"
@@ -210,7 +182,7 @@ def t_search(query, max_results=10):
 
 def t_screenshot(url=None, solve=True):
     if url is None:
-        return [{"type": "image", "data": op("shot", tab=my_tab(), timeout=90.0)["b64"],
+        return [{"type": "image", "data": op("shot", tab=my_tab(), timeout=connect.GOTO_TIMEOUT)["b64"],
                  "mimeType": "image/png"}]
     r = capture(url, solve=solve, max_chars=200, shot=True)
     return [{"type": "text", "text": f"{r.get('title') or ''} — {r.get('url') or ''}"},
@@ -219,7 +191,7 @@ def t_screenshot(url=None, solve=True):
 
 def t_goto(url, solve=True, mode="text", max_chars=8000, no_js=False):
     tab = my_tab()
-    op("goto", url=url, tab=tab, no_js=no_js, timeout=90.0)
+    op("goto", url=url, tab=tab, no_js=no_js, timeout=connect.GOTO_TIMEOUT)
     page = op("text", tab=tab)
     note = ""
     if solve and is_challenge(page):
@@ -311,7 +283,7 @@ TOOLS = [
              "solve": {"type": "boolean", "default": True,
                        "description": "Auto-clear a Cloudflare challenge if one is detected."},
              "no_js": {"type": "boolean", "default": False,
-                       "description": "Disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH)."},
+                       "description": "Disable page JavaScript: the server-sent HTML only, before any script rewrites it."},
              "max_chars": {"type": "integer", "default": 40000,
                            "description": "Truncate the body at this many characters."},
              "tries": {"type": "integer", "default": 20,
@@ -407,14 +379,15 @@ TOOLS = [
          description=(
              "Screenshot a page as a PNG you can actually look at. With `url`, it loads that page in "
              "its own tab (clearing a challenge if needed) and closes the tab after. With no url, it "
-             "shoots the browser's current page — use that to see the result of goto/click/js."),
+             "shoots YOUR tab (the one goto/click/js drive) to see their result."),
          schema={"type": "object", "properties": {
-             "url": {"type": "string", "description": "Optional; omit to shoot the current page."},
+             "url": {"type": "string", "description": "Optional; omit to shoot your tab."},
              "solve": {"type": "boolean", "default": True}}}),
 
     dict(name="goto", fn=t_goto,
          description=(
-             "Navigate the browser's CURRENT tab to a url and return a short text preview. This "
+             "Navigate YOUR tab (this agent's own, in the shared browser) to a url and return a "
+             "short text preview. This "
              "starts an interactive session: the page stays open for click/key/js/read/screenshot, "
              "and cookies persist. For a one-shot capture use `fetch` instead — it cleans up after "
              "itself, this does not. THIS IS THE LOGIN PATH: the browser is headed and the user is "
@@ -426,18 +399,19 @@ TOOLS = [
              "url": {"type": "string"},
              "solve": {"type": "boolean", "default": True},
              "no_js": {"type": "boolean", "default": False,
-                       "description": "Disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH)."},
+                       "description": "Disable page JavaScript: the server-sent HTML only, before any script rewrites it."},
              "mode": _TEXT_MODE,
              "max_chars": {"type": "integer", "default": 8000}}}),
 
     dict(name="read", fn=t_read,
-         description="Re-read the browser's current page (after click/key/js changed it).",
+         description="Re-read your tab's page (after click/key/js changed it).",
          schema={"type": "object", "properties": {
              "mode": _TEXT_MODE, "max_chars": {"type": "integer", "default": 40000}}}),
 
     dict(name="js", fn=t_js,
          description=(
-             "Evaluate a JavaScript expression in the current page and return its value. The precise "
+             "Evaluate a JavaScript expression in your tab's page (its main world: page globals are "
+             "visible) and return its value. The precise "
              "tool: use it to extract one field, fill an input, submit a form, or scroll — instead of "
              "pulling the whole page into context. Example: "
              "`[...document.querySelectorAll('h2')].map(e=>e.textContent)`."),
@@ -458,7 +432,7 @@ TOOLS = [
          schema={"type": "object", "required": ["key"], "properties": {"key": {"type": "string"}}}),
 
     dict(name="solve", fn=t_solve,
-         description=("Manually clear a Cloudflare Turnstile challenge on the current page. `fetch` "
+         description=("Manually clear a Cloudflare Turnstile challenge on your tab's page. `fetch` "
                       "and `goto` already do this automatically — only reach for this if a wall "
                       "appears mid-session."),
          schema={"type": "object", "properties": {"tries": {"type": "integer", "default": 20}}}),

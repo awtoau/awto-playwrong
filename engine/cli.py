@@ -24,6 +24,7 @@ only when you deliberately want a SECOND, isolated browser.
 Progress notes go to stderr and the page to stdout, so `playwrong <url> > page.txt` stays clean.
 """
 import argparse
+import base64
 import json
 import os
 import sys
@@ -61,7 +62,7 @@ def main(argv=None):
                         "print its text — works when the file sits behind a bot wall that curl alone "
                         "can't pass, and reports the page count that reveals a truncated document")
     p.add_argument("-o", "--out", metavar="PATH",
-                   help="where --pdf/--shot writes (default: tmp/, or the XDG cache dir when the "
+                   help="where --pdf writes (default: tmp/, or the XDG cache dir when the "
                         "checkout isn't writable). Use it to keep a document: -o sources/doc.pdf")
     p.add_argument("--agent", metavar="NAME",
                    help="how this caller is labelled in tab titles and --tabs (default: guessed "
@@ -79,7 +80,7 @@ def main(argv=None):
     p.add_argument("--shot", metavar="PATH", help="also save a PNG screenshot of each page")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument("--no-js", action="store_true",
-                   help="disable JavaScript execution to bypass client-side paywall script truncation (e.g. The Age, SMH)")
+                   help="disable page JavaScript: the server-sent HTML only")
     p.add_argument("--no-solve", action="store_true", help="don't auto-clear Cloudflare challenges")
     p.add_argument("--tries", type=int, default=20, help="max challenge-solve iterations")
     p.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
@@ -179,6 +180,10 @@ def main(argv=None):
 
     fmt = "html" if a.html else ("text+links" if a.links else "text")
 
+    if a.jobs > 1 and len(a.urls) > 1 and (a.shot or a.no_js):
+        if note:            # prefetch takes neither: fetch one at a time rather than drop the flag
+            note("--shot/--no-js need one page at a time; ignoring -j")
+        a.jobs = 1
     if a.jobs > 1 and len(a.urls) > 1:
         # Parallel: results arrive in COMPLETION order, not the order given, so each is labelled.
         results, failed, n = [], 0, 0
@@ -213,7 +218,6 @@ def main(argv=None):
             results.append({"url": url, "error": str(e)})
             continue
         if a.shot:
-            import base64
             path = _shot_path(a.shot, i, len(a.urls))
             with open(path, "wb") as f:
                 f.write(base64.b64decode(r.pop("b64")))

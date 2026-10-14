@@ -21,8 +21,8 @@ import tempfile
 import time
 import urllib.request
 
-# Chrome printing "DevTools listening on" after spawn: worst launch seen 2.8 s (`op_done op=start`
-# in tmp/nd-server.log, 2026-10-12); 1.25x. On expiry: CDPLaunchError with the tail of Chrome's log.
+# Chrome printing "DevTools listening on" after spawn: 1.25x the worst launch in the engine log
+# (`op_done op=start`, #41). On expiry: CDPLaunchError with the tail of Chrome's log.
 LAUNCH_TIMEOUT = 3.5
 LISTENING = re.compile(rb"DevTools listening on (ws://\S+)")
 # Websocket upgrade to a local Chrome: ms. 2 s covers a loaded box; on expiry ConnectionLost.
@@ -30,6 +30,10 @@ WS_OPEN_TIMEOUT = 2.0
 # Browser.close or SIGTERM -> exit for Chrome: ~0.3 s typical. On expiry: the next step (SIGTERM,
 # then SIGKILL).
 STOP_TIMEOUT = 2.0
+# Target.createTarget and closeTarget, for callers to bound them (engine, crawl): ~1.25x the worst
+# seen in the engine log (scripts/op_latency.py, #29). On expiry the caller names the op.
+NEWTAB_TIMEOUT = 0.5
+CLOSE_TIMEOUT = 0.3
 
 # First hit wins. Names are looked up on PATH; absolute paths are checked as they are.
 CHROME_CANDIDATES = {
@@ -41,12 +45,11 @@ CHROME_CANDIDATES = {
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome"],
 }
 
-# nodriver's launch flags, kept verbatim. The port is a concrete free one, never 0:
-# --remote-debugging-port=0 makes Chrome report navigator.webdriver = true (scripts/stealth_check.py).
-# IsolateOrigins,site-per-process OFF keeps ordinary cross-origin iframes in-process (pierce reaches
-# them). Turnstile's iframe is out-of-process anyway: find_text handles that via iframe targets (#45).
-# --remote-allow-origins is set per launch to the port's own origin (DevTools frontend), never `*`:
-# `*` let any web page drive the browser (scripts/cdp_surface_check.py). Our client sends no Origin.
+# Run stealth_check.py and cdp_surface_check.py after any change here. Set per launch in launch():
+# - a concrete port, never 0 (0 sets navigator.webdriver, #47)
+# - --remote-allow-origins = the port's own origin, never `*` (any web page could drive it, #52)
+# Site isolation off keeps ordinary cross-origin iframes in-process; Turnstile's is out-of-process
+# anyway (#45).
 CHROME_FLAGS = [
     "--no-first-run", "--no-service-autorun",
     "--no-default-browser-check", "--homepage=about:blank", "--no-pings",
@@ -216,6 +219,7 @@ class Browser:
         self._tabs = {}             # target_id -> Tab, insertion order = first seen
         self.closed = None          # ConnectionLost once the socket is gone
         self._reader = None
+        self._tasks = set()         # running async event handlers
 
     async def _start(self):
         self._reader = asyncio.ensure_future(self._read())
@@ -271,13 +275,15 @@ class Browser:
             err = e
         self._lost(err)
 
-    @staticmethod
-    def _dispatch(cb, params):
-        # Async handlers run as tasks: a handler that awaits a send must never stall the reader.
+    def _dispatch(self, cb, params):
+        # Async handlers run as tasks (held until done): one that awaits a send must not stall the
+        # reader.
         try:
             r = cb(params)
             if asyncio.iscoroutine(r):
-                asyncio.ensure_future(r)
+                task = asyncio.ensure_future(r)
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
         except Exception:
             pass
 

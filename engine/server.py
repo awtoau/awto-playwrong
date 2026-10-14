@@ -16,10 +16,13 @@ foreground anyway:
 """
 import asyncio
 import base64
-import html
+import ctypes
 import json
 import os
 import re
+import select
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +31,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cdp  # engine/cdp.py; server.py runs as a script, so its dir is on sys.path
+import connect
 import logroll
 import memcap
 
@@ -35,17 +39,8 @@ PORT = int(os.environ.get("PH_PORT", "8731"))
 
 
 def profile_dir():
-    """Where Chrome keeps its user-data-dir, if anywhere.
-
-    PH_PROFILE_DIR — an explicit path, for full control.
-    PH_PROFILE     — just a NAME ("work", "logged-in"), resolved to an XDG data dir and created for
-                     you. Persistent profiles are what you want for a site you log into: the session
-                     survives an engine restart. Naming one beats inventing a path, which is why
-                     this exists.
-    neither        — ephemeral: a throwaway profile per launch. The default, because a persistent
-                     profile silently accumulates real browsing state on disk and that should be an
-                     opt-in.
-    """
+    """Chrome's user-data-dir: PH_PROFILE_DIR (a path), PH_PROFILE (a name, under
+    $XDG_DATA_HOME/playwrong/profiles/), or None = a throwaway profile per launch (the default)."""
     d = os.environ.get("PH_PROFILE_DIR")
     if d:
         return os.path.expanduser(d)
@@ -61,30 +56,26 @@ def profile_dir():
 PROFILE_DIR = profile_dir()
 
 
-def code_version():
-    """What source this process is RUNNING, stamped once at launch.
+# A local `git` answers in ms; 5 s covers a cold disk. On expiry the sha is reported as None.
+GIT_TIMEOUT = 5
 
-    A long-lived engine keeps serving whatever it imported at startup, so a checkout can move
-    commits ahead of the process answering on the port — and nothing said so. That cost an
-    afternoon: every diagnostic reported healthy while the fixes being tested were not in the
-    running code. Returns {sha, dirty, started} — sha is None outside a git checkout (an installed
-    wheel), where `started` is still enough to compare against a file mtime.
-    """
-    import subprocess
+
+def code_version():
+    """{sha, dirty, started} of the source this process RUNS, stamped at launch: a long-lived engine
+    keeps serving old code after the checkout moves. sha is None outside a git checkout."""
     here = os.path.dirname(os.path.abspath(__file__))
     sha = dirty = None
     try:
         r = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=GIT_TIMEOUT)
         if r.returncode == 0:
             sha = r.stdout.strip()
-            # Repo root, not `here`: scoped to engine/ this reported a clean tree while crawl/ and
-            # pyproject.toml were both modified — "dirty" has to mean "the checkout differs
-            # from that sha", or it answers a question nobody asked.
+            # Repo root, not engine/: "dirty" means the whole checkout differs from that sha.
             root = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
-                                  capture_output=True, text=True, timeout=5).stdout.strip() or here
+                                  capture_output=True, text=True,
+                                  timeout=GIT_TIMEOUT).stdout.strip() or here
             d = subprocess.run(["git", "-C", root, "status", "--porcelain"],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=GIT_TIMEOUT)
             dirty = bool(d.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         pass
@@ -92,45 +83,19 @@ def code_version():
 
 
 CODE = code_version()
-
-
-def data_dir():
-    """Scratch/log directory: the checkout's tmp/ when that is really ours to write to, otherwise an
-    XDG cache dir. An INSTALLED package must never write into site-packages — which is exactly what
-    the old unconditional `../tmp` did, creating site-packages/tmp/logs/."""
-    cand = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp"))
-    if "site-packages" not in cand and "dist-packages" not in cand:
-        try:
-            os.makedirs(cand, exist_ok=True)
-            if os.access(cand, os.W_OK):
-                return cand
-        except OSError:
-            pass
-    d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "playwrong")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-TMP = data_dir()
+TMP = connect.DATA                               # checkout tmp/, or the XDG cache when installed
 LOG = os.path.join(TMP, "nd-server.log")
 CHROME_LOG = os.path.join(TMP, "chrome.log")     # Chrome's stdout/stderr, truncated per launch
-CHALLENGE = ("just a moment", "verify you are human", "cf-chl", "challenge-platform")
 
-# Ownership shown IN the tab title, so a human looking at a shared browser can tell at a glance which
-# agent and which repo opened a given tab. The brackets are the rare "white square" pair specifically
-# so the marker cannot collide with anything a real page would put in its own title, which is what
-# makes stripping it again exact rather than a guess.
+# Owner label in the tab title, for whoever watches the shared browser. The rare ⟦⟧ pair makes
+# stripping it from returned titles exact (#16).
 OWNER_L, OWNER_R = "\u27e6", "\u27e7"
 OWNER_TITLE_RE = re.compile(rf"^{OWNER_L}[^{OWNER_R}]*{OWNER_R}\s*")
 
 
 def unlabel(v, owner):
-    """Remove THIS tab's own ⟦owner⟧ label from a value the caller is about to receive.
-
-    Exact rather than pattern-matched: only the one owner string this engine wrote is removed, so a
-    page that uses the bracket pair itself keeps it. Recurses, because a js result is whatever the
-    expression returned — a string, a list of titles, an object with a title field (#16).
-    """
+    """Remove this tab's own ⟦owner⟧ label from a returned value, recursing into lists and dicts (a
+    js result can be any shape). Exact string, so a page's own ⟦⟧ survives (#16)."""
     if not owner:
         return v
     if isinstance(v, str):
@@ -143,8 +108,7 @@ def unlabel(v, owner):
 
 
 def strip_owner(title):
-    """Titles reported by the API are the page's own. The label is decoration for the human watching
-    the window, and must never leak into a capture, a result, or a caller's data."""
+    """The page's own title: the owner label is for the human watching, never for callers."""
     return OWNER_TITLE_RE.sub("", title or "")
 
 # Serialise the caller's expression IN THE PAGE and hand back a JSON string: undefined, promises and
@@ -158,8 +122,7 @@ PID = os.getpid()
 STARTED = time.monotonic()
 
 def log(a, **k):
-    # pid + rss on every line: the OOM record in #23 named a pid and a size, and nothing in this log
-    # could be tied to either. Timestamp is ISO 8601 with offset (UTC).
+    # pid + rss on every line, so an OOM record (pid, size) can be tied to this log (#23).
     ts = datetime.now(UTC).isoformat(timespec="milliseconds")
     try:
         logroll.roll(LOG)                 # every engine on this checkout shares the file (#39)
@@ -172,11 +135,10 @@ def log(a, **k):
 # ── memory: measure, bound, fail loud (#23) ──────────────────────────────────────────────────────
 MEMORY_MAX = os.environ.get("PH_MEMORY_MAX", "8G")     # cgroup cap for python + Chrome; "0" = none
 MEMORY_CAP = "unknown"                                   # what memcap.enter() achieved, for /status
-parse_size = memcap.parse_size
 
-# Self-restart threshold, checked after every op and every 60s. A healthy engine sits under 100 MB
-# (63 MB idle at 27 min measured); 2G is 30x that and a quarter of the cgroup cap.
-RSS_LIMIT = parse_size(os.environ.get("PH_RSS_LIMIT", "2G")) or (2 << 30)
+# Self-restart threshold on this process's RSS, checked after every op and every 60 s. A healthy
+# engine stays well under 100 MB (#23); 2G is a leak, and a quarter of the default cgroup cap.
+RSS_LIMIT = memcap.parse_size(os.environ.get("PH_RSS_LIMIT", "2G")) or (2 << 30)
 
 def proc_status_mb(key):
     """One Vm* field of /proc/self/status in MB, or None off Linux."""
@@ -187,27 +149,21 @@ def proc_status_mb(key):
     except (OSError, ValueError, IndexError):
         return None
 
-# Chrome recycle triggers (#23). 64 tabs is 2x the crawler's own --tabs cap of 32, so a legitimate
-# crawl never trips it; 1000 opened tabs is a few hours of the busiest client seen.
-# PH_DISPLAY=xvfb: headed Chrome on the engine's own Xvfb, off the user's desktop. Chrome is still
-# genuinely headed, so nothing changes for Turnstile; test engines use it. Unset = the desktop.
+# PH_DISPLAY=xvfb: headed Chrome on the engine's own Xvfb, off the desktop (still headed, so nothing
+# changes for Turnstile; test engines use it). Unset = the user's desktop.
 DISPLAY_MODE = os.environ.get("PH_DISPLAY", "")
-# Xvfb answering -displayfd: ~1.25x the worst start measured (issue #36). On expiry the engine
-# exits naming Xvfb, rather than launching Chrome at a display that isn't there.
-XVFB_START_TIMEOUT = 0.2
+# Xvfb answering -displayfd. Expiry is fatal (the engine exits naming Xvfb), and starts on a loaded
+# box ran past 0.2 s (#36, #53), so 1 s.
+XVFB_START_TIMEOUT = 1.0
 XVFB = None                 # the Xvfb Popen in PH_DISPLAY=xvfb mode
 
 def _die_with_parent():
     """Xvfb is the engine's; if the engine is killed, take Xvfb with it (PR_SET_PDEATHSIG)."""
-    import ctypes
-    import signal
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
 
 def start_xvfb():
     """Start the engine's own Xvfb on a free display and point DISPLAY at it. Returns ':N'."""
     global XVFB
-    import select
-    import subprocess
     r, w = os.pipe()
     t0 = time.monotonic()
     XVFB = subprocess.Popen(["Xvfb", "-displayfd", str(w), "-screen", "0", "1920x1080x24",
@@ -231,6 +187,7 @@ def start_xvfb():
 # Headed by default: headless is the Turnstile tell. PH_HEADLESS=1 is for test engines on an
 # isolated port, so test runs don't open windows on the user's desktop.
 HEADLESS = os.environ.get("PH_HEADLESS") == "1"
+# Chrome recycle triggers (#23): open tabs (2x the crawler's --tabs cap) and tabs opened since launch.
 CHROME_MAX_TABS = int(os.environ.get("PH_CHROME_MAX_TABS", "64"))
 CHROME_MAX_FETCHES = int(os.environ.get("PH_CHROME_MAX_FETCHES", "1000"))
 # New tabs are refused above this share of the cap held as unreclaimable memory, so a caller backs
@@ -244,11 +201,7 @@ HEAP_QUERY_TIMEOUT = 1.0
 # the browser dying: a local CDP event lands in ms, 0.25 s is far past that and still short.
 CRASH_EVENT_WAIT = 0.25
 
-# Bounds on the two ops #29 saw wedge for 60 s. Derivation: `scripts/op_latency.py` over the engine
-# log (issue #29). newtab's createTarget: worst seen 399 ms -> 0.5 s. A close: p99.9 217 ms; the
-# 10 s outlier is websockets' close handshake, so a close past 0.3 s finishes in the background.
-NEWTAB_TIMEOUT = 0.5
-CLOSE_TIMEOUT = 0.3
+NEWTAB_TIMEOUT, CLOSE_TIMEOUT = cdp.NEWTAB_TIMEOUT, cdp.CLOSE_TIMEOUT
 # Unanswered newtabs in a row before the browser connection is treated as dead and reattached
 # (same Chrome, session kept) instead of wedging until a manual --stop. 2: one can be a blip.
 NEWTAB_STRIKES = 2
@@ -297,14 +250,28 @@ def check_headroom(what):
             f"(over {HIGH_WATER:.0%}), so {what} was refused. Close tabs you no longer need, "
             f"or retry once other work finishes.")
 
-# Seconds past the 2 s settle to wait for readyState "complete": ~1.25x the worst seen (#32).
-# Expiry flags the capture partial, never silent; longer would tax every page whose load never fires.
+# After Page.navigate returns (the load has only started): let the document arrive before reading.
+SETTLE = 2.0
+# Past SETTLE, wait for readyState "complete": ~1.25x the worst seen (#32). Expiry flags the capture
+# partial, never silent.
 LOAD_WAIT = 5.0
+# Solve loop: look for the checkbox (a page shows it within ~2 s); after a click, Turnstile verifies
+# and reloads (~3 s); between tries. A try is ~8 s worst case, which connect.solve_timeout() assumes.
+FIND_TIMEOUT, AFTER_CLICK, SOLVE_PAUSE = 3.0, 4.0, 1.0
+# closeTarget is acked before teardown (ms); past this a tab is reported still open.
+CLOSE_SETTLE = 2.0
+# A prefetch job nobody polled for this long belongs to a dead client: 20x the default per-url timeout.
+JOB_IDLE = 600
+# Reading a timed-out tab: a busy renderer still answers within seconds; past this, report the timeout.
+PARTIAL_READ_TIMEOUT = 5.0
+# /status probe: one local round trip is ms; past this the loop is busy and `alive` falls back to
+# the process check.
+STATUS_PROBE_TIMEOUT = 3.0
 
 def cdp_sockets():
-    """Established TCP connections to Chrome's CDP port, from /proc/net/tcp. The leak in #23 showed
-    here first: 277 sockets for 3 tabs. Counts attached crawl shards too; they are few and known."""
-    port = (getattr(B, "_cdp", None) or {}).get("port")
+    """Established TCP connections to Chrome's CDP port (/proc/net/tcp): the engine's one, plus any
+    attached clients. Where a socket leak shows first (#23)."""
+    port = B.cdp_endpoint.get("port")
     if not port:
         return 0
     n = 0
@@ -327,12 +294,13 @@ def mem_snapshot():
             "fds": fds, "cdp_sockets": cdp_sockets(), "threads": threading.active_count(),
             "tabs": B.tab_count(), "uptime_s": int(time.monotonic() - STARTED), **scope_mb()}
 
+# mem line + RSS check while idle (no op to catch growth on). 60 s bounds a #23-rate leak between
+# samples while keeping the log small.
+MEMWATCH_PERIOD = 60
+
 def _memwatch():
-    """Every 60s: log a `mem` line and apply the RSS trigger (idle growth has no op to catch it on).
-    60s: the leak in #23 ran at ~5 MB/s at worst, 300 MB between samples, while a healthy engine's
-    line stays cheap enough to keep forever."""
     while True:
-        time.sleep(60)
+        time.sleep(MEMWATCH_PERIOD)
         s = mem_snapshot()
         log("mem", **s, top_renderers=top_renderers())
         try:
@@ -351,6 +319,9 @@ def check_rss(where):
     return rss
 
 SRV = None                      # the ThreadingHTTPServer, once bound
+# Retire waits this long for in-flight ops: a slow real page loads in seconds; past it the op is cut
+# and logged (retire_cut).
+RETIRE_DRAIN = 40.0
 _INFLIGHT = [0]                 # ops being served right now; guarded by _INFLIGHT_LOCK
 _INFLIGHT_LOCK = threading.Lock()
 _RETIRING = threading.Event()
@@ -367,13 +338,11 @@ def _retire_engine(**why):
 def _retire_worker():
     if SRV is not None:
         SRV.shutdown()          # returns once serve_forever() has stopped accepting (0.5s poll)
-    # In-flight ops: the slowest legitimate one is a goto — connect.py gives it 90s, real pages
-    # take a few seconds. 40s waits out the slow page; on expiry the op is cut and the log says so.
-    deadline = time.monotonic() + 40.0
+    deadline = time.monotonic() + RETIRE_DRAIN
     while time.monotonic() < deadline and _INFLIGHT[0] > 0:
         time.sleep(0.1)
     if _INFLIGHT[0]:
-        log("retire_cut", inflight=_INFLIGHT[0], waited_s=40)
+        log("retire_cut", inflight=_INFLIGHT[0], waited_s=RETIRE_DRAIN)
     _shutdown(code=3)
 
 def ensure_display(env=None, uid=None, x11_dir="/tmp/.X11-unix", run_dir=None):
@@ -413,27 +382,16 @@ def ensure_display(env=None, uid=None, x11_dir="/tmp/.X11-unix", run_dir=None):
     return got
 
 def heal_profile(profile_dir):
-    """Clear a stale SingletonLock so a persistent profile can be relaunched.
-
-    Chrome writes SingletonLock/SingletonCookie/SingletonSocket into a user-data-dir and removes them
-    on a CLEAN exit. After a crash, kill -9 or a host reboot they survive, pointing at a long-dead
-    PID — and the next launch against that profile then HANGS INDEFINITELY: /status never reports
-    alive, and nothing appears in the log past server_start. It is not a crash, the launch is stuck
-    on the lock, which makes it look like the browser is simply broken.
-
-    The documented fix was "rm the three Singleton* files yourself". Doing it here instead: the lock
-    is only meaningful if its owning process is alive, so we check, and remove it only when it is
-    not. A live lock (a second engine genuinely using this profile) is left alone.
-    """
+    """Remove a persistent profile's Singleton* files when their owning pid is dead.
+    - A crash or reboot leaves them behind, and the next launch on that profile hangs on the lock.
+    - A live owner (another engine on this profile) is left alone."""
     if not profile_dir or not os.path.isdir(profile_dir):
         return
     lock = os.path.join(profile_dir, "SingletonLock")
     if not os.path.lexists(lock):
         return
-    # ONLY SingletonLock encodes a pid, as a "<hostname>-<pid>" symlink target. SingletonCookie's
-    # target is a large random number and SingletonSocket's is a socket path — parsing either as a
-    # pid yields a value os.kill() rejects outright (OverflowError: Python int too large to convert
-    # to C int), which is why liveness is decided from the lock alone.
+    # Only SingletonLock's target ("<host>-<pid>") holds a pid; the other two hold a random number
+    # and a socket path.
     pid = None
     try:
         pid = int(os.readlink(lock).rsplit("-", 1)[-1])
@@ -487,19 +445,24 @@ class ND:
         self._launch = asyncio.Lock()   # serialises browser launch; see _ensure()
         self.owners = {}        # target_id -> "agent@repo:pid", shown in the tab title and /tabs
         self.fetches = 0        # tabs opened since this Chrome launched; see _maybe_recycle()
+        self.cdp_endpoint = {}  # {host, port, http} of the current Chrome; see _publish_cdp()
+        self._jobn = 0          # prefetch job counter
+        self._bg = set()        # background tasks, held so the loop cannot collect them mid-run
         threading.Thread(target=lambda:(asyncio.set_event_loop(self.loop),self.loop.run_forever()),
                          daemon=True).start()
     def run(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
     def run_timeout(self, coro, timeout):
-        """run(), but bounded — for the diagnostic paths, which must answer even when the loop is
-        busy with a page load. Raises TimeoutError; the coroutine is left to finish on its own."""
+        """run(), bounded: diagnostics must answer while the loop is busy. Raises TimeoutError; the
+        coroutine finishes on its own."""
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
+    def spawn(self, coro):
+        """Fire-and-forget on the loop, with a reference held until it finishes."""
+        task = asyncio.ensure_future(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        return task
     def gone(self):
-        """Has the Chrome we launched exited? Cheap — no CDP round trip on the happy path.
-
-        `self.tab` is a plain Python object that outlives the browser, so testing it alone answers
-        "did we ever launch", never "is it still there". `stopped` reads the child process's
-        returncode, which is the difference between recovering and not."""
+        """Has the Chrome we launched exited? Reads the process returncode; no CDP round trip."""
         if self.browser is None: return True
         try: return bool(self.browser.stopped)
         except Exception: return True   # can't tell -> assume gone; a spare relaunch beats a wedge
@@ -507,19 +470,12 @@ class ND:
         """Usable browser: launched, not marked dead by a failed op, process still running."""
         return self.tab is not None and not self._dead and not self.gone()
     async def probe(self, timeout=1.0):
-        """One real CDP round trip, or None if the loop was too busy to answer in time.
-
-        The process being alive is not the same as the browser being reachable — in #6 Chrome's
-        /json endpoint kept answering while every target websocket was dead, so a process check
-        alone would still have called that engine healthy. Browser.getVersion is the cheapest thing
-        that proves the socket carries traffic.
-
-        A local CDP round trip is single-digit milliseconds. 1s is ~200x that, chosen so a browser
-        busy with a page load is not declared dead; on expiry we return None ("could not tell")
-        rather than a verdict, because a slow answer means loaded, not broken."""
+        """True/False from one Browser.getVersion round trip; None if it took over `timeout`.
+        - A live process is not a reachable browser (#6), so health needs real traffic.
+        - A local round trip is ms; 1 s means busy with a page, so expiry says "can't tell"."""
         if not self.ok(): return False
         try:
-            # Through the BROWSER connection: browser health must not depend on one tab existing (#22).
+            # Through the BROWSER session: health must not depend on one tab existing (#22).
             await asyncio.wait_for(self.browser.send("Browser.getVersion"), timeout)
             return True
         except TimeoutError:
@@ -531,11 +487,8 @@ class ND:
         """The `agent@repo:pid` that opened this tab, or None if it was opened without a label."""
         return self.owners.get(getattr(t, "target_id", None))
     def owner_alive(self, owner):
-        """Is the process behind an owner label still running?
-
-        A dead owner's tabs are the orphans close_extra was written to sweep — the one case where
-        closing somebody else's tab harms nobody. Labels are `agent@repo:pid`; anything that does
-        not end in a pid is treated as alive, because guessing wrong closes a live agent's page."""
+        """Is the pid in an `agent@repo:pid` label alive? No pid -> assumed alive (closeextra must
+        never close a live agent's tab on a guess)."""
         if not owner or ":" not in owner:
             return True
         try:
@@ -550,31 +503,21 @@ class ND:
             return True              # exists, owned by another user
         return True
     def chrome_pid(self):
-        """PID of the Chrome we launched, or None. Diagnostic — and what lets a test kill exactly
-        this browser instead of pgrep-ing for one and hitting somebody's shared session."""
+        """PID of our Chrome, or None. Tests kill exactly this one, never a pgrep match."""
         p = self.browser.process if self.browser is not None else None
         return getattr(p, "pid", None)
     def forget(self, why):
-        """Mark the connection dead, but KEEP the browser handle.
-
-        Two failures wear the same error. Chrome exited (#8), or Chrome is still running and only
-        the websocket died (#6 — /json still answered while every target socket was dead). The
-        handle is what tells them apart in _ensure(): the second case wants a reattach, and throwing
-        the handle away there would strand a live Chrome that nothing can close.
-
-        Tags and owners go now either way. They are TARGET IDS, and a stale tag resolving into a
-        fresh browser is the cross-agent page theft that tab tagging exists to prevent."""
+        """Mark the connection dead but KEEP the handle: _ensure() uses it to tell "Chrome exited"
+        (#8, relaunch) from "only the socket died" (#6, reattach). Tags and owners go now: they are
+        target ids, and a stale one resolving in a new browser would hand an agent another's page."""
         log("browser_lost", why=str(why)[:100])
         self._dead = True
         self.tab = None
         self.tags.clear(); self.owners.clear()
     async def _reattach(self):
-        """Same Chrome, new connection. Returns True if it worked.
-
-        Preferred over relaunching whenever the process is alive: a relaunch throws away the cleared
-        Turnstile session and every login, which is the whole reason this project holds one browser
-        open."""
-        info = getattr(self, "_cdp", None) or {}
+        """Same Chrome, new connection; True if it worked. Preferred over a relaunch, which loses the
+        cleared Turnstile session and every login."""
+        info = self.cdp_endpoint
         if not info.get("host"): return False
         old = self.browser
         try:
@@ -590,34 +533,22 @@ class ND:
             self._dead = False
             log("nd_reattached", cdp=f"{info['host']}:{info['port']}")
             if old is not None:
-                asyncio.ensure_future(old.aclose())
+                self.spawn(old.aclose())
             return True
         except Exception as e:
             log("reattach_failed", e=repr(e)[:100])
             return False
     async def _retire(self):
-        """Stop a browser we are about to replace, so it is not orphaned.
-
-        Only reached when the connection is unusable but the process is still up. Skipping this is
-        how you get the pile of headed Chromes cleanup_orphans.py was written for — 12 of them
-        holding 15.7 GB, from one afternoon."""
+        """Close a still-running browser we are about to replace, so it is not orphaned."""
         try:
             if not self.gone(): await self.browser.close()
         except Exception as e:
             log("retire_err", e=repr(e)[:80])
     async def _ensure(self):
-        """Launch the browser once, however many callers arrive at once — and relaunch it if it died.
-
-        The bare `if self.tab: return` was a double-checked lock with no lock. The launch awaits, so
-        twelve concurrent first-ops ALL saw self.tab as None and ALL launched a browser: one engine,
-        twelve Chromes, eleven of them untracked and therefore unclosable. Measured exactly that —
-        nd_started fired 12 times for a single server. The lock makes the launch happen once; the
-        re-check inside it is what the fast path outside cannot guarantee.
-
-        The recovery half is the other failure: the browser goes away, self.tab still points at it,
-        and every op returns ConnectionClosedError until a human restarts the engine — three times in
-        two days before it was fixed (#8, #6, #7). Reattach if the process is still there, because
-        that keeps the cleared session; relaunch only when there is nothing left to attach to."""
+        """A usable browser, launched once however many callers arrive together.
+        - Lock + re-check: concurrent first ops each launched a Chrome without it.
+        - Dead connection, live process: reattach (keeps the session). Dead process: relaunch
+          (#6, #7, #8)."""
         if self.ok(): return
         async with self._launch:
             if self.ok(): return          # someone else fixed it while we waited for the lock
@@ -661,15 +592,8 @@ class ND:
         tabs = self.browser.tabs
         return tabs[0] if tabs else await self.browser.new_tab("about:blank")
     async def _start(self):
-        """Explicitly trigger the (otherwise lazy) browser launch and block until it's up - the
-        primitive /status can't give you on its own. Chrome only launches on the FIRST real op
-        (goto/newtab/etc via _ensure()), and polling /status never makes it happen - a caller that
-        only checks status in a loop waits forever. Call this once after confirming the HTTP server
-        itself is reachable, then /status will read alive:true.
-
-        Also the repair path: /status reports a browser that died as alive:false, and this relaunches
-        it. connect._wake() already calls /start whenever alive is false, so a client recovers by
-        doing what it always did."""
+        """Launch (or relaunch) Chrome and block until it is up. Chrome is otherwise lazy: polling
+        /status never starts it. connect._wake() calls this whenever /status says alive:false."""
         await self._ensure()
         return {"started": True}
     def tab_count(self):
@@ -677,30 +601,27 @@ class ND:
         try: return len(self.browser.tabs) if self.browser is not None else 0
         except Exception: return 0
     def _publish_cdp(self):
-        """Write the shared browser's CDP endpoint to a marker so OTHER processes can ATTACH to this
-        same browser (cdp.attach(host, port)) and shard by opening their own tabs — the
-        parallel-crawl use case. One browser, many attached drivers, tabs = shards."""
+        """Record the CDP endpoint (the `cdp` op, tmp/playwrong-cdp.json) so other processes can
+        attach to this same browser and drive their own tabs."""
+        host, port = self.browser.host, self.browser.port
+        self.cdp_endpoint = {"host": host, "port": port, "http": f"http://{host}:{port}"}
         try:
-            host=self.browser.host; port=self.browser.port
-            self._cdp={"host":host,"port":port,"http":f"http://{host}:{port}"}
-            with open(os.path.join(TMP,"playwrong-cdp.json"),"w") as f:
-                json.dump(self._cdp,f)
-        except Exception as e:
-            self._cdp={"error":str(e)[:120]}
+            with open(os.path.join(TMP, "playwrong-cdp.json"), "w") as f:
+                json.dump(self.cdp_endpoint, f)
+        except OSError as e:
+            log("publish_cdp_err", e=str(e)[:80])
     async def _cdp_op(self, method=None, params=None, tab=None, browser=False):
-        """No method: the shared browser's CDP endpoint. With one: raw passthrough, on the tab's
-        session (`tab`, default the active tab) or the browser's (`browser`). Request/response only;
-        for events, attach your own client to the endpoint."""
+        """No method: the CDP endpoint. With one: raw passthrough on the tab's session (`tab`,
+        default the active tab) or the browser's (`browser`). Request/response only; for events,
+        attach a client to the endpoint."""
         await self._ensure()
         if not method:
-            return getattr(self, "_cdp", {"error": "not published"})
+            return self.cdp_endpoint
         target = self.browser if browser else await self._tab(tab)
         return {"result": await target.send(method, params or {})}
     async def _watch_crashes(self):
-        """Hear renderer crashes on the browser connection, so a killed tab fails by name (#28).
-        Without this, an op on a tab whose renderer the kernel OOM-killed hung until the client
-        timed out, which reads as a wedged engine."""
-        # Target discovery is already on: cdp.Browser enables it to keep its tab list live.
+        """Renderer crashes, so an op on a killed tab fails by name instead of hanging (#28).
+        Target discovery is already on (cdp.Browser keeps its tab list live with it)."""
         self.browser.on("Target.targetCrashed", self._on_crash)
     def _on_crash(self, p):
         tid, status = p.get("targetId"), p.get("status")
@@ -711,9 +632,8 @@ class ND:
             if t.target_id == tid:
                 t.fail(self._crash_error(tid))   # in-flight and later commands raise TabCrashed
     async def _crash_for(self, ref):
-        """TabCrashed if the tab `ref` names has crashed, else None. A dying renderer can surface as
-        a socket-level error, which must not read as the BROWSER dying: forget() would drop every
-        agent's tags. The crash event can land just after that error; CRASH_EVENT_WAIT covers it."""
+        """TabCrashed if the tab `ref` names crashed, else None. A dying renderer's socket error must
+        not read as the browser dying; the crash event can lag it by CRASH_EVENT_WAIT."""
         tid = (self.tags.get(ref) if isinstance(ref, str) else getattr(self.tab, "target_id", None))
         t0 = time.monotonic()
         while tid and time.monotonic() - t0 < CRASH_EVENT_WAIT:
@@ -747,20 +667,8 @@ class ND:
             raise self._crash_error(tid)
         return t
     async def _resolve_tab(self, ref=None):
-        """Resolve a tab reference to a live Tab.
-
-        THIS is what makes one browser safe for many agents. Every op used to act on self.tab — the
-        one globally-active tab — so two callers driving the engine at once silently read each
-        other's pages. Now each op can name the tab it means.
-
-        ref=None      the active tab (unchanged single-caller behaviour)
-        ref="<tag>"   a tag registered by newtab{tag} — an agent's own handle
-        ref=<int>     a positional index (convenient, but see the warning below)
-
-        Tags resolve to TARGET IDs, never to indices. An index shifts whenever a lower-numbered tab
-        closes, so an index handed out earlier can later point at somebody else's tab — the same
-        class of bug as the active-tab race, just slower to show up.
-        """
+        """A live Tab for `ref`: None = the active tab; "<tag>" = an agent's own tab (resolves to a
+        target id, so it never drifts); int = an index (shifts when lower tabs close: avoid)."""
         await self._ensure()
         if ref is None: return self.tab
         await self._refresh()
@@ -768,10 +676,8 @@ class ND:
         for i, t in enumerate(self.browser.tabs):
             if isinstance(ref, int) and i == ref: return t
             if want and t.target_id == want: return t
-        # A KNOWN tag whose target is gone is a stale handle, not a bad reference: the tab was closed
-        # by hand, swept, or crashed. The tag is the agent's stable handle and the tab is the
-        # disposable half, so re-open under the same tag instead of raising. Before this, one closed
-        # tab wedged that agent's every interactive op until it restarted (#13, #14).
+        # A known tag whose tab is gone (closed, swept, crashed): re-open under the same tag rather
+        # than wedge that agent (#13, #14).
         if isinstance(ref, str) and ref in self.tags:
             owner = self.owners.pop(self.tags[ref], None)
             log("tag_stale", tag=ref[:40])
@@ -800,7 +706,7 @@ class ND:
             await t.send("Emulation.setScriptExecutionDisabled", {"value": bool(no_js)})
         except Exception:
             pass
-        await t.navigate(url); await asyncio.sleep(2)
+        await t.navigate(url); await asyncio.sleep(SETTLE)
         state = await self._loaded(t, no_js)
         if not no_js:
             await self._label(t)
@@ -810,31 +716,24 @@ class ND:
                 title = await self._title_from_html(t)
         else:
             title = await self._title_from_html(t)
-        # location.href, not the url we asked for: redirects (and challenge interstitials) mean the
-        # two differ, and a caller that stores the requested url records a page it never got.
+        # location.href, not the url asked for: redirects and interstitials make them differ.
         return {"title": title, "url": await self._href(t), "requested": url,
                 "ready_state": state}
 
     async def _title_from_html(self, t):
         try:
-            content = await t.content()
-            m = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
-            return strip_owner(html.unescape(m.group(1)).strip()) if m else ""
+            return strip_owner(connect.title_of(await t.content()))
         except Exception:
             return ""
     async def _label(self, t):
-        """Prefix this tab's title with its owner, best effort.
-
-        Best effort on purpose: a single-page app rewrites document.title whenever it likes, so the
-        label is a convenience for whoever is watching the screen, never something the code relies
-        on. Failing to set it must never fail the navigation that just succeeded."""
+        """Prefix this tab's title with its owner. Best effort: an SPA rewrites its title at will,
+        and a failed label must never fail the navigation."""
         owner = self.owners.get(t.target_id)
         if not owner:
             return
         try:
             await t.evaluate(
-                # \\s, not \s: this is a JS regex escape, and as a Python escape it does not exist \u2014
-                # every import warned, and the log was mostly that warning. Issue #9.
+                # \\s: a JS regex escape inside a Python string (#9).
                 "(()=>{const m=%r,o=%r;const t=document.title.replace(/^\u27e6[^\u27e7]*\u27e7\\s*/,'');"
                 "document.title=m+o+'\u27e7 '+t;return 1})()" % (OWNER_L, owner), isolated=True)
         except Exception:
@@ -844,31 +743,28 @@ class ND:
         """Authoritative current url: Tab.url comes from target events and can lag, so ask the page."""
         try: return await (t or self.tab).evaluate("location.href", isolated=True)
         except Exception: return ""
-    def _is_chal(self, t, h):
-        t=(t or "").lower(); h=(h or "").lower()
-        return any(k in t for k in CHALLENGE) or "verify you are human" in h
     async def _solve(self, tries=20, tab=None):
-        tb = await self._tab(tab)
+        passed, i = await self._solve_on(await self._tab(tab), tries)
+        return {"passed": passed, "iter": i}
+    async def _solve_on(self, t, tries):
+        """Click the checkbox until the page is no longer a challenge: (passed, iterations)."""
         for i in range(tries):
-            t=await tb.evaluate("document.title", isolated=True); h=await tb.content()
-            if not self._is_chal(t,h): log("solved",i=i); return {"passed":True,"iter":i}
-            if await self._click_challenge(tb): log("clicked",i=i)
-            await asyncio.sleep(1)
-        return {"passed":False,"iter":tries}
-    async def _click_challenge(self, t):
-        """Click the "verify you are human" checkbox if it is on the page; True if clicked."""
-        try:
-            hit = await t.find_text("verify you are human", timeout=3)
-            if hit:
-                await hit.click(); await asyncio.sleep(4)
-                return True
-        except Exception as e:
-            log("click_err", e=str(e)[:50])
-        return False
+            title, page = await t.evaluate("document.title", isolated=True), await t.content()
+            if not connect.title_is_challenge(title, page):
+                log("solved", i=i)
+                return True, i
+            try:
+                hit = await t.find_text("verify you are human", timeout=FIND_TIMEOUT)
+                if hit:
+                    await hit.click(); log("clicked", i=i)
+                    await asyncio.sleep(AFTER_CLICK)
+            except Exception as e:
+                log("click_err", e=str(e)[:50])
+            await asyncio.sleep(SOLVE_PAUSE)
+        return False, tries
     async def _text(self, tab=None):
         t = await self._tab(tab)
-        # The html carries the label too, inside <title> — mode="html" handed it straight to the
-        # caller while the `title` field beside it was clean (#16).
+        # The html's <title> carries the label too (#16).
         return {"title":strip_owner(await t.evaluate("document.title", isolated=True)),
                 "html":unlabel(await t.content(), self.owner_of(t)),
                 "url": await self._href(t)}
@@ -884,10 +780,7 @@ class ND:
         await t.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": float(x), "y": float(y)})
         return {"ok":1,"x":x,"y":y}
     async def _click(self, x, y, tab=None):
-        t = await self._tab(tab)
-        for ty in ("mousePressed","mouseReleased"):
-            await t.send("Input.dispatchMouseEvent", {"type": ty, "x": float(x), "y": float(y),
-                                                      "button": "left", "clickCount": 1})
+        await (await self._tab(tab)).click(x, y)
         return {"ok":1,"x":x,"y":y}
     async def _key(self, key, tab=None):
         tb = await self._tab(tab)
@@ -903,12 +796,10 @@ class ND:
             await tb.send("Input.dispatchKeyEvent", {"type": "char", "text": key})
         return {"ok":1,"key":key}
     async def _maybe_recycle(self):
-        """Replace Chrome past CHROME_MAX_TABS open tabs or CHROME_MAX_FETCHES tabs opened (#23).
-
-        Checked BEFORE a tab is opened, so the caller's new tab lands in the fresh browser. Every
-        other agent's tab goes with the old one: their tags are tombstoned, not deleted, so their
-        next op re-opens the tab (#14) instead of failing. The cleared Turnstile session and logins
-        go too unless PH_PROFILE is persistent — hence the loud log line, and the high defaults."""
+        """Replace Chrome past CHROME_MAX_TABS open or CHROME_MAX_FETCHES opened (#23).
+        - Checked before a newtab, so the caller's tab lands in the fresh browser.
+        - Other agents' tags become tombstones: their next op re-opens the tab (#14).
+        - The cleared session and logins go too, unless the profile is persistent."""
         if self.browser is None or self.gone():
             return
         n = self.tab_count()
@@ -924,9 +815,8 @@ class ND:
         self.owners.clear()
         await self._ensure()
     async def _repoint(self, why):
-        """Make self.tab a live, untagged page again after the current tab vanished (#22): the first
-        untagged page Chrome still has, else a fresh about:blank. Chrome itself is fine here, so
-        this never forget()s the browser, and the session and every tagged tab survive."""
+        """The active tab vanished but Chrome is fine (#22): make the first untagged page (or a new
+        about:blank) active. Never forget()s the browser."""
         await self._refresh()
         tagged = {v for v in self.tags.values() if v}
         for t in self.browser.tabs:
@@ -976,7 +866,7 @@ class ND:
         except TimeoutError:
             def reap(f):
                 if not f.cancelled() and f.exception() is None:
-                    asyncio.ensure_future(self._close_tab_obj(f.result()))
+                    self.spawn(self._close_tab_obj(f.result()))
             task.add_done_callback(reap)
             self.newtab_strikes += 1
             log("newtab_timeout", limit_s=NEWTAB_TIMEOUT, elapsed_s=round(time.monotonic() - t0, 2),
@@ -985,23 +875,20 @@ class ND:
                 self.newtab_strikes = 0
                 self.forget(f"newtab unanswered {NEWTAB_STRIKES}x in a row")   # next op reattaches
             raise NewTabTimeout(
-                f"Chrome did not open a tab within {NEWTAB_TIMEOUT}s (worst seen is under 0.4 s). "
+                f"Chrome did not open a tab within {NEWTAB_TIMEOUT}s. "
                 f"Retry: after {NEWTAB_STRIKES} in a row the engine reconnects to the same Chrome."
             ) from None
         self.newtab_strikes = 0
         return t
     async def _newtab_raw(self, url="about:blank", tag=None, owner=None):
-        """Open a tab and register its tag/owner. Returns the Tab OBJECT — _tab() needs that to hand
-        a re-opened tab straight back to the op that asked for it."""
+        """Open a tab, register its tag/owner, return the Tab (for _tab() to hand straight back)."""
         await self._ensure()
         check_headroom("a new tab")
         await self._maybe_recycle()
         self.fetches += 1
         t = await self._open_target(url)
         if not tag:
-            # A tagged tab is its owner's, driven by tag. Making it current too meant its closing
-            # took every untagged op down with it (#22).
-            self.tab = t
+            self.tab = t                # only untagged tabs become active (#22)
         tid = t.target_id
         if tag:
             self.tags[tag] = tid
@@ -1010,32 +897,20 @@ class ND:
         return t
 
     async def _newtab(self, url="about:blank", tag=None, owner=None):
-        """Open a tab and, optionally, TAG it as yours.
-
-        A tag is how one agent keeps its work separate from another's inside a single shared
-        browser: pass it back as `tab` on later ops and they act on your page regardless of what
-        anyone else does to the active tab."""
+        """Open a tab; a `tag` makes it yours: pass it as `tab` on later ops."""
         t = await self._newtab_raw(url, tag, owner)
         return {"ok":1,"url":url,"index":self._tab_index(t),"tag":tag,"owner":owner,
                 "target_id":t.target_id}
-    # --- tab management: playwrong is ONE shared long-running browser that many agents SHARD by opening
-    # their own tabs. Agents MUST track and CLOSE their tabs when done (else tabs/renderers leak — a
-    # single-tab crawler that opened 8 tabs/run and never closed them left 22 orphan renderers). These
-    # verbs let an agent enumerate the live tabs and close the ones it owns WITHOUT killing the server. ---
+    # --- tab management: agents shard the one browser by tab and close what they open ---
     def _tab_index(self, tab):
-        try:
-            for i, t in enumerate(self.browser.tabs):
-                if t is tab: return i
-        except Exception: pass
-        return -1
+        return next((i for i, t in enumerate(self.browser.tabs) if t is tab), -1)
     async def _refresh(self):
         """Re-read the tab list from Chrome. Target events keep it live, but an answer that callers
         rely on (closetab's `remaining`) should come from Chrome itself."""
         try: await self.browser.refresh()
         except Exception as e: log("refresh_err", e=str(e)[:60])
     async def _tabs(self):
-        """List every open tab: index, url, title, and whether it's the server's 'active' tab. Agents
-        use this to track what they opened and find tabs to close."""
+        """Every open tab: index, url, title, active, tag, owner, target_id."""
         await self._ensure(); await self._refresh()
         by_id = {v: k for k, v in self.tags.items() if v}   # skip tombstones: None is not an id
         out=[]
@@ -1046,16 +921,8 @@ class ND:
                         "owner":self.owners.get(t.target_id),"target_id":t.target_id})
         return {"tabs":out,"count":len(out)}
     def _forget_tags(self, ids):
-        """Tombstone tags whose tab we just closed, and drop those tabs' owners.
-
-        The tag is kept with a None target rather than deleted, because a deleted tag is
-        indistinguishable from one that was never registered — and _tab() has to tell them apart: a
-        known-but-dead tag is re-opened (#14), an unknown one is still a mistake worth raising. The
-        first version of this deleted them, and the regression test caught it immediately: goto on
-        the swept tag failed with `tags: []`.
-
-        Tombstones are capped: a long-lived engine meets a lot of one-shot tags, and there is no
-        reason to remember every agent that ever ran."""
+        """Tombstone (tag -> None) the tags of closed tabs and drop their owners. A tombstone is
+        re-opened on use (#14), unlike an unknown tag; the oldest beyond 128 are dropped."""
         ids = {i for i in ids if i}
         for tag, tid in list(self.tags.items()):
             if tid in ids:
@@ -1067,31 +934,22 @@ class ND:
             del self.tags[tag]
 
     async def _await_closed(self, ids):
-        """Wait until Chrome has actually destroyed the targets we asked it to close.
-
-        close_target is acknowledged immediately but the target is torn down asynchronously, so a
-        refresh taken right after the call still lists the tab — which made "remaining" report a
-        phantom leak on a tab that closed perfectly well. Observed teardown is single-digit ms; poll
-        at 50ms and give up after 2s, at which point the tab really is stuck and the honest answer is
-        to report it still open."""
+        """Wait until Chrome has torn the closed targets down (closeTarget acks first), so
+        `remaining` is true. Teardown takes ms; past CLOSE_SETTLE the tab is reported still open."""
         if not ids: return
-        deadline = asyncio.get_event_loop().time() + 2.0
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + CLOSE_SETTLE
+        while time.monotonic() < deadline:
             await self._refresh()
             live = {t.target_id for t in self.browser.tabs}
             if not (ids & live): return
             await asyncio.sleep(0.05)
         log("close_timeout", ids=",".join(str(i) for i in ids))
     async def _closetab(self, index=None, url=None, keep_first=True, tag=None):
-        """Close a tab by index OR by url-substring match. keep_first protects tab 0 (the server's base
-        tab). Never closes the last remaining tab. Returns how many were closed. This is how agents
-        clean up their shard — NOT by killing the server."""
+        """Close by tag (preferred: a target id never shifts), index or url substring. Never the
+        last tab; keep_first protects the base tab 0."""
         await self._ensure(); await self._refresh()
         tabs=list(self.browser.tabs)
         if len(tabs)<=1: return {"closed":0,"reason":"only one tab; refusing to close the last"}
-        # By TAG first: under concurrency an index is stale the moment another caller closes a
-        # lower-numbered tab, so index-based cleanup starts closing other agents' tabs (or missing
-        # its own and reporting a leak). A tag resolves to a target id, which never shifts.
         want_id = self.tags.get(tag) if tag else None
         targets=[]
         for i, t in enumerate(tabs):
@@ -1110,24 +968,15 @@ class ND:
             except Exception as e:
                 log("closetab_err",i=i,e=str(e)[:80])
         await self._await_closed(ids)  # so "remaining" is the truth, not a mid-teardown snapshot
-        # By target id, not just the tag the caller named: closing tab 3 by index also strands
-        # whoever's tag pointed at it, which the tag-only prune missed entirely (#14).
-        self._forget_tags(ids)
+        self._forget_tags(ids)         # by target id: any tag pointing at a closed tab (#14)
         if self.tab not in self.browser.tabs:
             await self._repoint("closetab")     # not tabs[0]: that may be another agent's tab
         return {"closed":closed,"remaining":len(self.browser.tabs)}
     async def _closeextra(self, owner=None, force=False):
-        """Clean up leaked tabs — YOURS, and those of agents that are gone. Base tab (0) is untouched.
-
-        This used to close every tab except the base one, whoever opened it, which made one agent's
-        tidy-up everyone else's lost page mid-navigation. Worse, it was the documented recovery for a
-        wedged session (#13), so an agent following the docs took out every other agent on the shared
-        browser. Ownership is advisory — force=True still sweeps everything, for the human who
-        genuinely means "clear this browser" — but the default no longer damages bystanders.
-
-        Closed: tabs owned by `owner`, tabs whose owning process has exited, and unlabelled tabs when
-        the caller gives no owner. Skipped tabs are REPORTED with their owner, so a caller seeing a
-        smaller count than it expected learns why instead of guessing."""
+        """Close leaked tabs except the base tab (0), never a live agent's (#13, #15).
+        - Closes: tabs owned by `owner` (or unlabelled ones when no owner), and tabs whose owner
+          process has exited. `force` closes everything.
+        - Skipped tabs are reported with their owner."""
         await self._ensure(); await self._refresh()
         n=0; ids=set(); skipped=[]
         for t in list(self.browser.tabs)[1:]:
@@ -1150,12 +999,7 @@ class ND:
                          f"still running. Pass force=true only if you mean to close their pages.")
         return out
     async def _js(self, expr, tab=None):
-        """Evaluate in the page, RESOLVING promises.
-
-        Without await_promise an async expression handed back a bare Promise, which serialised to
-        null — so `js` looked like it silently returned nothing for anything async. Top-level `await`
-        is also not valid inside a CDP evaluate, so an expression starting with it is wrapped in an
-        async IIFE rather than being rejected."""
+        """Evaluate in the page; promises resolved, values returned as JSON (JS_WRAP)."""
         t = await self._tab(tab)
         try:
             # Main world on purpose: callers read page globals. Engine-internal reads are isolated (#49).
@@ -1172,56 +1016,36 @@ class ND:
             return {"result": unlabel(raw, owner)}
         if isinstance(val, dict) and "__playwrong_error" in val:
             return {"error": f"js exception: {val['__playwrong_error']}"}
-        # document.title is the obvious case, but any expression reading a title hits it.
         return {"result": unlabel(val, owner)}
-    # ── prefetch: fire a batch of urls, collect them when they are ready ─────────────────────────
-    # A page load is mostly WAITING. Fetching ten urls one at a time serialises ten waits; loading
-    # them in N tabs at once overlaps them, and the caller reads results as they land instead of
-    # blocking on the slowest page. Same one browser — each url gets its own tab, so nothing
-    # contends, and the tab is closed the moment its page has been captured.
+    # ── prefetch: load many urls in parallel tabs; collect each as it lands ─────────────────────
     async def _prefetch(self, urls, concurrency=8, solve=True, tries=20, timeout=30, owner=None):
-        """Start a batch and return IMMEDIATELY with a job id. Nothing here blocks the caller."""
+        """Start a batch; returns a job id immediately."""
         await self._ensure()
-        self._jobn = getattr(self, "_jobn", 0) + 1
+        self._jobn += 1
         job = f"job{self._jobn}"
         urls = [u for u in (urls or []) if u]
-        # Slots are keyed by INDEX, not url. Keying by url silently collapsed a batch that contained
-        # the same url twice — "asked 3, got 2" — and any caller waiting for all of them then waited
-        # forever. Duplicates in a url list are completely ordinary.
+        # Slots keyed by index, not url: a batch may repeat a url.
         self.jobs[job] = {"slots": {}, "total": len(urls), "delivered": 0, "t": time.monotonic()}
         self._reap_jobs()
-        asyncio.ensure_future(self._batch(job, urls, concurrency, solve, tries, timeout, owner))
+        self.spawn(self._batch(job, urls, concurrency, solve, tries, timeout, owner))
         return {"job": job, "count": len(urls), "concurrency": concurrency, "timeout": timeout}
 
     def _reap_jobs(self):
-        """Keep finished jobs queryable for a while, then drop the oldest.
-
-        A drained job used to be deleted outright, so a caller that polled once more — the obvious
-        way to check "am I done yet" — got "no such job" instead of "nothing left". Keeping the last
-        20 makes the answer honest without growing without bound; bodies are already gone by then,
-        so what remains is a counter."""
+        """Keep the last 20 drained jobs (so a poll answers "nothing left", not "no such job"); drop
+        jobs untouched for JOB_IDLE (a client that died mid-batch never collects, #23)."""
         done = [j for j, d in self.jobs.items() if d.get("total", 0) <= d.get("delivered", 0)
                 and not d.get("slots")]
         for j in done[:-20]:
             self.jobs.pop(j, None)
-        # A client that died mid-batch never collects, so its bodies would sit here forever (#23).
-        # 10 min is 20x the default 30s per-url timeout: no live caller waits that long to collect.
         now = time.monotonic()
-        for j in [j for j, d in self.jobs.items() if now - d.get("t", now) > 600]:
+        for j in [j for j, d in self.jobs.items() if now - d.get("t", now) > JOB_IDLE]:
             log("job_reaped", job=j, slots=len(self.jobs[j].get("slots", {})))
             self.jobs.pop(j, None)
 
     async def _batch(self, job, urls, concurrency, solve, tries, timeout=30, owner=None):
-        """Load every url, at most `concurrency` at a time, each in its own tab.
-
-        PER-URL DEADLINE, not just a batch one. Measured on a real run: 7 of 8 pages finished in 3
-        seconds while a single wedged page held the batch for 104 more — exactly the stall this
-        feature exists to remove. A page that has not finished within `timeout` is recorded as timed
-        out and its tab closed, so one bad url costs one slot, never the whole batch.
-
-        `timeout` covers the load AND any Turnstile solve, so raise it for challenge-heavy batches:
-        a solve legitimately spends 10-30s clicking and waiting.
-        """
+        """Load every url, `concurrency` at a time, each in its own tab.
+        - Per-url deadline: one wedged page costs one slot, never the batch.
+        - `timeout` covers the load AND any Turnstile solve (10-30 s): raise it for walled sites."""
         sem = asyncio.Semaphore(max(1, int(concurrency)))
         slots = self.jobs[job]["slots"]
 
@@ -1233,21 +1057,15 @@ class ND:
                 self.owners[t.target_id] = owner   # a batch tab is short-lived but still someone's
             await t.navigate(url)
             await self._label(t)
-            await asyncio.sleep(2)
+            await asyncio.sleep(SETTLE)
             state = await self._loaded(t)
             title = await t.evaluate("document.title", isolated=True)
             html = await t.content()
-            passed = None
-            if solve and self._is_chal(title, html):
-                passed = False
-                for _ in range(tries):
-                    title = await t.evaluate("document.title", isolated=True)
-                    html = await t.content()
-                    if not self._is_chal(title, html):
-                        passed = True
-                        break
-                    await self._click_challenge(t)
-                    await asyncio.sleep(1)
+            passed = None                       # None = never challenged
+            if solve and connect.title_is_challenge(title, html):
+                passed, _ = await self._solve_on(t, tries)
+                title = await t.evaluate("document.title", isolated=True)
+                html = await t.content()
             try: href = await t.evaluate("location.href", isolated=True)
             except Exception: href = url
             slots[i] = {"status": "ready", "title": strip_owner(title), "html": html, "url": href,
@@ -1262,9 +1080,7 @@ class ND:
                 try:
                     await asyncio.wait_for(load(i, url, tabs), timeout=timeout)
                 except TimeoutError:
-                    # A load that never "finishes" usually still RENDERED — pypi.org does exactly
-                    # this, holding a connection open long after the content is there. Take what
-                    # rendered instead of discarding a good capture.
+                    # A load that never "finishes" usually still rendered: keep what is there.
                     slots[i] = await self._partial(tabs.get(i), url, timeout)
                     log("prefetch_timeout", url=url[:60], salvaged=slots[i]["status"])
                 except Exception as e:
@@ -1281,12 +1097,12 @@ class ND:
         log("prefetch_done", job=job, n=len(urls))
 
     async def _partial(self, t, url, timeout):
-        """Best-effort capture from a tab whose load never completed. Returns a ready result when
-        there is real content, otherwise an honest error."""
+        """What a timed-out tab rendered, flagged partial; an error when there is no real page."""
         if t is not None:
             try:
-                title = await asyncio.wait_for(t.evaluate("document.title", isolated=True), timeout=5)
-                html = await asyncio.wait_for(t.content(), timeout=10)
+                title = await asyncio.wait_for(t.evaluate("document.title", isolated=True),
+                                               PARTIAL_READ_TIMEOUT)
+                html = await asyncio.wait_for(t.content(), PARTIAL_READ_TIMEOUT)
                 if html and len(html) > 500:      # enough to be a page, not a blank shell
                     return {"status": "ready", "title": title, "html": html, "url": url,
                             "requested": url, "partial": True}
@@ -1311,11 +1127,8 @@ class ND:
         return {"jobs": [summarise(j, d) for j, d in self.jobs.items()]}
 
     async def _collect(self, job, drain=True):
-        """Hand back every result that is READY, and by default forget it.
-
-        Draining matters: a batch of pages is tens of MB of HTML, and holding it after the caller has
-        read it is a slow leak in a long-lived server. The job record itself survives so that asking
-        again returns "nothing left" rather than "no such job"."""
+        """Every finished result; drained by default (pages are MBs of HTML). The job record stays,
+        so a later call answers "nothing left"."""
         d = self.jobs.get(job)
         if not d:
             return {"error": f"no such job {job!r}"}
@@ -1348,9 +1161,8 @@ class ND:
         cks = await self.browser.cookies()
         return {"cookies":[{"name":c["name"],"value":c["value"],"domain":c.get("domain")} for c in cks]}
     def do(self, op, a):
+        # Driving ops take an optional `tab` (tag or index); without it they act on the active tab.
         m={"start":lambda:self._start(),
-           # every driving op takes an optional `tab` (a tag, or an index) so concurrent callers
-           # never have to rely on which tab happens to be active
            "goto":lambda:self._goto(a["url"],a.get("tab"),a.get("no_js",False)),
            "solve":lambda:self._solve(a.get("tries",20),a.get("tab")),
            "text":lambda:self._text(a.get("tab")),"shot":lambda:self._shot(a.get("tab")),
@@ -1373,10 +1185,8 @@ class ND:
            "jobs":lambda:self._jobstatus(a.get("job")),
            "collect":lambda:self._collect(a.get("job"),a.get("drain",True))}
         if op not in m: return {"error":f"unknown {op}"}
-        # Two attempts, and only for a dropped browser connection. Chrome can die between _ensure()
-        # and the op — the check there is cheap, not atomic — and the op then fails having done
-        # nothing, so re-running it is safe. Dropping the dead handles first makes attempt 2 relaunch
-        # via _ensure(). Any other error is returned on the first attempt, unretried.
+        # Retried once, only for a dropped browser connection (the op did nothing; attempt 2
+        # relaunches) or a lost active tab (#22). Anything else returns on the first attempt.
         for attempt in (1, 2):
             try: return self.run(m[op]())
             except Exception as e:
@@ -1385,8 +1195,6 @@ class ND:
                     crash = self.run(self._crash_for(a.get("tab")))
                     if crash is not None:
                         dead, e = False, crash
-                # Log the traceback, not just repr(e): a bare "OverflowError(...)" with no file or
-                # line is nearly useless when the cause is three frames down in a helper.
                 log("op_err",op=op,e=repr(e)[:120],dead_conn=dead,attempt=attempt,
                     where="|".join(traceback.format_exc().strip().splitlines()[-3:])[:300])
                 if dead and attempt == 1:
@@ -1401,43 +1209,20 @@ class ND:
                 if dead:
                     return {"error": f"browser connection lost and the relaunch did not take: "
                                      f"{e!r}"[:200]}
-                # 160 cut the Chrome launch failure off mid-sentence ("One of ..."), losing the
-                # only part that named a cause (#21). 600 holds a multi-line launch error whole.
-                return {"error":repr(e)[:600]}
+                return {"error":repr(e)[:600]}      # 600: a whole multi-line launch error (#21)
 
 B = ND()
-MARKERS={"aim":None,"cursor":None,"path":[],"box":None,"ollama":None}
-VIZ_HTML="""<!doctype html><meta charset=utf-8><title>nd viz</title>
-<style>body{margin:0;font:13px monospace;background:#111;color:#ddd;display:flex;height:100vh}
-#l{flex:1;position:relative}#r{width:280px;padding:10px}img{width:100%}#ov{position:absolute;inset:0}</style>
-<div id=l><img id=s><canvas id=ov></canvas></div><div id=r><b>nd viz</b><div id=i></div></div>
-<script>const s=document.getElementById('s'),ov=document.getElementById('ov'),inf=document.getElementById('i');
-async function t(){s.src='/frame?'+Date.now();const m=await(await fetch('/markers')).json();
-await s.decode().catch(()=>{});ov.width=s.clientWidth;ov.height=s.clientHeight;
-const sx=s.clientWidth/(s.naturalWidth||1),sy=s.clientHeight/(s.naturalHeight||1),c=ov.getContext('2d');
-c.clearRect(0,0,ov.width,ov.height);
-if(m.box){c.strokeStyle='lime';c.lineWidth=2;c.strokeRect(m.box[0]*sx,m.box[1]*sy,(m.box[2]-m.box[0])*sx,(m.box[3]-m.box[1])*sy);}
-if(m.aim){c.strokeStyle='red';c.strokeRect(m.aim[0]*sx-12,m.aim[1]*sy-12,24,24);}
-let o=m.ollama||{};inf.innerHTML='model '+(o.model||'-')+'<br>time '+(o.ms||'-')+'ms<br>conf '+(o.confidence||'-')+'<br>'+(o.description||'');}
-setInterval(t,100);t();</script>"""
+
+# Graceful Chrome stop on shutdown: Browser.close, then SIGTERM, then SIGKILL, each STOP_TIMEOUT
+# (cdp.py), plus margin. On expiry we exit anyway; scripts/cleanup_orphans.py collects the rest.
+SHUTDOWN_TIMEOUT = 3 * cdp.STOP_TIMEOUT + 2
 
 def _shutdown(code=0):
-    """Stop the BROWSER, then exit.
-
-    This used to be a bare os._exit(0). The HTTP process died instantly and Chrome — a separate
-    process tree that nothing else was driving — kept running forever on its throwaway profile. Every
-    `playwrong --stop` therefore leaked an entire browser: 12 of them were found holding 15.7 GB, all
-    from one afternoon of testing. They are easy to miss because a headed window just sits there
-    behind everything else.
-
-    So: close the browser first, and only then exit. The stop is bounded (10s) because a wedged
-    browser must not turn "stop" into "hang" — if it will not go quietly we exit anyway and
-    scripts/cleanup_orphans.py can collect the remains.
-    """
+    """Stop the browser, THEN exit: exiting first left Chrome running with nothing driving it."""
     try:
         if B.browser is not None:
             fut = asyncio.run_coroutine_threadsafe(_stop_browser(), B.loop)
-            fut.result(timeout=10)
+            fut.result(timeout=SHUTDOWN_TIMEOUT)
             log("browser_stopped")
     except Exception as e:
         log("shutdown_err", e=repr(e)[:120])
@@ -1455,9 +1240,7 @@ async def _stop_browser():
 
 class H(BaseHTTPRequestHandler):
     def _j(self,o,c=200):
-        # default=str so ONE unserialisable value can never kill the response. Without it the
-        # encoder raises after send_response, the client sees "Remote end closed connection without
-        # response", and the real cause is buried in the server's stdout log.
+        # default=str: one unserialisable value must never kill the response mid-flight.
         b=json.dumps(o,default=str).encode();self.send_response(c)
         self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(b)))
         self.end_headers();self.wfile.write(b)
@@ -1466,16 +1249,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length",str(len(b)));self.end_headers();self.wfile.write(b)
     def log_message(self,*a):pass
     def do_GET(self):
-        # alive = a browser that is actually there, not one we once launched. It used to report
-        # `B.tab is not None`, which stays true forever after the first launch — so /status, and
-        # doctor.py reading it, called a dead engine healthy while every op failed. Issue #8.
         if self.path=="/status":
-            # A real round trip, not an inference. `alive` used to be `B.tab is not None`, true
-            # forever after the first launch — so this endpoint, and doctor.py reading it, certified
-            # a dead engine as healthy (#8). The process check alone is not enough either: in #6
-            # Chrome was still running with a dead socket. probe() answers None when the loop is
-            # merely busy, and then the cheap answer stands, because busy is not broken.
-            try: p = B.run_timeout(B.probe(), 3.0)
+            # alive = a real round trip (#8: "launched once" read as healthy; #6: process up, socket
+            # dead). None from probe = the loop is busy; then the cheap check stands.
+            try: p = B.run_timeout(B.probe(), STATUS_PROBE_TIMEOUT)
             except Exception: p = None
             self._j({"server":True,"alive":B.ok() if p is None else bool(p),
                      "launched":B.tab is not None,"chrome_pid":B.chrome_pid(),
@@ -1483,11 +1260,6 @@ class H(BaseHTTPRequestHandler):
                      "memory_cap":MEMORY_CAP,"rss_limit_mb":RSS_LIMIT >> 20,"headless":HEADLESS,
                      "display":os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"),
                      "display_mode":DISPLAY_MODE or "desktop"})
-        elif self.path=="/viz":self._raw(VIZ_HTML.encode(),"text/html")
-        elif self.path.startswith("/frame"):
-            try:self._raw(B.run(B._frame()),"image/png")
-            except Exception:self._raw(b"","text/plain",500)
-        elif self.path=="/markers":self._j(MARKERS)
         elif self.path=="/tabs":
             try:self._j(B.run(B._tabs()))
             except Exception as e:self._j({"error":str(e)[:120]},500)
@@ -1498,14 +1270,11 @@ class H(BaseHTTPRequestHandler):
         try:
             a=json.loads(raw)
         except ValueError as e:
-            # Parsing outside a try dropped the connection mid-response, so the client saw
-            # "Remote end closed connection without response" and no clue why.
             self._j({"error":f"invalid JSON body: {e}"},400); return
         if not isinstance(a, dict):
             self._j({"error":"body must be a JSON object"},400); return
         op=self.path.strip("/")
         if op=="shutdown":self._j({"ok":1});threading.Thread(target=_shutdown).start();return
-        if op=="setmarkers":MARKERS.update(a);self._j(MARKERS);return
         if op=="_test_stall_newtab" and os.environ.get("PH_TEST_HOOKS")=="1":
             B.test_stalls = int(a.get("n", 1)); self._j({"ok":1}); return
         if op=="_test_forget" and os.environ.get("PH_TEST_HOOKS")=="1":
@@ -1525,18 +1294,9 @@ class H(BaseHTTPRequestHandler):
             with _INFLIGHT_LOCK: _INFLIGHT[0]-=1
 
 def _already_serving(port):
-    """Is a healthy engine already on this port? Then this process must not become a second one.
-
-    Belt and braces behind connect.ensure()'s spawn lock: anything at all can start server.py — a
-    stale script, a race, a user in a terminal — and a second engine on the same port means a second
-    Chrome, split state, and a browser nobody closes. Cheap to check, and the failure it prevents
-    (255 browsers from one runaway loop) is expensive."""
-    import urllib.request
-    try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=3).read()
-        return True
-    except Exception:
-        return False
+    """Is an engine already answering on this port? Then this process must not start a second one
+    (backs up connect.ensure()'s spawn lock against anything else starting server.py)."""
+    return connect.reachable(port, timeout=STATUS_PROBE_TIMEOUT)
 
 
 if __name__=="__main__":

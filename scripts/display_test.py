@@ -1,9 +1,9 @@
-"""display_test.py — prove ensure_display() adopts the desktop session, or fails naming itself.
+"""display_test.py — engine startup without a usable display fails by name, and fast.
 
-Guards the regression where an engine spawned from a shell with no DISPLAY (ssh, remote editor,
-after a reboot) failed every launch with a misleading "running as root" hint.
-
-No browser, no real display: fake X11/run dirs under tmp/, driven with an explicit env dict.
+- ensure_display() adopts the user's X/Wayland session when DISPLAY is unset, or raises "no display"
+  (fake X11/run dirs under tmp/).
+- An engine that dies while starting fails connect.ensure() at once with its own error (#53),
+  on isolated port 8738. No browser either way.
 
     python scripts/display_test.py
 
@@ -36,10 +36,39 @@ def ok(name, cond, detail=""):
 def load_server():
     # server.py runs as a script and imports its siblings (cdp, memcap) bare: give it engine/ too.
     sys.path.insert(0, os.path.join(REPO, "engine"))
-    spec =importlib.util.spec_from_file_location("pw_server", os.path.join(REPO, "engine", "server.py"))
+    spec = importlib.util.spec_from_file_location("pw_server", os.path.join(REPO, "engine", "server.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def engine_dies_at_startup(port=8738):
+    """#53: an engine that exits while starting (here: PH_DISPLAY=xvfb, no Xvfb on PATH) must fail
+    connect.ensure() at once, with the engine's own error, not after the 30 s bind wait."""
+    import time
+
+    from engine import connect
+    if connect.reachable(port):
+        ok("engine startup failure is reported at once", False, f"something already on :{port}")
+        return
+    saved = {k: os.environ.get(k) for k in ("PATH", "PH_DISPLAY")}
+    os.environ["PATH"] = os.path.dirname(sys.executable)   # python only: no Xvfb, no systemd-run
+    os.environ["PH_DISPLAY"] = "xvfb"
+    t0 = time.monotonic()
+    try:
+        connect.ensure(port, want_browser=False)
+        ok("engine startup failure is reported at once", False, "ensure() returned")
+    except connect.EngineError as e:
+        dt = time.monotonic() - t0
+        ok("engine startup failure is reported at once",
+           "exited during startup" in str(e) and dt < 10, f"{dt:.1f}s: {str(e)[:90]}")
+        ok("...with the engine's own error", "Xvfb" in str(e), str(e)[-120:])
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def dirs(base, x11=(), run=()):
@@ -84,6 +113,7 @@ def main():
         except RuntimeError as e:
             ok("no display raises, naming itself", "no display" in str(e), str(e)[:80])
 
+    engine_dies_at_startup()
     say(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
 
