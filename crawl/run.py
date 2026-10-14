@@ -37,11 +37,8 @@ def _same_site(url, hosts):
     """True only if url's host EQUALS one of `hosts` or is a dot-boundary subdomain of it. A raw
     suffix match (endswith) would let `evilsnowtravelbooker.com` pass for `snowtravelbooker.com` —
     a scope-escape / SSRF-adjacent bug — so we match on a host boundary and strip the port."""
-    try:
-        netloc = urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
-        return any(netloc == h or netloc.endswith("." + h) for h in hosts)
-    except Exception:
-        return False
+    host = _host_of(url)
+    return bool(host) and any(host == h or host.endswith("." + h) for h in hosts)
 
 
 def _host_of(url):
