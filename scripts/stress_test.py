@@ -223,6 +223,29 @@ def t_window():
         connect.call("closetab", port=PORT, tag=tag)
 
 
+def t_cdp_passthrough():
+    """The cdp op: endpoint with no method; raw CDP on a tagged tab or the browser; Chrome's own
+    error for a bad method."""
+    tag = "stress-cdp"
+    connect.call("newtab", port=PORT, url="about:blank", tag=tag)
+    try:
+        ep = connect.call("cdp", port=PORT)
+        ok("cdp with no method returns the endpoint", "host" in ep and "port" in ep, json.dumps(ep))
+        r = connect.call("cdp", port=PORT, body={"method": "Runtime.evaluate", "tab": tag,
+                                                 "params": {"expression": "6*7", "returnByValue": True}})
+        ok("raw CDP on a tagged tab", r.get("result", {}).get("result", {}).get("value") == 42,
+           json.dumps(r)[:90])
+        r = connect.call("cdp", port=PORT, body={"method": "Browser.getVersion", "browser": True})
+        ok("raw CDP on the browser session", "product" in r.get("result", {}), json.dumps(r)[:90])
+        try:
+            connect.call("cdp", port=PORT, body={"method": "No.suchMethod", "tab": tag})
+            ok("a bad CDP method fails with Chrome's message", False)
+        except connect.EngineError as e:
+            ok("a bad CDP method fails with Chrome's message", "No.suchMethod" in str(e), str(e)[:90])
+    finally:
+        connect.call("closetab", port=PORT, tag=tag)
+
+
 # ── protocol robustness ─────────────────────────────────────────────────────────────────────────
 
 def t_malformed():
@@ -287,7 +310,8 @@ def main():
 
     for fn in (t_duplicate_urls, t_bad_urls, t_empty_and_unknown, t_drain_once,
                t_more_than_concurrency, t_tabs_return_to_baseline, t_bad_tag, t_close_twice,
-               t_batch_plus_interactive, t_owner_labelling, t_window, t_malformed, t_parallel_ops,
+               t_batch_plus_interactive, t_owner_labelling, t_window, t_cdp_passthrough,
+               t_malformed, t_parallel_ops,
                t_processes):
         try:
             fn()

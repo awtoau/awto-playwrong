@@ -45,8 +45,10 @@ CHROME_CANDIDATES = {
 # --remote-debugging-port=0 makes Chrome report navigator.webdriver = true (scripts/stealth_check.py).
 # IsolateOrigins,site-per-process OFF keeps ordinary cross-origin iframes in-process (pierce reaches
 # them). Turnstile's iframe is out-of-process anyway: find_text handles that via iframe targets (#45).
+# --remote-allow-origins is set per launch to the port's own origin (DevTools frontend), never `*`:
+# `*` let any web page drive the browser (scripts/cdp_surface_check.py). Our client sends no Origin.
 CHROME_FLAGS = [
-    "--remote-allow-origins=*", "--no-first-run", "--no-service-autorun",
+    "--no-first-run", "--no-service-autorun",
     "--no-default-browser-check", "--homepage=about:blank", "--no-pings",
     "--password-store=basic", "--disable-infobars", "--disable-breakpad",
     "--disable-dev-shm-usage", "--disable-session-crashed-bubble",
@@ -121,7 +123,8 @@ async def launch(headless=False, user_data_dir=None, extra_args=None, log_path=N
     udd = tempfile.mkdtemp(prefix=PROFILE_PREFIX) if temp else user_data_dir
     port = _free_port()
     args = [find_chrome(), *CHROME_FLAGS, f"--user-data-dir={udd}",
-            "--remote-debugging-host=127.0.0.1", f"--remote-debugging-port={port}"]
+            "--remote-debugging-host=127.0.0.1", f"--remote-debugging-port={port}",
+            f"--remote-allow-origins=http://127.0.0.1:{port}"]
     if headless:
         args.append("--headless=new")
     if getattr(os, "getuid", lambda: 1)() == 0:

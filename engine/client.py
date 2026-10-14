@@ -25,6 +25,9 @@ CLI:
   client.py cookies
   client.py tabs | closetab [i] | closeextra     # tab hygiene — close what you opened
   client.py newtab | clearcookies
+  client.py cdp                    # the shared browser's CDP endpoint
+  client.py cdp <Method> ['{json}'] [--browser]   # raw CDP on the active tab (or the browser)
+  client.py rightmon               # place the window (PH_RIGHTMON_BOUNDS=x,y,w,h)
   client.py shutdown               # stops the SHARED engine, for everyone
 """
 import base64
@@ -165,6 +168,12 @@ def main(av):
     elif op=="inject": inject_marker(int(av[1]), int(av[2]))
     elif op=="detect": detect()
     elif op=="solvecf": print(call("solve", tries=int(av[1]) if len(av)>1 else 30))
+    elif op=="cdp":
+        args = [x for x in av[1:] if x != "--browser"]
+        # body=: "method"/"params" collide with call()'s own parameters
+        body = {"method": args[0], "params": json.loads(args[1]) if len(args) > 1 else {},
+                "browser": "--browser" in av} if args else {}
+        print(json.dumps(call("cdp", body=body), indent=2, default=str))
     elif op=="rightmon":
         # Set PH_RIGHTMON_BOUNDS=x,y,w,h if you want a specific placement.
         print(call("window", bounds=rightmon_bounds()))

@@ -687,9 +687,15 @@ class ND:
                 json.dump(self._cdp,f)
         except Exception as e:
             self._cdp={"error":str(e)[:120]}
-    async def _cdp_info(self):
+    async def _cdp_op(self, method=None, params=None, tab=None, browser=False):
+        """No method: the shared browser's CDP endpoint. With one: raw passthrough, on the tab's
+        session (`tab`, default the active tab) or the browser's (`browser`). Request/response only;
+        for events, attach your own client to the endpoint."""
         await self._ensure()
-        return getattr(self,"_cdp",{"error":"not published"})
+        if not method:
+            return getattr(self, "_cdp", {"error": "not published"})
+        target = self.browser if browser else await self._tab(tab)
+        return {"result": await target.send(method, params or {})}
     async def _watch_crashes(self):
         """Hear renderer crashes on the browser connection, so a killed tab fails by name (#28).
         Without this, an op on a tab whose renderer the kernel OOM-killed hung until the client
@@ -1358,7 +1364,8 @@ class ND:
            "closetab":lambda:self._closetab(a.get("index"),a.get("url"),a.get("keep_first",True),
                                             a.get("tag")),
            "closeextra":lambda:self._closeextra(a.get("owner"), a.get("force", False)),
-           "cdp":lambda:self._cdp_info(),
+           "cdp":lambda:self._cdp_op(a.get("method"),a.get("params"),a.get("tab"),
+                                     a.get("browser",False)),
            "window":lambda:self._window(a.get("bounds"),a.get("tab")),
            "prefetch":lambda:self._prefetch(a.get("urls"),a.get("concurrency",8),
                                             a.get("solve",True),a.get("tries",20),
