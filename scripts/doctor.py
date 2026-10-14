@@ -14,13 +14,13 @@ import json
 import os
 import platform
 import py_compile
+import shutil
 import socket
 import sys
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
-PORT = int(os.environ.get("PH_PORT", "8731"))
 # See check_engine_op(): 20s separates "busy" from "broken", it is not a hang budget.
 OP_BUDGET = 20
 
@@ -29,6 +29,15 @@ DEPS = [("websockets", "websockets", "CDP transport")]
 
 sys.path.insert(0, os.path.join(REPO, "engine"))
 import cdp  # noqa: E402  (stdlib-only at import; the engine's own Chrome lookup)
+import connect  # noqa: E402  (stdlib-only; the port every entry point would use)
+
+PORT = connect.default_port()
+
+# Optional host tools: (binary, what needs it, how to install). Missing = WARN, the core still works.
+TOOLS = [("pdftotext", "pdf text (pdf tool, --pdf)", "dnf install poppler-utils / apt install poppler-utils"),
+         ("pdfinfo", "pdf page count", "dnf install poppler-utils / apt install poppler-utils"),
+         ("systemd-run", "the engine's memory cap (MemoryMax scope)", "a systemd user session"),
+         ("Xvfb", "PH_DISPLAY=xvfb: test engines off the desktop", "dnf install xorg-x11-server-Xvfb / apt install xvfb")]
 
 RESULTS = []
 
@@ -87,6 +96,14 @@ def check_display():
     else:
         check("display", "FAIL", "no DISPLAY/WAYLAND_DISPLAY — headed Chrome cannot start",
               "run on a desktop session, or start a virtual display (Xvfb :99 & export DISPLAY=:99)")
+
+
+def check_tools():
+    for exe, need, fix in TOOLS:
+        if platform.system() != "Linux" and exe in ("systemd-run", "Xvfb"):
+            continue
+        path = shutil.which(exe)
+        check(exe, "PASS" if path else "WARN", path or f"not found — needed for {need}", fix)
 
 
 def check_tmp():
@@ -239,6 +256,7 @@ def main():
     check_deps()
     check_chrome()
     check_display()
+    check_tools()
     check_tmp()
     check_mcp()
     check_engine_port()

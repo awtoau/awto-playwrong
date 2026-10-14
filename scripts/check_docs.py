@@ -25,8 +25,8 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(REPO, "tmp", "logs")
-DOCS = ["README.md"] + [os.path.join("docs", f) for f in sorted(os.listdir(os.path.join(REPO, "docs")))
-                        if f.endswith(".md")]
+DOCS = ["README.md", "CLAUDE.md", "crawl/AGENTS.md", "helpers/README.md"] + [
+    os.path.join("docs", f) for f in sorted(os.listdir(os.path.join(REPO, "docs"))) if f.endswith(".md")]
 
 # Files that USED to exist. Naming one in a doc is always a bug now — this is the check that would
 # have caught the mcp/server.py rename immediately.

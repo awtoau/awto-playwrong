@@ -1,27 +1,22 @@
 # helpers/
 
-Thin CLI shims for **hand-driving** the shared playwrong browser (click, scroll, screenshot each
-step). The implementation lives in the engine — [`crawl/drive.py`](../crawl/drive.py) — which reuses
-the engine's HTTP client (one code path) and settles **condition-based (no fixed `sleep`)** by polling
-`document.readyState` after each action. These scripts just forward to it, so the old invocation keeps
-working. Prefer the module form in new code.
+CLI shims for hand-driving the shared browser. The code lives in [`crawl/drive.py`](../crawl/drive.py):
+it drives its own tagged tab (`drive`), starts the engine if it's down, and settles after each action
+by polling `document.readyState` (no fixed sleep).
 
-The engine must be running (see [`../docs/AGENT-API.md`](../docs/AGENT-API.md)).
-
-| Script (shim) | Module form | What it does |
+| Shim | Module form | What |
 |---|---|---|
-| `python3 helpers/click.py X Y [OUT]` | `python -m crawl.drive click X Y [OUT]` | click (x,y), settle, screenshot |
+| `python3 helpers/click.py X Y [OUT]` | `python -m crawl.drive click X Y [OUT]` | click, settle, screenshot |
 | `python3 helpers/scroll.py [bottom\|top\|<px>] [OUT]` | `python -m crawl.drive scroll [to] [OUT]` | scroll, settle, screenshot |
-| — | `python -m crawl.drive shot [OUT]` | screenshot the current page |
+| — | `python -m crawl.drive goto URL` | navigate the drive tab |
+| — | `python -m crawl.drive shot [OUT]` | screenshot |
 
-Env:
-- `PH_PORT` — engine port (default `8731`)
-- `PH_OUT_DIR` — screenshot output dir (default `./tmp`)
+Env: `PH_PORT` (default 8731), `PH_OUT_DIR` (default `./tmp`).
 
-Library use:
 ```python
 from crawl import drive
+drive.goto("https://awto.au")
 drive.scroll("bottom", "step1")     # -> tmp/step1.png
-drive.click(1643, 115, "step2")     # click, settle, screenshot
-info = drive.where()                 # {'title':…, 'url':…}
+drive.click(1643, 115, "step2")
+info = drive.where()                # {'title': …, 'url': …}
 ```

@@ -47,5 +47,7 @@ that hits it usually reaches for curl instead of reporting it. So:
   that engine's own `/status` so it can only ever hit its own.
 - Before committing: `python scripts/mcp_selftest.py --port 8739 --shutdown`,
   `python scripts/check_docs.py`, `uvx ruff check .`.
+- Docs: README is the index (features, install, env, files, tests); MCP.md, AGENT-API.md and
+  crawl/AGENTS.md go deep. State a fact once and link to it.
 - `check_docs.py` runs both ways — a new script in `scripts/` or a new CLI flag **fails the check
   until it is documented**. That is deliberate.

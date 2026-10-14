@@ -8,376 +8,321 @@
 playwrong https://awto.au          # the page, as readable text. Nothing to start first.
 ```
 
-One shared, long-lived, headed Chrome — driven over a local port — that clears Cloudflare Turnstile
-and stays warm between calls. A CLI, an AI agent (via **MCP**), and your own scripts all drive the
-same browser and reuse the same cleared session.
+One shared, long-lived, headed Chrome, driven over a local port. It clears Cloudflare Turnstile and
+stays warm between calls. The CLI, AI agents (via **MCP**) and your own scripts all drive the same
+browser and reuse the same cleared session.
 
 Repo: <https://github.com/awtoau/awto-playwrong> · MIT
 
 ## Features
 
 **Getting pages**
-- **Fetch any page as readable text** (or HTML, or text with links): one call, nothing to start first.
-- **Cloudflare Turnstile cleared**, including the click-the-checkbox challenge inside its
-  out-of-process iframe. Clearance cookies are reused by every later call.
-- **Web search** that works where curl gets a CAPTCHA: DuckDuckGo, with automatic fallback to Brave.
-- **PDFs** as text with a page count (a truncated document shows itself), and the file kept on disk.
-- **Downloads** of any file through the cleared session: resumes with Range, falls back to the
-  browser's own fetch, verifies sha256/size, and never passes a short transfer off as complete.
-- **Batch prefetch**: many urls in parallel tabs, read as each one finishes; one slow page costs
-  one slot, never the batch.
-- **Logins**: a headed browser the user can sign in to; persistent named profiles (`--profile`)
-  keep the session across restarts.
+- **Any page as readable text** (or HTML, or text with links): one call, nothing to start first.
+- **Cloudflare Turnstile cleared**, including the checkbox inside its out-of-process iframe. Later
+  calls reuse the clearance cookies.
+- **Web search** where curl gets a CAPTCHA: DuckDuckGo, falling back to Brave Search.
+- **PDFs** as text plus a page count (a truncated document shows itself), with the file kept.
+- **Downloads** through the cleared session: Range resume, in-browser fallback, sha256/size
+  verification. A short transfer is never reported as complete.
+- **Batch prefetch**: many urls in parallel tabs, read as each finishes. A slow page costs one slot,
+  not the whole batch.
+- **Logins**: the user signs in to the headed browser. Named profiles (`--profile`) keep the session
+  across restarts.
 
 **Driving a page**
-- `goto`, `read`, `js` (promises resolved, objects returned as JSON), `click`, `key`, `screenshot`,
+- `goto`, `read`, `js` (resolves promises, returns objects as JSON), `click`, `key`, `screenshot`,
   `cookies`, window placement, tabs.
-- **Many agents, one browser**: each caller gets its own tagged tab, so concurrent agents never
-  read each other's pages; tabs show their owner in the title.
+- **Many agents, one browser**: each caller gets its own tagged tab, so no agent ever reads another
+  agent's page. Each tab title shows its owner.
+- **Full Chrome DevTools Protocol**: a raw `cdp` passthrough op, a CDP endpoint your own client can
+  attach to, and the DevTools frontend. See [Chrome debugging surface](#chrome-debugging-surface).
 
 **Interfaces**
-- **MCP server** (stdio, stdlib-only) for Claude Code / VS Code and other agents.
+- **MCP server** (stdio, stdlib-only) for Claude Code, VS Code and other agents.
 - **`playwrong` CLI**, an interactive client, and a plain HTTP API on `127.0.0.1:<port>`.
 - **Python**: `from engine import connect; connect.capture(url)`.
 
 **Stealth by omission**
-- Our own minimal CDP client (`engine/cdp.py`, one file, MIT): no Playwright, no chromedriver,
-  no `--enable-automation`, never `Runtime.enable`; `navigator.webdriver` stays false.
-- The engine's own page reads run in an isolated world the page cannot hook.
+- Uses its own minimal CDP client (`engine/cdp.py`, one file, MIT). No Playwright, no chromedriver,
+  no `--enable-automation`, and it never calls `Runtime.enable`. `navigator.webdriver` stays false.
+- The engine reads pages from an isolated world that page scripts cannot hook.
 
 **Reliability**
-- Auto-starts the engine and Chrome; reattaches to a live Chrome or relaunches a dead one, keeping
-  the cleared session when it can.
-- Bounded everything: tab open/close timeouts, a crashed renderer fails only its own tab by name,
-  memory capped per engine (systemd scope), RSS self-restart, Chrome recycling, size-capped logs.
-- `scripts/doctor.py` preflight; `/status` that never reports a dead browser as alive.
+- Starts the engine and Chrome automatically. Reattaches to a live Chrome, or relaunches a dead one.
+- Everything is bounded: tab timeouts, a crashed renderer fails only its own tab (by name), a
+  memory cap per engine (systemd scope), RSS self-restart, Chrome recycling, size-capped logs.
+- `scripts/doctor.py` preflight checks. `/status` never reports a dead browser as alive.
 
 **Crawling (optional `crawl/` library)**
-- Point-and-go site crawler: resource blocking, consent dismissal, render waits, HTTP status and
-  429/503 backoff, per-host caps, resumable frontier in SQLite / Postgres / MySQL.
+- Point-and-go site crawler: resource blocking, consent dismissal, render waits, HTTP status
+  recording, 429/503 backoff, per-host caps, a resumable frontier in SQLite / Postgres / MySQL.
 - Importance ranking (sitemaps, url shape, OpenPageRank) and a site-shape report (hubs, orphans,
   dead links).
 
-**Why not just `curl`?** Because more and more pages don't answer it. Cloudflare serves a challenge;
-DuckDuckGo now returns `HTTP 202` and an image CAPTCHA. A real browser isn't asked. Nothing here
-solves or breaks a CAPTCHA — it drives a real browser that isn't given one, and hands you the result.
+**Why not just `curl`?** More and more pages won't answer it. Cloudflare serves a challenge, and
+DuckDuckGo returns `HTTP 202` with an image CAPTCHA. A real browser isn't challenged at all.
+Nothing here solves or breaks a CAPTCHA: it drives a real browser and hands you what it was served.
 
-Built and hardened against real bot-walled sites, where it recovered thousands of pages that plain
-HTTP fetching could not.
-
-## Install (fresh machine)
+## Install
 
 ```sh
 git clone https://github.com/awtoau/awto-playwrong && cd awto-playwrong
-python3 -m venv .venv                                            # optional but recommended
-.venv/bin/python scripts/install.py --deps --link --register --vscode   # deps, CLI, MCP
+python3.14t -m venv .venv                                              # 3.14+; free-threaded recommended
+.venv/bin/python scripts/install.py --deps --link --register --vscode  # deps, CLI on PATH, MCP
 .venv/bin/python scripts/mcp_selftest.py                               # prove it end to end
 ```
 
-You need **Python 3.11+, Chrome or Chromium, and a display** — the browser runs headed on purpose
-(headless is the Turnstile tell). The only PyPI package is `websockets`; the CDP client
-(`engine/cdp.py`) and everything else is in-tree stdlib. `python scripts/doctor.py` checks all of it
-and prints the exact command for anything missing.
+| Need | Why |
+|---|---|
+| **Python 3.14+**; a free-threaded build (`3.14t`) is recommended | The engine runs an HTTP thread per request alongside its asyncio loop. Crawls parse in parallel. A GIL build works but runs serialised. |
+| **Chrome or Chromium** (`PH_CHROME` overrides the lookup) | the browser |
+| **A display** | Chrome runs headed on purpose, because headless is the Turnstile tell. An engine with no `DISPLAY` adopts the user's X/Wayland session. |
+| `websockets` | the only PyPI package; everything else is in-tree stdlib |
+| optional: `poppler-utils` | `pdftotext`/`pdfinfo`, for PDF text and page count |
+| optional: `systemd-run` (user session) | the engine's memory cap |
+| optional: `Xvfb` | `PH_DISPLAY=xvfb`: tests run headed, off the desktop |
 
-> The `crawl/` library needs more (SQLAlchemy, psycopg, zstandard — see `pyproject.toml`). You don't
-> need any of that just to drive a browser.
+`python scripts/doctor.py` checks every one of these and prints the exact fix command for anything
+missing.
 
-## I'm an agent / I want this in Claude Code
+## Agents: the MCP server
 
-Use the **MCP server** — [docs/MCP.md](docs/MCP.md). After `--register`, browser ops appear directly
-in the tool list and one call does the whole job:
+Full guide: [docs/MCP.md](docs/MCP.md). After `--register`, the tools appear in the agent's tool list:
 
 ```
-fetch("https://awto.au")   # auto-starts the engine + Chrome, clears Cloudflare,
-                           # returns readable text, closes its own tab
+fetch("https://awto.au")   # starts engine + Chrome, clears Cloudflare, returns text, closes its tab
 ```
 
-Also: `prefetch`/`collect` (a list of urls, loaded in parallel, read as each finishes), `search`,
-`pdf`, `download`, `screenshot`, `goto`, `read`, `js`, `click`, `key`, `solve`, `cookies`, `tabs`,
-`close_tab`.
-No script to write, no API doc to read, no tab bookkeeping. `engine/mcp_server.py` is a stdlib-only proxy in
-front of the same engine described below — driving it over HTTP still works exactly as before.
+Tools: `fetch`, `prefetch`/`collect`, `search`, `pdf`, `download`, `screenshot`, `goto`, `read`, `js`,
+`click`, `key`, `solve`, `cookies`, `tabs`, `close_tab`, `status`.
 
-**Send every url through it — including ones you already have, raw files, and urls that look
-simple.** Not curl, not wget, not a built-in web-fetch. Fetching any other way gives up the only
-thing this project provides, and does it silently: a 200 whose body is a login page, a 45-page
-datasheet that arrives as 10, a search answered with HTTP 202 and a CAPTCHA, a JS-rendered page that
-arrives empty. All four look like success. Details and the login workflow:
-[docs/MCP.md](docs/MCP.md#every-url-goes-through-here-no-exceptions).
+- **Send every url through it**, including urls you already have, raw files, and urls that look
+  simple. Each other path fails silently: a 200 whose body is a login page, a 45-page datasheet that
+  arrives as 10, a search answered with HTTP 202 + CAPTCHA, a JS page that arrives empty.
+  [Details](docs/MCP.md#every-url-goes-through-here-no-exceptions).
+- **Login walls:** `goto` the page, ask the user to sign in to that tab, then `read`. Never handle
+  their credentials. See [Pages behind a login](docs/MCP.md#pages-behind-a-login-open-the-tab-and-ask-the-user).
 
-**A page that needs an account isn't a dead end.** The browser is headed and the user is in front of
-it: `goto` the page, ask them to sign in to that tab, then `read`. Never handle their credentials —
-see [Pages behind a login](docs/MCP.md#pages-behind-a-login--open-the-tab-and-ask-the-user).
-
-## I just want to view / fetch one web page
+## Shell: `playwrong`
 
 ```sh
-./playwrong https://awto.au
+playwrong https://awto.au                           # one page as text
+playwrong https://awto.au https://awto.au/about     # several, one warm browser
+playwrong -j 8 url1 url2 …                          # in parallel, printed as each finishes
+playwrong --search "nodriver turnstile"             # DuckDuckGo results (Brave if blocked)
+playwrong --pdf https://awto.au/doc.pdf -o sources/doc.pdf   # text + page count, file kept
+playwrong --profile work https://awto.au            # persistent named profile
+playwrong --tabs                                    # every open tab and who opened it
+playwrong --status | --stop
 ```
-
-That's it. There is **nothing to start first** — no server to launch, no `PYTHONPATH`, no port to
-pick. The first command starts the engine and a real headed Chrome; the page comes back as readable
-text.
-
-```sh
-./playwrong --search "nodriver turnstile"  # DuckDuckGo results (curl gets a CAPTCHA now)
-./playwrong --pdf https://awto.au/doc.pdf # any PDF, as text — never curl one, see docs/MCP.md
-./playwrong --pdf https://awto.au/doc.pdf -o sources/doc.pdf   # ...and keep the file
-./playwrong --profile work https://awto.au # persistent named profile: logins survive
-./playwrong https://awto.au https://awto.au/capabilities   # several, one warm browser
-./playwrong https://awto.au --links       # keep hrefs, so you can pick the next url
-./playwrong https://awto.au --html        # raw markup instead of text
-./playwrong https://awto.au --shot p.png  # also save a screenshot
-./playwrong https://awto.au --json        # {text,title,url,challenge} for scripting
-./playwrong --status                      # what's running
-./playwrong --stop                        # stop the shared engine
-```
-
-### Every option
 
 | Flag | What |
 |---|---|
-| `-j N`, `--jobs N` | load N urls **in parallel**, printing each as it finishes. A page load is mostly waiting; this overlaps it. |
-| `-s`, `--search Q` | DuckDuckGo results as `title + url` (curl gets a CAPTCHA; a real browser doesn't) |
-| `-n N` | max search results (default 10) |
-| `--pdf URL` | download a PDF **through the cleared session**, keep the file, print its text and page count |
-| `-o`, `--out PATH` | where `--pdf` / `--shot` writes (default: the checkout's `tmp/`, or the XDG cache dir when that isn't writable). `-o sources/doc.pdf` to keep a document |
-| `--links` / `--html` | keep hrefs as `anchor <url>` / return raw markup instead of text |
+| `-j N`, `--jobs N` | load N urls in parallel and print each as it finishes. Falls back to sequential with `--shot` / `--no-js`. |
+| `-s`, `--search Q` / `-n N` | search results as `title + url` / max results (default 10) |
+| `--pdf URL` | download through the cleared session, keep the file, print text and page count |
+| `-o`, `--out PATH` | where `--pdf` writes (default: the data dir, see [Files](#files-and-logs)) |
+| `--links` / `--html` | keep hrefs as `anchor <url>` / raw markup instead of text |
 | `--max-chars N` | truncate each page (`0` = no limit; default 40000) |
-| `--no-js` | disable JavaScript execution in Chrome to bypass client-side paywall script truncation (e.g. The Age, SMH) |
-| `--shot PATH` | also save a PNG. Several urls get `name-0.png`, `name-1.png`. |
-| `--json` | machine-readable output instead of text |
-| `--no-solve` | don't auto-clear Cloudflare challenges |
-| `--tries N` | max challenge-solve iterations (default 20) |
-| `--profile NAME` | persistent named Chrome profile — logins survive a restart |
-| `--agent NAME` | how this caller is labelled in tab titles and `--tabs` |
-| `--tabs` | list every open tab with the agent and repo that opened it |
+| `--no-js` | disable page JavaScript: the server-sent HTML only |
+| `--shot PATH` | also save a PNG. Several urls give `name-0.png`, `name-1.png`, … |
+| `--json` | `{text, title, url, challenge, partial}` per page |
+| `--no-solve` / `--tries N` | don't auto-clear Cloudflare / max solve iterations (default 20) |
+| `--profile NAME` | persistent profile; each name gets its own engine on a stable port |
+| `--agent NAME` | how this caller is labelled in tab titles (default: guessed; `PLAYWRONG_AGENT`) |
+| `--tabs` | list every open tab with its owner |
 | `--port N` | use/start an engine on another port (a second, isolated browser) |
 | `-q`, `--quiet` | no progress notes on stderr |
-| `--status` / `--stop` | what's running / stop the shared engine |
+| `--status` / `--stop` | engine state / stop the shared engine **for everyone** |
 
-Progress notes go to stderr and the page to stdout, so `playwrong <url> > page.txt` stays clean.
+- Progress goes to stderr and the page to stdout, so `playwrong <url> > page.txt` stays clean.
+- **You never manage a host:port.** The engine listens on `PH_PORT` (default 8731). The first call
+  starts it and later calls reuse it, with the same cookies and the same cleared session.
 
-**You never manage a host:port.** The engine is a long-lived local server on a fixed default port
-(`PH_PORT`, 8731). The first command starts it; every later command finds it already up and reuses
-it — same browser, same cookies, same cleared Turnstile session, no cold start (~3s cold, ~2s warm).
-Fire one command per url whenever you like and they compound. `--port` is only for deliberately
-running a *second*, isolated browser.
+### Driving a page: `engine/client.py`
 
-`scripts/install.py --link` puts `playwrong` on your PATH so you can drop the `./`.
-
-**The engine runs under a hard memory cap.** It re-execs itself into a systemd user scope with
-`MemoryMax=8G`, no swap and `OOMPolicy=continue`, so running out kills the biggest renderer (one tab,
-which then fails by name) instead of the host or every client — #23 was 39.5 GB and a hard reset, #28
-was one OOM taking every tab. New tabs are refused above 85 % of the cap (`PH_MEMORY_HIGH_WATER`). `PH_MEMORY_MAX=16G` raises it,
-`PH_MEMORY_MAX=0` disables it; without a systemd user manager it runs uncapped and `/status` says so.
-`python -m crawl.run` gets the same treatment in a scope of its own, `PH_CRAWL_MEMORY_MAX` (default
-4G), because it attaches with its own CDP client (#26). An engine that a crawl spawns still gets its
-own 8G scope, so the two never share a cap.
-
-### Driving a page, not just reading it
-`engine/client.py` has the interactive verbs — `goto`, `click`, `key`, `js`, `shot`, `tabs`,
-`solvecf`. It auto-starts the engine too:
+Drives the CLI's own tab (`client`), which persists across invocations:
 
 ```sh
 python engine/client.py goto https://awto.au
 python engine/client.py js "document.title"       # promises resolve; objects come back as JSON
-python engine/client.py read --links              # current page as text, hrefs kept
+python engine/client.py read --links              # the page as text, hrefs kept
+python engine/client.py click 640 360             # CDP input, viewport CSS pixels
 python engine/client.py shot page.png
+python engine/client.py solvecf                   # clear a Turnstile challenge
+python engine/client.py cdp Page.getLayoutMetrics # raw CDP on the CLI's tab
+python engine/client.py closetab                  # done: close the CLI's tab
 ```
 
-Or POST directly to the port from anything: `curl -s localhost:8731/goto -d '{"url":"..."}'`. The
-browser stays alive between calls. The rest of this README is for crawling many pages.
+Run `python engine/client.py` with no arguments to list every verb.
 
-## Testing and maintenance
+## Python: `engine/connect.py`
 
-Every one of these runs standalone and prints a pass/fail tally. The ones that start an engine run
-its Chrome **headed on the engine's own Xvfb** (`PH_DISPLAY=xvfb`), so tests stay off the desktop
-while Chrome is still genuinely headed; `--headed` shows the window on your desktop instead.
-`PH_HEADLESS=1` also exists, but DuckDuckGo and Turnstile detect headless Chrome (#34).
-
-| Script | What it proves |
-|---|---|
-| `scripts/doctor.py` | preflight: Python, deps, Chrome, display, port. Prints the exact fix command for anything missing. |
-| `scripts/turnstile_click_test.py` | the engine's `solve` clicks a REAL interactive Turnstile (Cloudflare's test sitekey `3x…FF` on a local page): the checkbox sits in an out-of-process iframe, the click lands, the widget issues its token (#45). |
-| `scripts/logroll_test.py` | engine logs are size-capped (`engine/logroll.py`, 20 MB + one `.1` backup): `nd-server.log` and `search.log` roll instead of growing (#39). Offline. |
-| `scripts/cdp_surface_check.py` | who can reach the DevTools port: our client and a second attach are accepted, the DevTools frontend's own origin is accepted, a foreign web origin is refused, loopback only (#52). |
-| `scripts/stealth_check.py` | what a CDP-leak bot detector (bot-detector.rebrowser.net) sees: `navigator.webdriver`, `Runtime.enable` and sourceURL leaks, before and after the engine's own `js` op. Any red outside the documented two fails. |
-| `scripts/profile_test.py` | a persistent profile (`PH_PROFILE_DIR`) on an isolated engine: a cookie survives a clean restart (graceful `Browser.close`), the profile is kept, and a SIGKILL'd engine + Chrome relaunch on the same profile (stale `SingletonLock` healed). |
-| `scripts/cdp_smoke_test.py` | `engine/cdp.py` against a real headless Chrome, no network: launch, tabs, evaluate, content, screenshot, find + click through an iframe and shadow root (the Turnstile layout), Fetch/dialog handling surviving navigation (#43), stop cleaning up its profile. |
-| `scripts/mcp_selftest.py` | the MCP layer over real stdio JSON-RPC: protocol, a live fetch, tab cleanup, and a local server that hangs up mid-download (must resume or fail by name, #31). `--cloudflare` adds a real Turnstile wall. |
-| `scripts/download_latency.py` | measures time-to-headers and the longest gap between socket reads on real downloads: the numbers `download()`'s per-read timeout is derived from (#30). `--runs N`. |
-| `scripts/stress_test.py` | the edge cases: duplicate and bad urls, empty batches, double collect, missing tabs, a batch running while someone else drives, malformed requests. |
-| `scripts/concurrency_test.py` | N processes against ONE engine each get the page they asked for, with no leaked tabs. |
-| `scripts/frontier_test.py` | `--max-per-host` holds in all three claim orderings, and survives a resume; `--exclude` drops matching links. No browser or network needed. |
-| `scripts/display_test.py` | `ensure_display()` adopts the user's own X/Wayland session when the engine has no `DISPLAY`, and fails with `no display` when there is none. No browser needed. |
-| `scripts/recovery_test.py` | SIGKILLs the browser under a running engine: `/status` tells the truth about it, and the next op relaunches instead of failing forever. Also forces a reattach (`PH_TEST_HOOKS=1`) and checks it keeps the same Chrome (#33). Isolated port only — it refuses to run on 8731. |
-| `scripts/memory_test.py` | opens, drives and closes tabs on an isolated engine and checks CDP sockets, fds and RSS return to baseline (#23). `--shed`: a tab allocating past the cap loses only itself (#28). `--high-water`, `--cap`, `--retire`, `--recycle` exercise the other guards; run one per invocation. |
-| `scripts/crawl_stall_test.py` | `crawl.run` against a local site whose one page blows an isolated engine's memory cap: the crawl finishes, leaves no tab open, the no-progress watchdog cuts a stuck batch (#27), and pages record their HTTP status (#42). |
-| `scripts/rank_test.py` | `crawl.rank` scoring (url shape, sitemap discovery, OpenPageRank, secrets lookup) offline, then `crawl.run --rank` on a local site: a 2-page budget fetches the sitemap-only page, not the tag listings (#2). `--offline` skips the crawl. |
-| `scripts/search_fallback_test.py` | a local page posing as DuckDuckGo's anti-bot block: `search()` retries once, falls back to live Brave Search, tags the results `brave`, and logs each attempt (#34). |
-| `scripts/op_latency.py` | per-op duration percentiles from the engine log, the data the engine's tab timeouts are derived from (#29). `--op`, `--errors`. |
-| `scripts/engine_inspect.py` | read-only heap probe of a RUNNING engine via `sys.remote_exec`: objects by type, asyncio tasks, CDP client counters (pending commands, sessions, tabs, handlers), optional tracemalloc. For the next "why is it 4 GB". |
-| `scripts/cleanup_orphans.py` | finds and closes browsers left behind by a dead engine. Only ever touches engine temp profiles and playwrong profiles, so your own browser can't match. |
-| `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
-| `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |
-| `scripts/install.py` | deps, the `playwrong` command on PATH, and both MCP registries. |
-
-## Why this exists
-Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**
-you drive over **IP:port** — `goto a page → get back {html, cookies, status, screenshot, metadata}` —
-that any number of apps/agents can share. No DB, no project specifics: pure capture. Wire your own
-data layer on top (the project keeps its DB code; this stays generic).
-
-## Why raw CDP, and not Playwright
-**Playwright is the detection tell.** Cloudflare serves it a dead challenge that never resolves, no
-matter how the automation is configured. A real Chrome driven over raw CDP passes. The browser also
-runs **headed** deliberately — headless is itself a signal. That is the whole architectural choice,
-and it's why this repo exists rather than a Playwright wrapper.
-
-### The pieces
-- `engine/server.py` — the engine: one persistent **headed real Chrome**, driven over HTTP on a port.
-  Holds the browser, the cleared session, and every verb.
-- `engine/cdp.py` — our CDP client (#41; replaced the vendored AGPL nodriver). One websocket,
-  flattened sessions per tab, raw JSON. Stealth is by omission: no `--enable-automation`, no
-  chromedriver, never `Runtime.enable`. The Turnstile iframe runs out-of-process regardless of the
-  site-isolation flags, so `find_text` also searches the tab's iframe targets and clicks through
-  that iframe's own session (#45). The engine's own page reads (readyState, title, location, the
-  owner label, crawl render polling) run in an isolated world a page cannot hook; only the caller's
-  `js` op is main-world, since callers read page globals (#49).
-- `engine/connect.py` — **the one place that reaches the engine and starts it if it's down**, plus
-  html→text, one-shot `capture()`, `search()` and `download()`/`pdf()`. Every entry point goes
-  through it, so "how do I start this thing" has exactly one answer.
-- `engine/cli.py` + `./playwrong` — the one-shot command: url in, readable page out.
-- `engine/client.py` — the interactive port client (`goto/click/key/js/read/tabs/…`).
-- `engine/mcp_server.py` — the MCP stdio server for agents ([docs/MCP.md](docs/MCP.md)).
-- `crawl/` — an optional library for crawling many pages on top of the engine (its own heavier deps).
-
-## Usage (engine)
-```
-# there is no step 1 — every entry point starts the engine and Chrome if they're down
-./playwrong https://awto.au                      # one page as text
-python engine/client.py goto https://awto.au
-python engine/client.py solvecf                  # clear a Turnstile challenge
-python engine/client.py text                     # get the page HTML
-python engine/client.py shot frame.png           # screenshot
-```
-From your own Python, use the same code path the CLI and the MCP server use — `engine/connect.py`:
+The CLI, the MCP server and your scripts all go through this one module, so "how do I start this
+thing" has one answer.
 
 ```python
 from engine import connect
-
-page = connect.capture("https://awto.au")        # starts engine+Chrome, solves, closes its tab
-print(page["text"])                              # {text, title, url, challenge}
+page = connect.capture("https://awto.au")   # starts engine+Chrome, solves, closes its tab
+print(page["text"])
 ```
 
-| Function | What |
+| Function | Returns |
 |---|---|
-| `capture(url, mode=, max_chars=, solve=)` | one page, own tab, auto-solve, auto-cleanup |
-| `fetch_many(urls, concurrency=8)` | a **generator** — every page in parallel, yielded as each finishes |
-| `prefetch(urls, concurrency=, timeout=)` | start a batch, return a job id immediately |
-| `poll(job)` | counts only: ready / loading / pending / errors / done |
-| `collect(job, wait=, max_chars=)` | take whatever is ready; each page delivered exactly once |
-| `search(query, max_results=)` | DuckDuckGo results as `[{title, url}]`; Brave Search if DDG blocks (`.engine` says which) |
-| `pdf(url, path=)` / `download(url, path=)` | a file, via the cleared session → `{path, bytes, pages, text, final_url}` |
-| `session_headers(url)` | just the `{Cookie, User-Agent, Referer}`, to drive a transfer yourself |
-| `ensure(port=, profile=)` | engine + Chrome up; idempotent, and safe when many processes call it at once |
-| `call(op, **body)` / `op(op, **body)` | any raw engine verb, without / with an auto-start |
+| `capture(url, mode=, max_chars=, solve=, shot=, no_js=, profile=)` | `{text, title, url, challenge, partial, b64?}`: one page in its own tab |
+| `fetch_many(urls, concurrency=8)` | a **generator**: pages in completion order |
+| `prefetch(urls, concurrency=, timeout=)` → `poll(job)` → `collect(job, wait=)` | job id → counts → ready pages, each delivered once |
+| `search(query, max_results=)` | a list of `{title, url}`; its `.engine` is `"brave"` when DuckDuckGo blocked |
+| `pdf(url, path=)` | `{path, bytes, pages, text, content_type, final_url, sha256, via, …}` |
+| `download(url, path=, expect_sha256=, expect_size=, extra_headers=)` | `{path, bytes, content_type, final_url, sha256, via, expected_bytes, resumed}` |
+| `session_headers(url)` | `{Cookie, User-Agent, Referer}`, to drive a transfer yourself |
+| `ensure(port=, profile=)` | the port, with engine + Chrome up. Idempotent; safe for many processes at once. |
+| `call(op, **body)` / `op(op, **body)` | any raw engine op, without / with auto-start |
 
-The crawl library adds `CrawlDB.host_counts()` — pages already attempted per host, which is what makes
-`--max-per-host` survive a resume.
-Launching `engine/server.py` by hand still works if you want it in the foreground; it needs no
-`PYTHONPATH`.
-Or POST directly: `POST http://127.0.0.1:8731/goto {"url": "..."}` → returns the capture.
+Raw HTTP contract (every op, `/status` fields, tab tagging): [docs/AGENT-API.md](docs/AGENT-API.md).
 
-## The capture contract (what you get back)
-`goto` / `capture` returns: **html, title, status, cookies, screenshot (base64), and metadata**
-(timing, passed-challenge flag, request counts). Wire your own storage/DB on top — this engine never
-touches a database.
+## Chrome debugging surface
 
-## crawl/ — the reusable crawl LIBRARY (on top of the server)
-
-Where `engine/` captures ONE page over a port, `crawl/` is a **library of crawl mechanics** for
-walking a whole site — still ref-free (zero project names), so any consumer reuses it. It attaches to
-the same shared browser.
-
-| module | what |
+| Who | How |
 |---|---|
-| `crawl.browser` | attach an `engine.cdp` client to the shared engine Chrome via `/cdp` (starts the server if down) |
-| `crawl.challenge` | Cloudflare "verify you are human" detect + `solve()`; generic soft-404 matcher |
-| `crawl.netblock` | CDP Fetch resource-type block — **one pattern per blocked type** so page load never stalls (the naive `url_pattern="*"` version froze `readyState=loading` → empty captures; see the docstring) |
-| `crawl.render` | consent-dismiss (`dismiss_overlays`) + `wait_ready` (readyState) + `wait_for_render` (client-mount) |
-| `crawl.parse` | clean words-only text, page links, image refs; entity-decoding; segment-boundary feed/infra URL filter; generic `image_kind` (consumer supplies vertical kinds via `extra_rules`) |
-| `crawl.store` | content-addressed zstd page store (sha256, sharded) — no DB |
-| `crawl.db` | **SQLAlchemy 2.0 Core** relational store: SQLite (a file) / Postgres / MySQL from one model. Atomic `claim()`, `reclaim_stuck()`, portable `scan_status` CHECK, and an `unhandled` feedback table |
-| `crawl.graph` | reports over the page→page reference graph: hubs / authorities / orphans / dead-links / `image_usage` / `improvement_report` |
-| `crawl.run` / `crawl.report` | point-and-go CLI: crawl a site → SQLite + auto site-shape report |
-| `crawl.drive` | hand-drive helpers (click / scroll / screenshot; settles without a fixed sleep) |
-| sibling `assets/` | content-addressed image/binary store (store / classify / imgmeta) |
+| HTTP callers | `POST /cdp {"method": "Page.getLayoutMetrics", "params": {}, "tab": "<tag>"}` returns `{result}`. Add `"browser": true` for the browser session. Request/response only. |
+| Python | `ep = connect.call("cdp")` → `await engine.cdp.attach(ep["host"], ep["port"])`: full CDP including events (`tab.on(...)`) on the shared browser. Close your tabs and `aclose()`; never `launch()`. |
+| A human | `GET http://127.0.0.1:<cdp port>/json/list` → open a tab's `devtoolsFrontendUrl`. |
 
-Point-and-go (one command rips a site + prints its shape):
+- The DevTools port binds to loopback only. Chrome refuses a websocket from any web origin except the
+  DevTools frontend's own (`--remote-allow-origins=http://127.0.0.1:<port>`, #52). Clients without
+  an Origin header (ours, Puppeteer, `websockets`) are accepted.
+- `scripts/cdp_surface_check.py` proves all of this. Run it after any change to Chrome's flags.
+
+## The engine
+
+| Piece | Role |
+|---|---|
+| `engine/server.py` | one headed Chrome behind an HTTP port; holds the session, tags, memory guards |
+| `engine/cdp.py` | the CDP client: one websocket, flattened per-tab sessions, `find_text` through OOPIF iframes (#45), isolated-world reads (#49) |
+| `engine/connect.py` | reach/start the engine, html→text, `capture`/`search`/`download`/`pdf` |
+| `engine/cli.py` + `./playwrong` | the one-shot command |
+| `engine/client.py` | interactive verbs |
+| `engine/mcp_server.py` | MCP stdio server |
+| `engine/memcap.py`, `engine/logroll.py` | systemd memory scope; 20 MB + `.1` log rotation |
+
+**Why raw CDP and not Playwright:** Cloudflare serves Playwright a dead challenge that never
+resolves. A real Chrome over raw CDP passes. See [docs/lessons.md](docs/lessons.md).
+
+### Memory
+
+- The engine re-execs into a systemd user scope: `MemoryMax=8G` (`PH_MEMORY_MAX`, `0` = off), no
+  swap, `OOMPolicy=continue`. Running out kills one renderer, and that tab fails by name (#23, #28).
+- New tabs are refused above `PH_MEMORY_HIGH_WATER` (0.85) of the cap.
+- The engine's own Python RSS above `PH_RSS_LIMIT` (2G) means a leak: it stops Chrome and exits, and
+  the next call restarts it.
+- Chrome is recycled after `PH_CHROME_MAX_TABS` (64) open tabs, or `PH_CHROME_MAX_FETCHES` (1000)
+  tabs opened since launch.
+- `python -m crawl.run` gets its own scope: `PH_CRAWL_MEMORY_MAX` (4G, #26).
+- No systemd user manager → runs uncapped, and `/status` `memory_cap` says so.
+
+### Environment
+
+| Var | Default | What |
+|---|---|---|
+| `PH_PORT` | 8731 | engine port |
+| `PH_PROFILE` / `PH_PROFILE_DIR` | throwaway | named persistent profile (own engine port, #54) / explicit profile path |
+| `PH_CHROME` | lookup | Chrome binary |
+| `PH_DISPLAY` | desktop | `xvfb`: headed Chrome on the engine's own Xvfb |
+| `PH_HEADLESS` | off | `1`: headless. DuckDuckGo and Turnstile block it (#34). |
+| `PLAYWRONG_AGENT` | guessed | the owner label on your tabs |
+| `PH_MEMORY_MAX`, `PH_MEMORY_HIGH_WATER`, `PH_RSS_LIMIT`, `PH_CHROME_MAX_TABS`, `PH_CHROME_MAX_FETCHES`, `PH_CRAWL_MEMORY_MAX` | see [Memory](#memory) | |
+| `PH_RIGHTMON_BOUNDS` | `0,0,1280,720` | `client.py rightmon` window placement, `x,y,w,h` |
+| `PH_OUT_DIR` | `./tmp` | `crawl.drive` screenshots |
+| `PH_TEST_HOOKS` | off | `1`: test-only ops (`recovery_test.py`, `memory_test.py`) |
+
+### Files and logs
+
+Everything goes in the **data dir**: the checkout's `tmp/`, or `$XDG_CACHE_HOME/playwrong` when the
+checkout isn't writable (an installed package).
+
+| File | What |
+|---|---|
+| `nd-server.log` | structured engine log: one line per op with RSS (`op_done`), `mem` every 60 s, errors |
+| `chrome.log` | Chrome's own stdout/stderr, truncated per launch |
+| `logs/playwrong-engine.log` | the spawned engine's stdout/stderr, including startup failures |
+| `logs/search.log` | one JSON line per search attempt (engine, outcome, n) |
+
+Logs roll at 20 MB, keeping one `.1` backup (#39).
+
+## crawl/: the crawl library
+
+Walks a whole site on top of the shared browser. Agent guide: [crawl/AGENTS.md](crawl/AGENTS.md).
+
+```sh
+python -m crawl.run --seed https://awto.au/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
+python -m crawl.report --db site.sqlite          # re-print the site-shape report
 ```
-python -m crawl.run --seed https://example.com/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
-python -m crawl.report --db site.sqlite            # re-print the report later
-```
-`--exclude REGEX` (repeatable) keeps matching discovered links out of the queue — forum post anchors,
-redirects, member pages, calendars.
-`--rank` fetches the important pages first (#2, `crawl/rank.py`): priority = sitemap membership +
-url shape + OpenPageRank/10, each 0-1. `--prefer KW` / `--avoid KW` steer the shape score;
-`--min-priority P` leaves lower rows queued. OpenPageRank needs a key in `~/.config/awto/secrets.yaml`
-(section `openpagerank`, field `password`); without one it ranks on sitemap + shape and says so.
-`--db` also takes `postgresql+psycopg://…` or `mysql+pymysql://…`. See `crawl/AGENTS.md` for the full
-agent guide and `schema.sql` for the relational model.
 
-## Install (system-wide tool — no venv to activate)
+| Module | What |
+|---|---|
+| `crawl.run` / `crawl.report` | point-and-go CLI → DB + site-shape report |
+| `crawl.browser` | attach an `engine.cdp` client to the shared Chrome (starts the engine if down) |
+| `crawl.challenge` | challenge detection (the engine's own check), `solve()`, soft-404 matcher |
+| `crawl.netblock` | CDP Fetch resource blocking, one pattern per blocked type, so the page load never stalls |
+| `crawl.render` | consent dismissal, `wait_ready`, `wait_for_render` (stable body length) |
+| `crawl.parse` | words-only text, links, image refs, `image_kind` |
+| `crawl.ratelimit` | per-host gap + 429/503 backoff, shared across tabs |
+| `crawl.rank` | priority = sitemap + url shape + OpenPageRank (`--rank`, #2) |
+| `crawl.store` | content-addressed zstd page store |
+| `crawl.db` | SQLAlchemy 2.0 Core: SQLite / Postgres / MySQL, atomic `claim()`, lease reclaim |
+| `crawl.graph` | hubs, authorities, orphans, dead links, image usage |
+| `crawl.drive` | hand-driving: click / scroll / screenshot with condition-based settling ([helpers/README.md](helpers/README.md)) |
+| `assets/` | content-addressed image store, Chrome cache harvest, image metadata |
 
-Install the crawl library as an isolated tool so `crawl` / `crawl-report` are on your PATH from
-anywhere, with the deps kept out of system Python:
+Crawl dependencies: `pip install -e ".[crawl]"` (SQLAlchemy, psycopg, pymysql, zstandard).
 
-```
-DISABLE_SQLALCHEMY_CEXT=1 uv tool install \
-  --python /usr/bin/python3.14t \
-  --no-binary-package sqlalchemy \
-  git+https://github.com/awtoau/awto-playwrong     # or a local checkout path
+**On a free-threaded Python**, two of them re-enable the GIL unless built pure-Python:
+- SQLAlchemy: `DISABLE_SQLALCHEMY_CEXT=1 pip install --no-binary sqlalchemy "sqlalchemy>=2.0"`
+- psycopg: plain `psycopg`, not `[binary]`/`[c]`
+- As a tool: `DISABLE_SQLALCHEMY_CEXT=1 uv tool install --python python3.14t --no-binary-package
+  sqlalchemy "awto-playwrong[crawl] @ git+https://github.com/awtoau/awto-playwrong"`
+- Verify: `python -c "import sys, crawl.db; assert not sys._is_gil_enabled()"`
 
-crawl --seed https://example.com/ --db site.sqlite --max 200 --max-per-host 50 --tabs 8
-```
+## Testing
 
-Every flag is load-bearing on a free-threaded (no-GIL) machine — omit one and the GIL comes back on:
-- `--python /usr/bin/python3.14t` — build the tool env on the **free-threaded** interpreter (plain
-  `python3.14` has the GIL; `uv` would otherwise pick it and no-GIL is silently lost).
-- `--no-binary-package sqlalchemy` + `DISABLE_SQLALCHEMY_CEXT=1` — build SQLAlchemy from source with
-  its C extension off; the prebuilt wheel's `cyextension` re-enables the GIL on import.
+Tests that start an engine use an **isolated port** (8739). They run Chrome headed on the engine's
+own Xvfb (`PH_DISPLAY=xvfb`); pass `--headed` to watch. Every test prints a pass/fail tally.
 
-Verify after install: `python -c "import sys, crawl; import sqlalchemy.util as u; assert not
-sys._is_gil_enabled() and not u.has_compiled_ext()"` on the tool's interpreter.
+| Script | Proves |
+|---|---|
+| `scripts/doctor.py` | preflight: Python, deps, Chrome, display, optional tools, port, the running engine's code and a real op |
+| `scripts/mcp_selftest.py` | MCP over real stdio: protocol, live fetch, tab cleanup, short-transfer resume (#31), `PH_PROFILE` port (#54). `--offline`, `--cloudflare`, `--shutdown`. |
+| `scripts/cdp_smoke_test.py` | `engine/cdp.py` against headless Chrome, offline: tabs, evaluate, screenshot, find+click through an iframe and shadow root, Fetch/dialog handling (#43) |
+| `scripts/cdp_surface_check.py` | DevTools port: our client + a second attach accepted, the frontend origin accepted, a foreign origin refused, loopback only (#52) |
+| `scripts/turnstile_click_test.py` | `solve` clicks a real interactive Turnstile (test sitekey) in its OOPIF (#45) |
+| `scripts/stealth_check.py` | a CDP-leak detector: `navigator.webdriver`, `Runtime.enable` and sourceURL leaks |
+| `scripts/stress_test.py` | duplicate/bad urls, empty batches, double collect, missing tabs, malformed requests, window + raw `cdp` ops |
+| `scripts/concurrency_test.py` | N processes on one engine each get their own page; owner-scoped `closeextra`; stale tags (#14, #15) |
+| `scripts/recovery_test.py` | SIGKILLed browser: `/status` tells the truth, the next op relaunches; reattach keeps the same Chrome (#33) |
+| `scripts/memory_test.py` | sockets, fds and RSS return to baseline (#23). `--shed`, `--high-water`, `--cap`, `--retire`, `--recycle`. |
+| `scripts/profile_test.py` | a persistent profile survives a clean restart and a SIGKILL (stale `SingletonLock` healed) |
+| `scripts/display_test.py` | display adoption; an engine that dies at startup fails fast with its log (#53) |
+| `scripts/search_fallback_test.py` | DuckDuckGo block → retry → Brave, logged (#34) |
+| `scripts/logroll_test.py` | log rotation (#39), offline |
+| `scripts/frontier_test.py` | `--max-per-host`, claim leases, priority, `--exclude`, dead links (#48), offline |
+| `scripts/rank_test.py` | `crawl.rank` offline, then a ranked crawl on a local site (#2) |
+| `scripts/crawl_stall_test.py` | a crawl survives a page that blows the memory cap; the watchdog cuts a stuck batch (#27) |
+| `scripts/download_latency.py` | time-to-headers and read gaps on real downloads: the source of `download()`'s timeouts (#30) |
+| `scripts/op_latency.py` | per-op duration percentiles from the engine log: the source of the tab timeouts (#29) |
+| `scripts/engine_inspect.py` | read-only heap probe of a running engine (`sys.remote_exec`) |
+| `scripts/cleanup_orphans.py` | finds browsers left by a dead engine; only engine/playwrong profiles can match |
+| `scripts/check_docs.py` | docs match code: paths exist, every CLI flag, MCP tool and script documented |
+| `scripts/release.py` | builds, installs each artifact in a clean venv and fetches a page with it before uploading |
+| `scripts/install.py` | deps, `playwrong` on PATH, Claude Code + VS Code MCP registries |
 
-For development, an editable install in a free-threaded venv works too:
-`uv pip install -e .` after `DISABLE_SQLALCHEMY_CEXT=1 uv pip install --no-binary sqlalchemy "sqlalchemy>=2.0"`.
-
-## Gotchas — read before running
-- **SQLAlchemy on no-GIL.** Its `cyextension` C module silently re-enables the GIL. Install the
-  pure-Python build: `DISABLE_SQLALCHEMY_CEXT=1 pip install --no-binary SQLAlchemy "SQLAlchemy>=2.0"`.
-  Verify `not sys._is_gil_enabled()` after import. Drivers must be pure-Python too: `psycopg` (not
-  `[binary]`/`[c]`), `pymysql`, stdlib `sqlite3`.
-- **One crawl at a time on the shared browser.** Two crawls attaching to the same Chrome contend for
-  tabs and break. Finish/stop one first. Never `pkill` the browser — shut it down over the command
-  port so the cleared session is reused.
-- **Point each crawl at its OWN db/schema.** The `crawl.db` tables use plain names (`page`, `asset`,
-  `frontier`, …); a shared DB with another project's `page` table collides.
-
-## Key lessons baked in (see docs/)
-- **Playwright is the Turnstile tell.** Cloudflare detects Playwright's CDP instrumentation and serves
-  a dead challenge; **raw CDP** (no Playwright) gets the real interactive widget and passes.
-- **Site-isolation flags** + real Chrome channel matter for reaching cross-origin challenge iframes.
-- **Torn-frame guard** for image/cam grabs (validate JPEG ends FFD9 / PNG ends IEND; retry on
-  mid-write).
-- **Clean shutdown over the command port** — never pkill the browser.
-- **Python 3.14t free-threaded** — sync Playwright segfaults; use async / raw CDP.
+Before committing: `python scripts/mcp_selftest.py --port 8739 --shutdown`,
+`python scripts/check_docs.py`, `uvx ruff check .`.
 
 ## Licence
-MIT — see [LICENSE](LICENSE).
+
+MIT, see [LICENSE](LICENSE).
 
 Use it lawfully: respect the terms of the sites you fetch, and don't point it at anything you have no
-right to access. It exists so that legitimate access — research, archiving, your own accounts and
-your own sites — isn't blocked by a bot check aimed at someone else.
+right to access. It exists so that legitimate access (research, archiving, your own accounts and
+sites) isn't blocked by a bot check aimed at someone else.

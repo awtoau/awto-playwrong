@@ -1,339 +1,133 @@
-# Agent API — connect to awto-playwrong (and start it if needed)
+# Engine HTTP API
 
-> **Before writing any of the code below, check whether you need to.** The
-> goto → detect → solve → text → close-tab sequence on this page is already implemented:
->
-> - **agent** → the MCP tools, [MCP.md](MCP.md): `fetch{url}` and you're done.
-> - **shell** → `./playwrong <url>` — starts everything itself, prints the page as text.
-> - **python** → `from engine import connect; connect.capture(url)` — same code path as both of the
->   above.
->
-> None of them need a server started first, and none need `PYTHONPATH`. This page is the raw HTTP
-> contract: read it when you're building something that is none of
-> the above, or need a verb those layers don't expose.
+The raw contract of `engine/server.py`. **You probably don't need it:**
 
-How an app or agent uses the shared capture engine: it's an **HTTP server on a port**; you POST ops
-and get JSON back. No SDK needed — plain HTTP. If the server isn't running, `connect.ensure()` (or
-any of the three entry points above) starts it; starting it by hand is a fallback, not the workflow.
+- agent → MCP tools, [MCP.md](MCP.md): `fetch{url}`
+- shell → `playwrong <url>`
+- Python → `from engine import connect; connect.capture(url)`
 
-## TL;DR
-```
-Base URL:  http://127.0.0.1:8731     (PH_PORT env overrides the port)
-Check up:  GET  /status              -> {"server": true, "alive": true|false,
-                                        "launched": true|false, "chrome_pid": 1234|null,
-                                        "code": {"sha": "4abc6e6", "dirty": false, "started": "..."},
-                                        "pid": 82682, "rss_mb": 310, "swap_mb": 0, "fds": 31,
-                                        "cdp_sockets": 4, "tabs": 3, "threads": 5, "uptime_s": 120,
-                                        "memory_cap": "8192M", "rss_limit_mb": 6144}
-Warm up:   POST /start  {}                 -> {started: true}  (blocks until Chrome is launched)
-Drive:     POST /goto   {"url": "..."}     -> {title, url, requested}   (url = where you LANDED)
-           POST /solve  {"tries": 20}      -> {passed, iter}     (clear Cloudflare Turnstile)
-           POST /text   {}                 -> {html, title, url}
-           POST /shot   {}                 -> {b64}              (PNG screenshot, base64)
-           POST /clearcookies {}           -> {cleared}
-           GET  /frame                     -> image/png          (latest screenshot bytes)
-           POST /shutdown {}               -> {ok}
+All three start the engine themselves. Read on to build a client in another language, or to use an
+op those layers don't expose.
+
+## Basics
+
+- `http://127.0.0.1:8731` (`PH_PORT`; a `PH_PROFILE` name picks its own port, see `connect.default_port()`).
+- `POST /<op>` with a JSON object body → JSON. Failures return `{"error": "…"}` (HTTP 200); a
+  malformed body returns HTTP 400.
+- `GET /status`, `GET /tabs`.
+- Start it: `connect.ensure()`, or run `python engine/server.py` (no `PYTHONPATH` needed).
+- Ops run concurrently on the engine's event loop. **Name your tab on every driving op** (below).
+
+## `/status`
+
+```json
+{"server": true, "alive": true, "launched": true, "chrome_pid": 1234,
+ "code": {"sha": "eaee615", "dirty": false, "started": "2026-10-15T00:00:00+00:00"},
+ "pid": 82682, "rss_mb": 90, "swap_mb": 0, "fds": 31, "cdp_sockets": 2, "threads": 5, "tabs": 3,
+ "uptime_s": 120, "scope_current_mb": 900, "scope_peak_mb": 1400, "scope_unreclaimable_mb": 700,
+ "scope_max_mb": 8192, "scope_oom_kills": 0, "memory_cap": "8G", "rss_limit_mb": 2048,
+ "headless": false, "display": ":0", "display_mode": "desktop"}
 ```
 
-**`server` vs `alive` vs `launched` — three different things, don't confuse them.** `server: true`
-means the HTTP process is up and answering requests (true the instant it responds at all — if you got
-JSON back, this is true). `alive` means Chrome is **there right now**, re-checked per call.
-`launched` means a browser was started at some point, which is what `alive` used to report — it
-stayed true after Chrome died, so `/status` and `doctor.py` called a wedged engine healthy while
-every op failed (issue #8). `chrome_pid` is the browser's pid, or null.
+| Field | Meaning |
+|---|---|
+| `server` | the HTTP process answered (always true if you got JSON) |
+| `alive` | Chrome answers a CDP round trip **now** (#8) |
+| `launched` | a browser was started at some point. Not health. |
+| `code` | the source this process imported at launch. Compare `code.sha` with your checkout before assuming a fix is live. |
+| `rss_mb`, `fds`, `cdp_sockets`, `scope_*` | memory and leak signals (#23, #28) |
 
-Chrome launches **lazily**: nothing spawns a browser until the first real op
-(`start`/`goto`/`newtab`/etc.) asks for one. Polling
-`/status` in a loop **waiting for `alive` to turn true on its own will hang forever** if nothing
-else ever calls a real op - this is not a bug to work around, it's the intended lazy-launch design
-(no wasted Chrome startup if a caller never ends up driving the browser), but it has caught agents
-off guard before. If you just want the browser up and ready before doing anything else, call `POST
-/start` and wait for its response - it blocks until Chrome is launched, so there's no ambiguity
-about what to poll for.
+**Chrome launches lazily.** Nothing starts a browser until an op needs one, so polling `/status` for
+`alive` will wait forever. Call `POST /start` instead: it blocks until Chrome is up.
 
-## Connect, auto-starting the server if needed
+## Ops
 
-**This is now `engine/connect.py` — import it instead of copying the snippet:**
-
-```python
-from engine import connect
-connect.ensure()                                  # engine + Chrome up, idempotent
-page = connect.call("text")                       # or connect.op("text"), which ensures first
-whole = connect.capture("https://example.com")    # own tab, solve, extract, close  <- usually this
-```
-
-The snippet below is kept as documentation of what `ensure()` does, for non-Python callers.
-
-```python
-import os, sys, json, time, subprocess, urllib.request
-REPO = os.environ.get("PLAYWRONG_REPO", os.getcwd())
-PORT = int(os.environ.get("PH_PORT", "8731"))
-BASE = f"http://127.0.0.1:{PORT}"
-
-def up():
-    try:
-        urllib.request.urlopen(f"{BASE}/status", timeout=3); return True
-    except Exception:
-        return False
-
-def ensure_server():
-    """Start the capture server if it isn't already running, then wait for the port. This only
-    waits for the HTTP PROCESS to answer - it does NOT wait for Chrome (that's /start, see below),
-    and does not need to: up() checks reachability only, never the "alive" field."""
-    if up(): return
-    subprocess.Popen([sys.executable, f"{REPO}/engine/server.py"],
-                     env={**os.environ, "PH_PORT": str(PORT)},   # no PYTHONPATH needed
-                     stdout=open(os.path.join(REPO, "tmp", "playwrong-server.log"), "a"),
-                     stderr=subprocess.STDOUT)
-    for _ in range(60):                 # wait up to ~30s for the HTTP server to bind
-        if up(): return
-        time.sleep(0.5)
-    raise RuntimeError("playwrong server did not start")
-
-def call(op, **body):
-    req = urllib.request.Request(f"{BASE}/{op}", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    return json.loads(urllib.request.urlopen(req, timeout=120).read())
-
-# --- usage ---
-ensure_server()                                  # start the HTTP process if needed
-call("start")                                     # explicitly launch Chrome and wait for it (optional
-                                                   # but recommended - see the alive/server note above;
-                                                   # skippable since goto/etc. below trigger it anyway)
-call("goto", url="https://example.com")           # navigate
-# behind Cloudflare? clear the challenge once; the cleared session is reused:
-if "just a moment" in call("text")["title"].lower():
-    call("solve", tries=20)
-page = call("text")                               # {html, title, url}
-shot = call("shot")["b64"]                         # base64 PNG
-```
-
-Shell equivalent (the bundled client):
-```
-REPO_ROOT="$(pwd)"  # set to your local checkout root if needed
-# no need to start the server: every client verb below starts it (and Chrome) if they're down
-"$REPO_ROOT/playwrong" https://example.com      # one page, as text
-python "$REPO_ROOT/engine/client.py" goto https://example.com
-python .../engine/client.py solvecf      # solve Turnstile
-python .../engine/client.py text         # html
-python .../engine/client.py shutdown     # clean stop (never pkill the browser)
-```
-
-## Endpoints (the real contract — engine/server.py)
-| Method | Path | Body | Returns |
-|---|---|---|---|
-| GET | `/status` | — | `{server: true, alive: bool, launched: bool, chrome_pid: int\|null, code: {sha, dirty, started}, pid, rss_mb, swap_mb, fds, cdp_sockets, tabs, threads, uptime_s, scope_current_mb, scope_peak_mb, scope_unreclaimable_mb, scope_max_mb, scope_oom_kills, memory_cap, rss_limit_mb, headless, display, display_mode}` — `server` is always true if this responds at all; `alive` is a live check of the browser (false before the first op launches it, and false again if it dies); `launched` is the old "has one ever started" flag; `code` is the source this PROCESS is running, stamped at launch — a long-lived engine keeps serving what it imported, so compare `code.sha` with your checkout before concluding a fix is live; the memory fields are the engine's own `/proc` reading (#23) |
-| POST | `/start` | — | `{started: true}` — explicitly launches Chrome and blocks until ready; use this instead of polling `/status` for `alive` |
-| POST | `/goto` | `{url, no_js?}` | `{title, url, requested, ready_state}` — navigates (2s settle, then up to `LOAD_WAIT` for `ready_state` `complete`; anything else means the page was still loading, #32; `null` under `no_js`). `url` is `location.href` *after* redirects/interstitials; `requested` is what you asked for. Set `no_js=true` to disable JS execution in Chrome (e.g. to bypass client-side paywall script truncation). Storing the requested url records a page you may never have got. |
-| POST | `/solve` | `{tries?}` | `{passed, iter}` — finds + clicks the Turnstile "verify you are human" iframe, polls until clear |
-| POST | `/text` | — | `{html, title, url}` — current page |
-| POST | `/shot` | — | `{b64}` — PNG screenshot base64 |
-| GET | `/frame` | — | `image/png` — latest screenshot bytes (for live viewing) |
-| POST | `/clearcookies` | — | `{cleared}` |
-| GET | `/markers`, POST `/setmarkers` | — | overlay markers (for the /viz debug page) |
-| GET | `/viz` | — | side-by-side debug viewer (mirror + overlay) |
-| POST | `/shutdown` | — | `{ok}` — clean stop |
-
-## Notes for agents
-- **PDFs: don't open them in the browser, and don't curl them either.** Chrome's built-in PDF viewer
-  (PDFViewerApplication) can't be driven via JS: page navigation, scrolling and thumbnail clicks all
-  fail. And curl gets a bot wall's block page (often saved as a .pdf that won't open) — so for a
-  protected file neither tool works alone.
-  The working sequence is: clear the challenge in the browser → read `/cookies` → fetch the file over
-  HTTP with that jar *and the browser's exact User-Agent*. That is implemented, so don't hand-roll
-  it: `playwrong --pdf <url> -o sources/doc.pdf`, the MCP `pdf` tool, or `connect.pdf(url, path=…)` /
-  `connect.download(url, path)` for any file type. `connect.session_headers(url)` returns just the
-  `{Cookie, User-Agent, Referer}` if you want to drive the download yourself.
-  **Use it even when the url looks unprotected**, because you cannot tell in advance and the failures
-  are silent: a 200 whose body is a login page, or a 45-page datasheet that arrives as 10 pages. Both
-  save without error. `connect.pdf` checks the magic bytes and returns `pages`, so both are visible;
-  it also returns `final_url` (post-redirect) and `bytes` for a manifest. See docs/MCP.md.
-- **Every url comes through this engine** — not curl, wget, urllib or a built-in web-fetch, and that
-  includes a url you already have, a raw file, or one that looks simple. A fetch made any other way
-  loses the only thing this provides, silently: the 200-that-is-a-login-page and the 10-of-45-pages
-  above, plus DuckDuckGo answering HTTP 202 + an image CAPTCHA, and a client-rendered page arriving
-  as an empty shell. All look like success. A tool here misbehaving is a bug to report, not a reason
-  to fall back to curl.
-- **A page behind a login: ask the user, don't route around it.** Chrome is headed and the person is
-  in front of it, so the working move is `/goto` the page, then stop and ask them to sign in to that
-  tab (tabs carry the caller's agent label), then `/text` when they confirm. Don't poll or sleep
-  while you wait — end the turn. Never handle the credentials yourself: not pasted into chat, not
-  typed via `/js`, not read from a file. 2FA, SSO and a CAPTCHA on the login form are theirs too, and
-  they work precisely because the browser is real. Pair with `PH_PROFILE` below so it survives a
-  restart.
-- **Tab cleanup is owner-scoped.** `closeextra {owner, force}` closes the caller's own tabs plus any
-  whose owning process has exited, spares other agents' live tabs and returns them in `skipped`.
-  Pass the `owner` you opened tabs with (`newtab {owner}`) or your tabs look like someone else's;
-  `force: true` closes everything but tab 0, as it always did. Advisory, not enforced — the failure
-  it prevents is an accident (#15).
-- **One browser, shared.** The server holds ONE headed Chrome, alive across requests, so the cleared
-  Turnstile session persists — solve once, many agents/calls reuse it. Don't launch a second browser
-  (causes orphan-window conflicts).
-- **A dead browser heals itself; don't restart the engine for it.** An op that hits a dropped
-  connection drops the dead handles and retries once, and `_ensure()` re-checks the browser rather
-  than trusting a handle. Two outcomes:
-  - **Socket died, Chrome still running** (issue #6) → **reattach** over `/cdp`. The cleared
-    Turnstile session and every login survive, because it is the same browser.
-  - **Chrome exited** — crash, or someone closed the window → **relaunch**. A still-running browser
-    is stopped first so it is not orphaned. Cookies and the cleared session are lost unless the
-    profile is persistent (`PH_PROFILE`).
-
-  Tab tags are dropped with the browser they named either way, so re-open your tabs. Before the fix
-  this state was permanent and invisible: every op returned `ConnectionClosedError` while `/status`
-  said `alive: true` (issues #6, #7, #8). `python scripts/recovery_test.py` is the regression guard —
-  it covers the closed-window and crash paths; the reattach path can't be forced from outside the
-  engine and is untested.
-- **Memory is measured, capped and fatal, in that order (#23).** Every `tmp/nd-server.log` line
-  carries `pid=`; every op logs `op_done op= ms= rss_mb=`; a watchdog logs `mem` every 60s with the
-  same fields `/status` reports (`rss_mb`, `fds`, `cdp_sockets`, `tabs`, `threads`). The engine
-  re-execs itself into a systemd user scope (`MemoryMax`, `MemorySwapMax=0`, `OOMPolicy=continue`,
-  default `PH_MEMORY_MAX=8G`, `0` disables) so a leak never takes the host; `/status`
-  `memory_cap` says what was achieved.
-- **Out of memory loses one tab, not the engine (#28).**
-  - `OOMPolicy=continue` (`memory.oom.group=0`): the kernel kills its top scorer, a renderer.
-  - Ops on that tab then raise `TabCrashed` ("this tab's renderer was killed …") instead of hanging;
-    `close_tab` still works. Logged as `renderer_crashed`.
-  - `newtab`/`prefetch` raise `MemoryHighWater` above `PH_MEMORY_HIGH_WATER` (0.85) of the cap, counting
-    unreclaimable memory (anon + shmem + kernel − reclaimable slab).
-  - The `mem` line adds `scope_*_mb`, `scope_oom_kills` and `top_renderers=pid:MB`; `tab_mem` lines give
-    each connected tab's JS heap + array buffers.
-  - Chrome's browser process moves itself into its own uncapped `app-com.google.Chrome-<pid>.scope`;
-    renderers, GPU and utilities stay under the cap. At `rss_limit_mb` (75% of the cap, or `PH_RSS_LIMIT`) it logs
-  `rss_limit`, stops Chrome and exits 3 — the next call restarts it. `cdp_sockets` is the number to
-  watch: it counts every process's connections to this Chrome, so the engine's own share tracks its
-  tab count (277 for 3 tabs was the nodriver-era leak; the engine now holds one socket) and a high
-  count next to a small `fds` means a client attached via `/cdp` is leaking sockets.
-- **Capture-only, no DB.** You get html/cookies/screenshot back; store it yourself. This engine never
-  touches a database.
-- **Cookies:** `POST /cookies` returns `{cookies:[{name,value,domain}]}` for the whole browser,
-  including the cleared `cf_clearance`. (This used to be listed as "a small planned addition" — it
-  has existed and worked for a while; the note was stale.)
-- **Clean shutdown over the port** (`/shutdown`), never `pkill` — that orphans Chrome + loses the
-  session.
-- **Concurrency:** multiple agents can POST to the same server; calls are serialised on the single
-  browser. For true parallelism run multiple servers on different `PH_PORT`s.
-- **Persistent profiles: `PH_PROFILE=<name>` (or `PH_PROFILE_DIR=<path>`).** Unset = ephemeral, a
-  throwaway profile per launch. A *name* is resolved to `$XDG_DATA_HOME/playwrong/profiles/<name>`
-  and created for you, so logins and cleared sessions survive a restart. On the CLI:
-  `playwrong --profile work <url>` — each name gets its own engine on its own stable, name-derived
-  port, since a Chrome profile is fixed at browser launch and one engine therefore serves one
-  profile.
-- **Stale `SingletonLock` — now healed automatically, no longer a manual step.** If a
-  persistent-profile engine died without a clean `/shutdown` (crash, `kill -9`, host reboot),
-  Chrome's `SingletonLock`/`SingletonCookie`/`SingletonSocket` are left pointing at a long-dead PID,
-  and a relaunch against that profile used to hang indefinitely — `/status` never reporting `alive`,
-  nothing in `tmp/nd-server.log` past `server_start`. Not a crash: the launch itself was stuck on
-  the lock. The engine now checks the lock's owning PID before launching and removes the three files
-  only if that process is gone (a live lock is left alone), logging `profile_lock_cleared`. Session
-  data is never touched.
-- **Diagnosing a launch that "hangs":** check `tmp/nd-server.log` (structured, one line per
-  `server_start`/`nd_started`/`op_err` event - NOT the same as the HTTP process's own redirected
-  stdout, which stays empty during a normal lazy-launch wait since nothing calls `print()`). A
-  `server_start` line with no matching `nd_started` after it, and no `op_err`, most often just
-  means `/start` (or a real op) was never actually called yet - see the `server` vs `alive` note
-  above - not that anything is broken.
-
-## Full verb set
-`engine/server.py` implements the full surface (verified live):
+Driving ops take an optional `tab` (a tag or an index). Without one, they act on the engine's active
+tab.
 
 | Op | Body | Returns |
 |---|---|---|
-| `start` | — | `{started:true}` — explicitly launch Chrome (otherwise lazy - see `/status` note above) and block until ready |
-| `goto` | `{url}` | `{title,url,requested}` — `url` = landed, `requested` = asked |
-| `solve` | `{tries?}` | `{passed,iter}` |
-| `text` | — | `{html,title,url}` |
-| `shot` | — | `{b64}` |
-| `frame` (GET) | — | `image/png` |
-| `move` | `{x,y}` | `{ok,x,y}` — CDP synthetic mouse move (no real-cursor jump) |
-| `click` | `{x,y}` | `{ok,x,y}` — CDP synthetic click |
-| `key` | `{key}` | `{ok,key}` — named (Enter/Tab/Escape/…) or a printable char |
-| `newtab` | `{url?, tag?, owner?}` | `{ok,url,index,tag,target_id}` — fresh tab. **Pass a `tag`** and every later op can name it via `tab`, which is how concurrent callers avoid driving each other's page. `owner` ("agent@repo:pid") is prefixed to the tab's TITLE so a human can see who opened it, and stripped from every title the API returns |
-| `tabs` | — (also `GET /tabs`) | `{tabs:[{index,url,title,active,tag,target_id}],count}` — enumerate every open tab, including who owns it. `url`/`title` come from each target and are populated for BACKGROUND tabs too |
-| `closetab` | `{tag?}`, `{index?}` or `{url?}` `{keep_first?}` | `{closed,remaining}` — close by **tag** (exact, race-free), index, or url-substring; won't close tab 0 or the last tab. Prefer `tag`: an index goes stale the instant another caller closes a lower-numbered tab |
-| `closeextra` | — | `{closed,remaining}` — close ALL tabs except the base tab (leak cleanup) |
-| `prefetch` | `{urls,concurrency?,solve?,tries?,timeout?}` | `{job,count,concurrency,timeout}` — starts loading all of them in parallel tabs and returns IMMEDIATELY. Per-url `timeout` (30s) so one stalled page cannot hold the batch |
-| `jobs` | `{job?}` | counts: `{ready,loading,pending,errors,urls}` — cheap to poll, never ships page bodies |
-| `collect` | `{job,drain?}` | `{results:[{status,title,html,url,partial?}],remaining}` — every READY result, removed from the engine once handed over |
-| `cdp` | — | `{host,port,http}` — the shared browser's CDP endpoint, so another process can ATTACH (`engine.cdp.attach(host, port)`) to this SAME browser and open its own tabs (parallel sharding) |
-| `cdp` | `{method, params?, tab?, browser?}` | `{result}` — raw CDP passthrough: any protocol command on the tab's session (default the active tab) or, with `browser: true`, the browser's. Chrome's own error on failure. Request/response only: for events, attach a client to the endpoint. From Python pass it as `body=` (`method` collides with `call()`'s HTTP method). |
-| `window` | `{bounds?, tab?}` | `{windowId, bounds}` — the tab's browser window; with `bounds` (`{left,top,width,height}`) move/resize it first (`client.py rightmon` uses this) |
-| `js` | `{expr}` | `{result}` — evaluates in the page and **resolves promises**: `await …`, a `.then()` chain, objects and arrays all come back as plain JSON. A thrown JS error returns `{error}` with the message. (It used to return null for anything async.) |
-| `cookies` | — | `{cookies:[{name,value,domain}]}` — the whole browser, incl. cleared `cf_clearance`. Feed these to an HTTP client to download a file the browser cleared for you. |
-| `clearcookies` | — | `{cleared}` |
-| `shutdown` | — | `{ok}` |
+| `start` | — | `{started}`: launch Chrome and block until it is ready |
+| `newtab` | `{url?, tag?, owner?}` | `{ok, url, index, tag, owner, target_id}`. A tagged tab doesn't become active. `owner` (`agent@repo:pid`) prefixes the tab title. |
+| `goto` | `{url, tab?, no_js?}` | `{title, url, requested, ready_state}`. `url` is where the page **landed**. Waits a 2 s settle, then up to `LOAD_WAIT` (5 s) for `complete` (#32). `no_js` disables page scripts. |
+| `text` | `{tab?}` | `{title, url, html}` |
+| `solve` | `{tries?, tab?}` | `{passed, iter}`: find and click the Turnstile checkbox (through its OOPIF), poll until clear |
+| `shot` | `{tab?}` | `{b64}`: PNG |
+| `js` | `{expr, tab?}` | `{result}`, main world. Resolves promises; objects come back as JSON. A JS throw returns `{error}`. |
+| `click` / `move` | `{x, y, tab?}` | `{ok, x, y}`: CDP mouse input, viewport CSS pixels |
+| `key` | `{key, tab?}` | `{ok, key}`: a named key (Enter/Tab/Escape/Backspace/arrows) or a printable char |
+| `window` | `{bounds?, tab?}` | `{windowId, bounds}`; with `{left, top, width, height}`, moves/resizes the window first |
+| `cdp` | — | `{host, port, http}`: the browser's CDP endpoint |
+| `cdp` | `{method, params?, tab?, browser?}` | `{result}`: raw CDP on the tab's session, or the browser's with `browser: true`. Errors carry Chrome's message. Request/response only. |
+| `tabs` | — (or `GET /tabs`) | `{tabs: [{index, url, title, active, tag, owner, target_id}], count}` |
+| `closetab` | `{tag}` (or `{index}` / `{url}`, `keep_first?`) | `{closed, remaining}`. Prefer `tag`: an index shifts when another caller closes a tab. Never closes the last tab, nor tab 0 while `keep_first`. |
+| `closeextra` | `{owner?, force?}` | `{closed, remaining, skipped}`: closes your tabs (`owner`) and orphans of exited processes; spares live agents' tabs. `force` closes all but tab 0 (#15). |
+| `prefetch` | `{urls, concurrency?, solve?, tries?, timeout?, owner?}` | `{job, count, concurrency, timeout}`, immediately. Each url has its own `timeout` (30 s). |
+| `jobs` | `{job?}` | `{job, total, delivered, ready, loading, errors, pending, done}`, or `{jobs: […]}` for every job |
+| `collect` | `{job, drain?}` | `{job, results: [{status, title, html, url, partial?} \| {status: "error", requested, error}], remaining, done}`. Drained once handed over. Jobs idle for `JOB_IDLE` (600 s) are dropped. |
+| `cookies` | — | `{cookies: [{name, value, domain}]}`: the whole browser, including `cf_clearance` |
+| `clearcookies` | — | `{cleared}`. Wipes the **shared** session. |
+| `shutdown` | — | `{ok}`. Stops the engine **for everyone**. Never `pkill` instead. |
 
-`engine/client.py` (CLI) wraps these; some client-only helpers (`inject`, `detect`, `rightmon`,
-ollama vision) are convenience layers on top of the core ops.
+From Python, `connect.call("cdp", body={"method": …})`: `method` collides with `call()`'s own HTTP
+method argument.
 
-## Sharding contract — ONE server, many agents, tabs are the unit of work
+## Tabs: the unit of sharing
 
-**playwrong is a single long-running process that many agents SHARE by opening their own tabs.** This
-is the core operating model — treat it accordingly:
-
-- **Never launch your own browser** (`cdp.launch()`) or `pkill` Chrome to "get a clean slate." That
-  defeats the shared server (orphan windows, lost Turnstile session, competing browsers). Connect to
-  the running server on its port; if it isn't up, `ensure_server()` starts THE one server.
-- **Never `shutdown` the server** to end your work. Shutdown stops it for everyone. Close YOUR tabs
-  instead (`closetab`), leave the server running.
-- **A tab is your shard.** `newtab` → do your work on it → **`closetab` when done.** The returned
-  `index` is your handle. An agent that opens tabs and never closes them leaks tabs and renderer
-  processes (a crawler that opened 8 tabs/run and never closed them left ~20 orphan renderers — the bug
-  these verbs fix). Track what you open; close what you opened.
-- **Cleanup after a crash:** `closeextra` closes every tab except the base tab — the panic button when
-  an aborted run left orphan tabs. It never touches the server process.
-- **`closed`/`remaining` come from Chrome.** The server re-reads the target list (`_refresh()`)
-  before answering and waits for closed targets to go; a new verb reporting tab counts should too.
-- **The base tab (index 0) is protected** — `closetab` won't close it and `closeextra` keeps it, so the
-  server always has a live tab (its `/status` stays alive).
-
-Multiple agents can POST concurrently; ops are serialised on the single browser. For true parallel
-browsers, run multiple servers on different `PH_PORT`s — but within one server, shard by tab.
-
-### Tab tagging — the built-in answer for concurrent callers
-
-**Every driving op takes an optional `tab`** (`goto`, `text`, `shot`, `js`, `click`, `key`, `move`,
-`solve`). Omit it and you get the engine's active tab, which is fine for a single caller. Pass a tag
-and the op acts on YOUR page no matter what anyone else is doing:
-
-- A tagged `newtab` does not become the active tab; only an untagged one does. If the active tab
-  vanishes (closed from outside, or a hung page's target torn down), the next untagged op moves to
-  a live untagged tab, or a fresh `about:blank`, and retries once. The log line is `tab_repointed`.
-  Before #22 that state was permanent: `/status` said `alive: false` while Chrome was fine.
-
+One engine, one browser, many callers. Each caller works in **its own tagged tab**:
 
 ```python
-connect.call("newtab", tag="agent-7", url="about:blank")
-connect.call("goto", url="https://example.com", tab="agent-7")
-page = connect.call("text", tab="agent-7")          # your page, guaranteed
+connect.call("newtab", tag="agent-7", owner=connect.OWNER, url="about:blank")
+connect.call("goto", url="https://awto.au", tab="agent-7")
+page = connect.call("text", tab="agent-7")          # your page, whatever anyone else is doing
 connect.call("closetab", tag="agent-7")
 ```
 
-Without this, two callers on one engine silently returned each other's pages: A's `goto`, then B's
-`goto` moving the active tab, then A's `text` reading B's page. Tags resolve to CDP target ids, which
-never shift — unlike indices, which move whenever a lower-numbered tab closes.
+- Tags resolve to CDP target ids, which never shift.
+- A tag whose tab was swept is reopened on the next use (#14). An unknown tag errors with
+  `no such tab`.
+- An untagged op whose active tab vanished moves to a live untagged tab (or a fresh `about:blank`)
+  and retries once, logged as `tab_repointed` (#22).
+- **Never** launch your own browser, `pkill` Chrome, or `shutdown` to end your work. Close your tabs.
+- `connect.capture()` and the MCP server do all of this for you.
 
-`engine/connect.py` does all of this for you (`capture()` tags per call), and the MCP server gives
-each agent its own tagged tab. You only need the raw form when driving the port directly.
+## Parallel tabs: attach your own CDP client
 
-### Parallel sharding — attach to the same browser via `/cdp`
-The HTTP ops (`goto`/`text`/…) drive ONE active tab, serialised — fine for a single agent driving one
-page at a time. For a process that needs to drive MANY tabs in parallel (e.g. a crawler), don't fight
-the HTTP serialisation: read the browser's CDP endpoint from `/cdp` and attach your own CDP client to
-the same Chrome:
+To drive many tabs at once with CDP events, attach to the same browser:
 
 ```python
-from engine import cdp
-ep = call("cdp")                                  # {host, port, http}
+from engine import cdp, connect
+ep = connect.call("cdp")                             # {host, port, http}
 browser = await cdp.attach(ep["host"], ep["port"])   # ATTACH, never launch
-tab = await browser.new_tab(url)                  # your own tab on the shared browser
-...                                               # tab.send("Method", {...}), tab.evaluate(...)
-await tab.close()                                 # CLOSE every tab you opened when done
-await browser.aclose()                            # your socket only; Chrome keeps running
+tab = await browser.new_tab("https://awto.au")       # your own tab on the shared browser
+await tab.send("Page.getLayoutMetrics")              # any CDP command
+tab.on("Network.responseReceived", handler)          # events, after the domain is enabled
+title = await tab.evaluate("document.title", isolated=True)   # a world the page cannot hook
+await tab.close()                                    # close every tab you opened
+await browser.aclose()                               # your socket only; Chrome keeps running
 ```
 
-You now drive the shared browser directly (parallel tabs) while still respecting the contract: you
-launched no new browser, you close your own tabs, and you never shut the server down. Two agents can
-coexist — one driving via HTTP ops, another attached via CDP for parallel work — on the one browser.
+- `crawl.browser` wraps this for the crawler.
+- The DevTools port is loopback only, and refuses connections from web origins (#52).
+- For a human: `http://<host>:<port>/json/list` → `devtoolsFrontendUrl`.
 
-_Connect over HTTP:port, auto-start with ensure_server(), drive with goto/solve/text/shot. The engine
-beats Cloudflare Turnstile (raw CDP) and stays capture-only so any app/agent can share it._
+## Recovery
+
+- **The browser socket died but Chrome is still running (#6)** → reattach. The session survives.
+- **Chrome exited** → relaunch. Cookies are lost unless the profile is persistent.
+- Either way, tags are dropped with the browser, so reopen your tabs. `recovery_test.py` covers both
+  cases.
+- **A crashed renderer (#28)**: ops on that tab raise `TabCrashed`; other tabs are unaffected.
+- **Near the memory cap**: `newtab`/`prefetch` raise `MemoryHighWater`. Memory limits:
+  [README](../README.md#memory).
+- **A stale `SingletonLock`** on a persistent profile is removed when its owner pid is gone
+  (`profile_lock_cleared`).
+
+## Logs
+
+In the data dir (the checkout's `tmp/`, or `$XDG_CACHE_HOME/playwrong`):
+
+- `nd-server.log`: `server_start`, `nd_started`, `op_done op= ms= rss_before_mb=`, `op_err`, and `mem`
+  every 60 s. A `server_start` with no `nd_started` usually means no op has asked for Chrome yet.
+- `chrome.log`: Chrome's own output, for a launch that fails.
+- `logs/playwrong-engine.log`: the spawned process's stdout/stderr, including startup tracebacks.
