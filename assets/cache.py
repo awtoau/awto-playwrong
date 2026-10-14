@@ -5,8 +5,7 @@ keeps the response body in its Simple Cache under `<profile>/Default/Cache/Cache
 module walks those entry files, extracts the original image bytes, and hands them to a caller-supplied
 sink (typically assets.store.store_asset) — no network, faithful original bytes (correct sha).
 
-Ported from powderhounds/scripts/recover_cache_images.py (which reverse-engineered the on-disk format).
-Zero project refs — pass a url_filter to scope to your sites, and a sink to store however you like.
+Zero project refs: pass a url_filter to scope to your sites, and a sink to store however you like.
 
 Simple Cache _0 entry layout (verified by byte-dumping v5 entries):
   [SimpleFileHeader 24B: magic u64 | version u32 | key_length u32 | key_hash u32 | pad u32]
@@ -28,8 +27,6 @@ Usage:
 CLI:
     python -m assets.cache --profiles-glob '/tmp/playwrong-profile-*' --root /path/assets --host mysite.com [--dry-run]
 """
-from __future__ import annotations
-
 import glob
 import io
 import os
@@ -38,7 +35,7 @@ import tempfile
 
 try:
     from PIL import Image
-except Exception:  # pragma: no cover
+except ImportError:
     Image = None
 
 SIMPLE_MAGIC = 0xfcfb6d1ba7725c30                      # SimpleFileHeader.initial_magic_number

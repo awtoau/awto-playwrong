@@ -299,8 +299,13 @@ def t_processes():
 def main():
     global _fh, PORT
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, help="engine port (use an isolated one)")
+    ap.add_argument("--port", type=int, default=8739, help="isolated engine port (never 8731)")
+    ap.add_argument("--headed", action="store_true", help="show the browser on your desktop")
     a = ap.parse_args()
+    if a.port == 8731:
+        sys.exit("refusing to run on 8731: this test force-closes tabs on the engine it uses")
+    if not a.headed:
+        os.environ["PH_DISPLAY"] = "xvfb"     # headed Chrome on its own Xvfb, off the desktop
     PORT = a.port
     os.makedirs(os.path.join(connect.DATA, "logs"), exist_ok=True)
     _fh = open(os.path.join(connect.DATA, "logs", "stress-test.log"), "w")

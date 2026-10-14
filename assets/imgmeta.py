@@ -9,18 +9,17 @@ from dataclasses import dataclass, field
 
 try:
     from PIL import Image
-except Exception:
+except ImportError:
     Image = None
 
 try:
     import imagehash
-except Exception:
+except ImportError:
     imagehash = None
 
-# Drop C0 control chars (except tab/nl/cr) + NUL so EXIF strings are safe for Postgres text/jsonb —
-# odd EXIF blobs carry raw binary that otherwise crashes the insert.
+# Drop C0 control chars (except tab/nl/cr) so EXIF strings are safe for Postgres text/jsonb: odd
+# EXIF blobs carry raw binary that otherwise crashes the insert.
 _CTRL = {c: None for c in range(32) if c not in (9, 10, 13)}
-_CTRL[0] = None
 
 
 def _scrub(s):

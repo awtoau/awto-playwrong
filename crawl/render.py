@@ -1,10 +1,15 @@
-"""crawl.render — get a JS-SPA page to actually show its content before capture. Zero project refs.
+"""crawl.render — let a client-rendered page show its content before capture. Zero project refs.
 
-Modern sites ship a script bundle + build the DOM client-side, often behind a cookie-consent wall.
-Capturing too early yields an empty shell. This module: dismisses the consent popup, then polls until
-the visible text mounts (or settles / times out). Consumers call these on the tab after navigating.
+After navigating: wait_ready() (readyState), dismiss_overlays() (consent walls), wait_for_render()
+(visible text mounted). All page reads run in an isolated world (#49).
 """
 import asyncio
+import time
+
+_BODY_LEN = "document.body ? document.body.innerText.length : 0"
+# Polls a below-min_chars length must hold before wait_for_render accepts it as final: a client
+# render often pauses between script load and mount.
+_STABLE_BELOW_MIN = 3
 
 # Accept-buttons for the common consent platforms + a generic text matcher (EN + DE, for .at/.de).
 DISMISS_JS = r"""(() => {
@@ -47,46 +52,34 @@ async def dismiss_overlays(tab):
 
 
 async def wait_for_render(tab, min_chars=200, max_wait=8.0, poll=0.5):
-    """Poll until the page's visible body text reaches min_chars OR stops growing OR max_wait. For
-    JS-SPA sites that build the DOM client-side (else we'd capture the empty pre-render shell).
-    Returns the final body-text length. Best-effort."""
-    import time as _t
-    last = -1
-    t0 = _t.monotonic()
-    while _t.monotonic() - t0 < max_wait:
-        try:
-            n = await tab.evaluate("document.body ? document.body.innerText.length : 0",
-                                   isolated=True)
-            n = int(n) if isinstance(n, (int, float)) else 0
-        except Exception:
-            n = 0
-        if n >= min_chars and n == last:   # reached the bar AND settled
-            return n
-        if n == last and n > 0:            # settled below the bar — no more coming
+    """Poll the visible text length until it settles: one unchanged poll at or above min_chars,
+    _STABLE_BELOW_MIN below it; else max_wait. Returns the last length (0 if unreadable)."""
+    last, same, t0 = -1, 0, time.monotonic()
+    while time.monotonic() - t0 < max_wait:
+        n = await body_text_len(tab)
+        same = same + 1 if n == last else 0
+        if same >= (1 if n >= min_chars else _STABLE_BELOW_MIN):
             return n
         last = n
         await asyncio.sleep(poll)
-    return last
+    return max(last, 0)
 
 
 async def body_text_len(tab):
-    """Current visible body-text length (used to decide if a page is empty). Best-effort -> 0."""
+    """Visible body-text length; 0 when unreadable."""
     try:
-        return int(await tab.evaluate("document.body ? document.body.innerText.length : 0",
-                                      isolated=True) or 0)
+        n = await tab.evaluate(_BODY_LEN, isolated=True)
+        return int(n) if isinstance(n, int | float) else 0
     except Exception:
         return 0
 
 
 async def wait_ready(tab, max_wait=10.0, poll=0.25):
-    """Wait until document.readyState is 'interactive' or 'complete' before capturing. CRITICAL: some
-    driver navigations return while the doc is still 'loading' — grabbing get_content() then yields a
-    partial stub (empty <body>), which parses to near-zero text. Poll readyState first, THEN the
-    caller can wait_for_render for client-rendered content. Returns the final readyState."""
-    import time as _t
-    t0 = _t.monotonic()
+    """readyState "interactive" or "complete" (Page.navigate returns while still "loading", and
+    reading then gets an empty stub), else max_wait. Returns the last state."""
+    t0 = time.monotonic()
     state = "loading"
-    while _t.monotonic() - t0 < max_wait:
+    while time.monotonic() - t0 < max_wait:
         try:
             state = await tab.evaluate("document.readyState", isolated=True) or "loading"
         except Exception:

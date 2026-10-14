@@ -222,7 +222,6 @@ while Chrome is still genuinely headed; `--headed` shows the window on your desk
 | `scripts/check_docs.py` | the docs describe the code that exists: no dead paths, no removed files, every flag and tool real and documented. |
 | `scripts/release.py` | builds, then **installs each artifact into a clean venv and fetches a page with it** before it will upload. `twine check` only validates metadata — it passed the whole time the wheel was broken. |
 | `scripts/install.py` | deps, the `playwrong` command on PATH, and both MCP registries. |
-| `scripts/crawl_theage.py` | crawl The Age website end-to-end (articles & photos) with `--no-js` paywall bypass and asset storage. |
 
 ## Why this exists
 Browser automation kept getting rebuilt per-project. This is the shared home: a **running server**

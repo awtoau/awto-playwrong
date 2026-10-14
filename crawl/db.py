@@ -1,44 +1,36 @@
-"""crawl.db — the crawl's relational store on SQLAlchemy 2.0 Core. One model, any backend.
+"""crawl.db — the crawl's relational store on SQLAlchemy 2.0 Core: one model, any backend.
 
-The engine content-addresses bytes on disk; THIS is the optional relational side — the frontier, the
-page rows, the page->page reference graph, the asset rows, and an `unhandled` feedback table (things
-the engine couldn't classify/handle generically, so a consumer learns what to improve). Zero project
-references: no schema names baked in, no domain columns — just the standard model below.
-
-Built on **SQLAlchemy Core** (not the ORM): one `MetaData`/`Table` model, and SQLAlchemy emits the
-correct DDL, placeholder binding, ON CONFLICT / upsert, and type mapping for whichever backend the URL
-selects. That removes the whole class of hand-rolled-dialect bugs (paramstyle translation, DDL string
-munging, enum-drops-on-sqlite). Drivers are all pure-Python (no-GIL safe): stdlib sqlite3,
-`postgresql+psycopg` (pure-Python psycopg), `mysql+pymysql`.
+- Tables: frontier, page, page_link (the page graph), asset, page_asset, unhandled (things the
+  crawl could not handle generically: a consumer's improvement list). Zero project references.
+- Core, not the ORM: SQLAlchemy emits DDL, binding, upserts and types per backend.
+- Drivers are pure-Python: stdlib sqlite3, postgresql+psycopg, mysql+pymysql. On a free-threaded
+  Python, SQLAlchemy must be built without its C extension (it re-enables the GIL); see README.
 
     from crawl import db
-    d = db.open_db("site.sqlite")                       # -> sqlite:///site.sqlite (a file)
-    d = db.open_db("postgresql+psycopg://u@host/mydb")  # Postgres
-    d = db.open_db("mysql+pymysql://u@host/mydb")        # MySQL/MariaDB
+    d = db.open_db("site.sqlite")                       # or postgresql+psycopg://…, mysql+pymysql://…
     d.init_schema()
     d.enqueue("https://site/", depth=0)
-    for url, depth in d.claim(8):
-        ... engine fetch/render/parse ...
+    for url, depth, link_code in d.claim(8):
+        ... fetch/render/parse ...
         d.upsert_page(stored_page, url, title, text_chars, status="ok")
         d.add_links(page_sha, hrefs)
-        d.upsert_asset(stored_asset); d.link_page_asset(page_sha, img_url, alt, kind)
         d.scan(url, status="ok")
-        d.record_unhandled("consent_unknown", url, sample="<div id=…>")   # feedback for improvement
-
-SQLAlchemy must be the pure-Python build on no-GIL (its cyextension re-enables the GIL) — see the
-Databases note in python-coding-style.md. This module doesn't enforce that; the venv is set up for it.
 """
 import datetime
 import json
+from urllib.parse import urlsplit
 
+import sqlalchemy as _sa
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Engine,
     Float,
     Integer,
     MetaData,
+    PrimaryKeyConstraint,
     String,
     Table,
     Text,
@@ -151,16 +143,11 @@ unhandled = Table(
     Column("note", Text),
 )
 
-# composite-PK-ish uniqueness is enforced via upsert index elements below (page_link + page_asset use
-# (page_sha, href/img_url)). SQLAlchemy needs them declared for ON CONFLICT targets:
-from sqlalchemy import PrimaryKeyConstraint  # noqa: E402
-
+# Composite keys, declared so they can be ON CONFLICT targets.
 page_link.append_constraint(PrimaryKeyConstraint("page_sha", "href"))
 page_asset.append_constraint(PrimaryKeyConstraint("page_sha", "img_url"))
 
-# CHECK constraint for the status vocabulary (portable across all three backends).
-from sqlalchemy import CheckConstraint  # noqa: E402
-
+# The status vocabulary as a CHECK (portable across all three backends).
 _status_in = "'" + "','".join(SCAN_STATUSES) + "'"
 frontier.append_constraint(CheckConstraint(f"scan_status IS NULL OR scan_status IN ({_status_in})"))
 page.append_constraint(CheckConstraint(f"scan_status IN ({_status_in})"))
@@ -169,7 +156,7 @@ page.append_constraint(CheckConstraint(f"scan_status IN ({_status_in})"))
 def open_db(dsn, echo=False):
     """Open a crawl DB from a SQLAlchemy URL (or a bare path/filename -> SQLite). Returns a CrawlDB."""
     url = _normalize_dsn(dsn)
-    engine = create_engine(url, echo=echo, future=True)
+    engine = create_engine(url, echo=echo)
     return CrawlDB(engine)
 
 
@@ -185,8 +172,8 @@ def _normalize_dsn(dsn):
     return f"sqlite:///{dsn}"                         # bare path -> SQLite file
 
 
-def _upsert_stmt(engine, table, index_elements, set_cols=None):
-    """Dialect-correct INSERT .. ON CONFLICT DO NOTHING/UPDATE for the engine's backend."""
+def _insert_for(engine, table):
+    """(INSERT statement, dialect name): the dialect's own insert, which supports ON CONFLICT."""
     name = engine.dialect.name
     if name == "postgresql":
         base = pg_insert(table)
@@ -220,11 +207,8 @@ class CrawlDB:
         self._ensure_columns()            # add any columns missing from pre-existing tables
 
     def _ensure_columns(self):
-        """Additively add columns the model defines but an OLDER database is missing (create_all only
-        creates missing tables, not missing columns). Idempotent, safe on every backend — this is what
-        lets existing crawl DBs keep working after the schema gains a field (e.g. link_code/text_sha/
-        caption). Never drops or alters existing columns."""
-        import sqlalchemy as _sa
+        """Add model columns an older database lacks (create_all only adds tables). Idempotent;
+        never drops or alters a column."""
         insp = _sa.inspect(self.engine)
         existing_tables = set(insp.get_table_names())
         with self.engine.begin() as c:
@@ -249,7 +233,7 @@ class CrawlDB:
 
     # -- frontier --------------------------------------------------------------------------------
     def enqueue(self, url, depth=0, discovered_from=None, link_code=None, priority=0.0):
-        stmt, name = _upsert_stmt(self.engine, frontier, ["url"])
+        stmt, name = _insert_for(self.engine, frontier)
         stmt = stmt.values(url=url, depth=depth, discovered_from=discovered_from, link_code=link_code,
                            priority=priority)
         stmt = _do_nothing(stmt, name, ["url"])
@@ -257,13 +241,12 @@ class CrawlDB:
             c.execute(stmt)
 
     def enqueue_many(self, rows):
-        # rows: (url, depth, discovered_from[, link_code])
+        """enqueue() each of rows: (url, depth, discovered_from[, link_code])."""
         for r in rows:
-            self.enqueue(*r[:4]) if len(r) >= 4 else self.enqueue(*r[:3])
+            self.enqueue(*r[:4])
 
     def set_priorities(self, scores):
         """Re-score QUEUED rows: {url: priority}. Rows already claimed or done keep theirs."""
-        import sqlalchemy as _sa
         if not scores:
             return 0
         with self.engine.begin() as c:
@@ -279,13 +262,8 @@ class CrawlDB:
                                             .where(frontier.c.state == "queued")).fetchall()]
 
     def host_counts(self):
-        """{host: pages already attempted} — anything no longer queued.
-
-        Read from the DB, not kept in memory, so a RESUMED run enforces a per-host cap against what
-        previous runs already fetched rather than starting the count from zero. Grouping happens in
-        Python because the frontier stores whole urls and there is no portable host expression across
-        SQLite, Postgres and MySQL."""
-        from urllib.parse import urlsplit
+        """{host: pages already attempted} (rows no longer queued), from the DB so a resumed run caps
+        against earlier runs too. Grouped in Python: no portable SQL host expression."""
         out = {}
         with self.engine.begin() as c:
             rows = c.execute(select(frontier.c.url)
@@ -295,34 +273,15 @@ class CrawlDB:
             out[h] = out.get(h, 0) + 1
         return out
 
-    def claim(self, n, lease_stale_tries=None, shuffle=False, host_diverse=False,
+    def claim(self, n, shuffle=False, host_diverse=False,
               max_per_host=0, host_counts=None, by_priority=False, min_priority=None):
-        """Atomically take up to n queued URLs, mark them 'fetching', return [(url, depth, link_code), …].
-        Uses a single UPDATE..RETURNING (Postgres/SQLite>=3.35/MySQL8) so two crawlers never claim the
-        same rows. Falls back to SELECT-then-UPDATE-in-one-transaction if RETURNING is unavailable.
-
-        Ordering modes (best last):
-        - default: (depth, url). Deterministic but CLUSTERS a host (its pages sort adjacently) so a
-          batch hammers one origin (this tripped wbtools' 429).
-        - shuffle=True: (depth, random). Spreads a batch across hosts within a depth band.
-        - host_diverse=True: ROUND-ROBIN across hosts — take the shallowest queued URL from EACH host in
-          turn, so a batch of n covers up to n DIFFERENT hosts. A host with only deep pages left still
-          contributes (goes deeper) rather than a shallow-heavy host dominating every tab. This is the
-          "one site per tab, even if it means going deeper" model. Overrides shuffle.
-
-        max_per_host / host_counts: cap how many urls a single host may contribute, counting the
-        pages it has ALREADY given (host_counts, normally from host_counts()). The cap is enforced
-        WITHIN this batch, not just between batches — checking only between them let a single batch
-        take ten urls from a host that had one slot left, overshooting the cap by most of a batch.
-        Urls over the cap stay QUEUED: they are not errors, and a later run with a higher cap should
-        still be able to take them.
-
-        by_priority / min_priority (#2): highest `priority` first, ahead of depth, in every mode
-        (host_diverse keeps its round-robin, each host offering its best first). Rows under
-        min_priority stay queued: the per-site stop once only low-value pages remain."""
-        from urllib.parse import urlsplit
-
-        import sqlalchemy as _sa
+        """Take up to n queued urls, mark them 'fetching', return [(url, depth, link_code), …].
+        SELECT then UPDATE in one transaction (Postgres: FOR UPDATE SKIP LOCKED).
+        - Order: default (depth, url) clusters a host; shuffle=True randomises within a depth;
+          host_diverse=True round-robins hosts (one site per tab, going deeper if needed).
+        - max_per_host + host_counts: a per-host cap counting pages already taken, enforced within
+          the batch too. Over-cap urls stay queued.
+        - by_priority: highest priority first in every mode (#2); rows under min_priority stay queued."""
         prio = _sa.func.coalesce(frontier.c.priority, 0.0)
         queued = frontier.c.state == "queued"
         if min_priority is not None:
@@ -440,7 +399,7 @@ class CrawlDB:
                     raw_bytes=getattr(sp, "raw_bytes", None), stored_bytes=getattr(sp, "stored_bytes", None),
                     text_chars=text_chars, text_sha=getattr(sp, "text_sha", None), lang=lang,
                     link_code=link_code, scan_status=status, scan_note=note)
-        stmt, name = _upsert_stmt(self.engine, page, ["sha256"])
+        stmt, name = _insert_for(self.engine, page)
         stmt = stmt.values(**vals)
         stmt = _do_update(stmt, name, ["sha256"],
                           {"url": url, "title": title, "text_chars": text_chars, "scan_status": status})
@@ -453,7 +412,7 @@ class CrawlDB:
         rows = [{"page_sha": page_sha, "href": h} for h in hrefs]
         if not rows:
             return
-        stmt, name = _upsert_stmt(self.engine, page_link, ["page_sha", "href"])
+        stmt, name = _insert_for(self.engine, page_link)
         stmt = _do_nothing(stmt.values(rows), name, ["page_sha", "href"])
         with self.engine.begin() as c:
             c.execute(stmt)
@@ -464,7 +423,7 @@ class CrawlDB:
                     content_type=sa.content_type, ext=sa.ext, bytes=sa.bytes, width=sa.width,
                     height=sa.height, img_format=sa.img_format, img_mode=sa.img_mode, phash=sa.phash,
                     is_probably_photo=sa.is_probably_photo, exif=json.dumps(sa.exif or {}))
-        stmt, name = _upsert_stmt(self.engine, asset, ["sha256"])
+        stmt, name = _insert_for(self.engine, asset)
         stmt = _do_nothing(stmt.values(**vals), name, ["sha256"])
         with self.engine.begin() as c:
             c.execute(stmt)
@@ -474,7 +433,7 @@ class CrawlDB:
                         caption=None, link_code=None):
         # NB: keep alt, kind, asset_sha in their original positions — caption/link_code are appended so
         # existing positional callers (e.g. run.py's link_page_asset(sha, url, alt, kind)) stay correct.
-        stmt, name = _upsert_stmt(self.engine, page_asset, ["page_sha", "img_url"])
+        stmt, name = _insert_for(self.engine, page_asset)
         stmt = stmt.values(page_sha=page_sha, img_url=img_url, alt=alt, caption=caption, kind=kind,
                            asset_sha=asset_sha, link_code=link_code)
         stmt = _do_nothing(stmt, name, ["page_sha", "img_url"])

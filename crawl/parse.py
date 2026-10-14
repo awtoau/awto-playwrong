@@ -124,14 +124,13 @@ def _img_attr(tag, name):
     return m.group(1) if m else None
 
 
-# Ad / tracker beacon URL markers — an image whose URL matches is 'junk', never the prize (M8: an
-# adspeed.net ad was previously classed 'photo' and could be prioritised). Kept minimal + generic.
+# Ad / tracker beacon URL markers: an image whose URL matches is 'junk' (an ad was once classed
+# 'photo'). Minimal and generic.
 _JUNK_IMG_MARKERS = ("doubleclick", "googlesyndication", "google-analytics", "adspeed", "/ads/",
                      "ad.php", "/pixel", "/beacon", "quantserve", "scorecardresearch")
-# GENERIC kinds only — no vertical vocabulary baked in. A consumer passes `extra_rules` (an ordered
-# list of (compiled_regex, kind)) to add domain-specific kinds (e.g. a ski consumer adds piste_map /
-# lift_map). Order: junk -> consumer rules -> generic. `unhandled_cb(url, alt)` (optional) is called
-# when nothing but the 'photo' fallback matched, so a consumer can log it for the improvement report.
+# Generic kinds only. Consumers pass `extra_rules` [(regex, kind)] for their own vocabulary.
+# Order: junk -> consumer rules -> generic. `unhandled_cb(url, alt)` fires when only the 'photo'
+# fallback matched, for the consumer's improvement report.
 _GENERIC_RULES = (
     (re.compile(r"\bmap\b|karte|\bplan\b"), "map"),
     (re.compile(r"panorama|bird.?eye|\b3d\b"), "panorama"),

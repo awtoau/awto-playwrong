@@ -1,26 +1,16 @@
-"""memory_test.py — prove the engine does not grow per tab (issue #23).
+"""memory_test.py — the engine does not grow per tab, and its memory guards fire (#23, #28).
 
-The shared engine reached 39.5 GB and took the host down. Every closed tab had left behind a live
-websocket to Chrome, a listener task and the last 25 CDP results on that connection — whole DOM
-trees from get_content() — about 20 MB each; 277 such ghosts were found for a browser with 3 tabs.
-This opens, drives and closes tabs on an ISOLATED engine and checks that CDP sockets, file
-descriptors and RSS come back to where they started.
+- Default: open, drive and close tabs on an ISOLATED engine; CDP sockets, fds and RSS must return to
+  baseline. Refuses 8731 (it stops the engine).
+- An engine without memory fields in /status is read from /proc (sudo -n if non-dumpable).
 
     python scripts/memory_test.py                        # isolated engine on :8739, stopped after
     python scripts/memory_test.py --cycles 60 --port 8750
     python scripts/memory_test.py --keep                 # leave the engine up for engine_inspect.py
 
-Refuses 8731: the shared engine holds everyone's cleared Turnstile session, and this test closes
-tabs and stops the engine.
+Each guard alone, on a fresh engine whose limit one tab cycle trips:
 
-Against an engine running code from before #23 (no memory fields in /status) the numbers are read
-from /proc instead — sudo -n if the engine's python is non-dumpable — so the same loop demonstrates
-the leak on the old code: `PH_PORT=8750 python <old checkout>/engine/server.py`, then `--port 8750`.
-
-The three guards are exercised on their own, each with a fresh engine on the port whose limit is
-set so low that one tab cycle trips it:
-
-    python scripts/memory_test.py --retire     # PH_RSS_LIMIT=64M: rss_limit logged, engine exits,
+    python scripts/memory_test.py --retire     # PH_RSS_LIMIT=64M + a 40 MB js result: rss_limit, exit,
                                                # the next call is served by a new pid
     python scripts/memory_test.py --recycle    # PH_CHROME_MAX_FETCHES=3: chrome_recycle logged,
                                                # a different chrome_pid, the caller's tab still works
@@ -48,8 +38,8 @@ from engine import connect  # noqa: E402
 LOGDIR = os.path.join(REPO, "tmp", "logs")
 LOG = os.path.join(LOGDIR, "memory-test.log")
 
-# A page with a few thousand DOM nodes, served from the url itself so the test needs no network.
-# get_content() on it pulls a DOM.getDocument tree of that size — the payload that leaked in #23.
+# A few thousand DOM nodes from the url itself (no network): reading it moves a large DOM payload,
+# the kind that leaked in #23.
 PAGE = "data:text/html," + urllib.parse.quote("<title>memtest</title>" + "<p>node</p>" * 2000)
 
 # Allocates ~52 MB of array buffer every 50 ms (~1 GB/s), touching every page so it is RSS. Array
@@ -134,7 +124,7 @@ def cycle(port, i):
     tag = f"memtest-{i}"
     connect.call("newtab", port=port, url="about:blank", tag=tag, owner="memory_test")
     connect.call("goto", port=port, url=PAGE, tab=tag)
-    connect.call("text", port=port, tab=tag)          # get_content(): the DOM tree that leaked
+    connect.call("text", port=port, tab=tag)          # the whole document: the payload that leaked
     connect.call("js", port=port, expr="document.title", tab=tag)
     r = connect.call("closetab", port=port, tag=tag)
     if r.get("closed") != 1:

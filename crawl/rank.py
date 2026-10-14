@@ -11,11 +11,14 @@ priority = sitemap + shape + opr, each in [0, 1]:
 Every fetch goes through playwrong (engine.connect.download); `fetch` is injectable for tests.
 """
 import gzip
+import json
 import os
 import re
 import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
+
+from engine import connect
 
 # Listing/archive/utility shapes that are rarely the substance of a site.
 AVOID = (r"/tags?/", r"/category/", r"/categories/", r"/page/\d", r"/feed", r"/print", r"/author/",
@@ -44,27 +47,25 @@ def shape_score(url, prefer=(), avoid=()):
     return max(0.0, min(1.0, score))
 
 
-def _default_fetch(url, port=None):
-    """Bytes at url through playwrong (the engine on `port`), or None."""
-    from engine import connect
-    fd, path = tempfile.mkstemp(prefix="rank-", dir=_tmpdir())
+def _download(url, port=None, **kw):
+    """Bytes at url through playwrong (engine on `port`), via a scratch file in connect.DATA (never
+    the package dir, which is site-packages when installed)."""
+    fd, path = tempfile.mkstemp(prefix="rank-", dir=connect.DATA)
     os.close(fd)
     try:
-        connect.download(url, path=path, port=port)
-        return open(path, "rb").read()
+        connect.download(url, path=path, port=port, **kw)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(path)
+
+
+def _default_fetch(url, port=None):
+    """Bytes at url, or None on any failure (a missing sitemap is normal)."""
+    try:
+        return _download(url, port)
     except Exception:
         return None
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
-def _tmpdir():
-    d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmp")
-    os.makedirs(d, exist_ok=True)
-    return d
 
 
 def _xml(data):
@@ -121,20 +122,11 @@ def opr_key(path=SECRETS):
 
 def opr_ranks(domains, key, fetch_json=None, port=None):
     """{domain: rank 0-10} from OpenPageRank; domains it does not know are left out."""
-    import json
     if not key or not domains:
         return {}
     if fetch_json is None:
         def fetch_json(url):
-            from engine import connect
-            fd, path = tempfile.mkstemp(prefix="opr-", dir=_tmpdir())
-            os.close(fd)
-            try:
-                connect.download(url, path=path, port=port, solve=False,
-                                 extra_headers={"API-OPR": key})
-                return json.load(open(path))
-            finally:
-                os.unlink(path)
+            return json.loads(_download(url, port, solve=False, extra_headers={"API-OPR": key}))
     out, ds = {}, sorted(set(domains))
     for i in range(0, len(ds), OPR_BATCH):
         q = "&".join(f"domains%5B{j}%5D={urllib.parse.quote(d)}"

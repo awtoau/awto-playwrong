@@ -38,10 +38,8 @@ LOGDIR = os.path.join(REPO, "tmp", "logs")
 LOG = os.path.join(LOGDIR, "recovery-test.log")
 URL = "https://example.com"
 
-# A relaunch is one uc.start(): measured at 0.8s (server_start -> nd_started in tmp/nd-server.log).
-# 20s is 25x that, because the op that triggers it also loads a page over the network — the page,
-# not the launch, is what makes this slow. On expiry the op is reported as failed with its elapsed
-# time, which is the answer either way: recovery did not happen.
+# A relaunch (cdp.launch) takes well under a second; the op that triggers it also loads a page over
+# the network, which dominates. On expiry the op is reported failed with its elapsed time.
 RELAUNCH_BUDGET = 20.0
 # A page whose renderer never yields (#27, #29). Opened with newtab{url}, so no goto waits on it.
 HUNG = "data:text/html,<title>hung</title><script>while(true){}</script>"

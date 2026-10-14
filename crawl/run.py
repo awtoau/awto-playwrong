@@ -28,6 +28,8 @@ import sys
 import time
 from urllib.parse import urlsplit
 
+from engine import cdp
+
 from . import browser, db, graph, netblock, parse, rank, ratelimit, render, store
 
 
@@ -86,10 +88,10 @@ async def _fetch_one(tab, url, depth, cfg, d, stats, link_code=None):
             # 'blocked' is the valid SCAN_STATUSES member for a rate-limit (429/503); 'rate_limited'
             # is NOT in the CHECK vocabulary and would violate the constraint.
             d.scan(url, status="blocked", http_status=doc_status["code"],
-                   note=f"429/503 backoff -> {rl._h(host).delay:.1f}s"); terminal = True
+                   note=f"429/503 backoff -> {rl.delay(host):.1f}s"); terminal = True
             d.enqueue(url, depth, link_code=link_code)   # requeue (keep the tag) for a slower attempt
             stats["fail"] += 1
-            print(f"  429 backoff {rl._h(host).delay:.0f}s (requeued) {url[:60]}", flush=True)
+            print(f"  429 backoff {rl.delay(host):.0f}s (requeued) {url[:60]}", flush=True)
             return
         # nav can return while the doc is still 'loading' -> a stub with an empty body. Wait for the
         # DOM to be ready, dismiss any consent wall, then let client-rendered content mount.
@@ -155,11 +157,8 @@ async def _auto_dismiss_dialogs(tab):
         pass
 
 
-# Bounds on the tab plumbing around each fetch (#27); same CDP ops as the engine's, derived the same
-# way (issue #29, `scripts/op_latency.py`): createTarget worst 399 ms -> 0.5 s; close p99.9 217 ms
-# -> 0.3 s. Expiry logs the op, limit and elapsed; the worker moves on.
-NEWTAB_TIMEOUT = 0.5
-CLOSE_TIMEOUT = 0.3
+# Tab open/close around each fetch: the engine's bounds (#27, #29). Expiry logs op, limit, elapsed.
+NEWTAB_TIMEOUT, CLOSE_TIMEOUT = cdp.NEWTAB_TIMEOUT, cdp.CLOSE_TIMEOUT
 # Setup sends (Fetch/Page enable) on a fresh about:blank tab: local round trips, bounded like a close
 # plus margin for the first send's attach.
 SETUP_TIMEOUT = 1.0
@@ -221,24 +220,9 @@ async def _new_tab(b, cfg):
     return tab, blk
 
 
-async def _recycle(b, cfg, tab, blk):
-    """Replace a tab that has gone bad — close the old one, open a fresh one. Isolation without a leak:
-    a wedged/leaked renderer is discarded so it can't poison the next page, but we never grow the tab
-    count. Best-effort close (a crashed tab may already be gone)."""
-    try:
-        await _bounded(blk.disable(), CLOSE_TIMEOUT, "resource blocker disable")
-    except Exception:
-        pass
-    await _close_tab(b, tab)
-    return await _new_tab(b, cfg)
-
-
-async def _worker(slot, b, queue, cfg, d, stats):
-    """Pull URLs from the shared queue until a None sentinel. FRESH TAB PER URL: every URL gets its own
-    brand-new tab (with its own resource blocker), and the tab is CLOSED as soon as the page is done —
-    no tab is ever reused across URLs. This is the strongest process isolation (a page can't leak state,
-    cookies, or a wedged renderer into the next one) at the cost of a tab open/close per page. `slot` is
-    kept for signature/pool compatibility but no persistent tab lives in it."""
+async def _worker(b, queue, cfg, d, stats):
+    """Pull urls until a None sentinel; each url gets a fresh tab, closed when done, so no page can
+    leak state or a wedged renderer into the next."""
     while True:
         item = await queue.get()
         try:
@@ -248,15 +232,8 @@ async def _worker(slot, b, queue, cfg, d, stats):
             tab = blk = None
             try:
                 tab, blk = await _new_tab(b, cfg)          # a fresh tab for THIS url only
-                # HARD STALL GUARD: one ceiling over the WHOLE fetch (nav + render + capture). A page
-                # that wedges the tab (e.g. a 'Leave site?' beforeunload the auto-dismiss missed, an
-                # infinite redirect, a hung renderer) can't stall the crawl — we abandon it and the tab
-                # is closed below. Ceiling = generous multiple of the nav budget so a slow-but-fine page
-                # still finishes.
-                # Ceiling over the WHOLE fetch. Explicit --stall-ceiling wins; else a generous multiple
-                # of the nav budget. Lower it to abandon slow pages sooner (fresh-tab-per-URL means a
-                # faster abandon = the next tab starts sooner — the aggressive "cut losses" mode).
-                stall_ceiling = cfg.stall_ceiling if cfg.stall_ceiling else max(45.0, cfg.nav_timeout * 4)
+                # One ceiling over the whole fetch: a page that wedges the tab is abandoned.
+                stall_ceiling = cfg.stall_ceiling_s
                 try:
                     await asyncio.wait_for(
                         _fetch_one(tab, url, depth, cfg, d, stats, link_code), timeout=stall_ceiling)
@@ -268,19 +245,15 @@ async def _worker(slot, b, queue, cfg, d, stats):
                     stats["fail"] += 1
                     print(f"  STALL >{stall_ceiling:.0f}s abandoned {url[:60]}", flush=True)
             except Exception as e:
-                # _fetch_one records its own terminal state — but only if it RAN. _new_tab() raising
-                # (the browser stopped answering CDP) left the row in 'fetching' forever, and a run
-                # burned its whole frontier that way in 44 minutes while reporting success (#17).
-                # Hand it back as queued so the lease is released immediately rather than waiting to
-                # expire; n_tries is the ceiling that stops this looping.
+                # _fetch_one never ran (no tab): hand the row back as queued now, not at lease
+                # expiry (#17); n_tries stops it looping.
                 try:
                     d.scan(url, status="error", note=f"fetch failed: {e!r}"[:180], done=False)
                 except Exception:
                     pass
                 stats["fail"] += 1
             finally:
-                # Both bounded: after a stall the tab's renderer may be dead, and an unbounded await
-                # here hung every worker in turn, the whole run with them (#27).
+                # Bounded: after a stall the renderer may be dead (#27).
                 if blk is not None:
                     try:
                         await _bounded(blk.disable(), CLOSE_TIMEOUT, "resource blocker disable",
@@ -359,40 +332,32 @@ async def crawl(cfg):
         b = await browser.attach(cfg.port)
         stats = {"ok": 0, "fail": 0, "chars": 0}
         attempted = 0
-        # Per-host cap. Counts come from the DB so a RESUMED run enforces the cap against pages
-        # earlier runs already took, and are then kept up to date in memory rather than re-queried
-        # every batch. Without this a broad crawl never stops: one 58-site run stored 800 pages and
-        # still had 10,195 urls queued.
+        # Per-host counts from the DB, so a resumed run caps against earlier runs' pages too.
         per_host = d.host_counts() if cfg.max_per_host else {}
-        # Lease for a claimed url: 4x the ceiling on a single fetch. A worker holding one longer than
-        # that is not slow, it is gone — the stall guard would have abandoned the page first.
-        lease = (cfg.stall_ceiling if cfg.stall_ceiling else max(45.0, cfg.nav_timeout * 4)) * 4
-        # No page resolved in 3 stall ceilings (every tab abandoned a page, 3 rounds) x1.25 means the
-        # workers are stuck, not slow; the watchdog cuts the batch (#27).
-        no_progress = (lease / 4) * 3 * 1.25
+        # Lease for a claimed url: 4x the per-fetch ceiling (the stall guard abandons first).
+        lease = cfg.stall_ceiling_s * 4
+        # No page resolved in 3 ceilings (x1.25) = workers stuck, not slow: cut the batch (#27).
+        no_progress = cfg.stall_ceiling_s * 3 * 1.25
         strikes = 0
+
+        def claim():
+            return d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
+                           shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
+                           max_per_host=cfg.max_per_host, host_counts=per_host,
+                           by_priority=cfg.rank, min_priority=cfg.min_priority)
         while attempted < cfg.max_pages:
-            # Mid-run recovery. reclaim_stuck() used to run only at startup, so a row stranded by a
-            # dead worker stayed stranded for the whole run (#17).
-            rec = d.reclaim_stuck(lease_seconds=lease)
+            rec = d.reclaim_stuck(lease_seconds=lease)      # mid-run, not only at startup (#17)
             if rec["requeued"] or rec["abandoned"]:
                 print(f"  reclaimed {rec['requeued']} stale claim(s), abandoned {rec['abandoned']} "
                       f"past {db.MAX_TRIES} tries", flush=True)
-            batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
-                            shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
-                            max_per_host=cfg.max_per_host, host_counts=per_host,
-                            by_priority=cfg.rank, min_priority=cfg.min_priority)
+            batch = claim()
             if not batch:
-                # Empty does not mean finished: it also happens when every remaining row is claimed
-                # but unresolved. Force-expire the leases and look once more before calling it done.
+                # Empty can also mean "all claimed, none resolved": expire leases, look once more.
                 rec = d.reclaim_stuck(lease_seconds=0)
                 if rec["requeued"]:
                     print(f"  work-list looked empty; recovered {rec['requeued']} claimed-but-"
                           f"unresolved url(s)", flush=True)
-                    batch = d.claim(min(cfg.tabs * 3, cfg.max_pages - attempted),
-                                    shuffle=cfg.shuffle, host_diverse=cfg.host_diverse,
-                                    max_per_host=cfg.max_per_host, host_counts=per_host,
-                                    by_priority=cfg.rank, min_priority=cfg.min_priority)
+                    batch = claim()
             if not batch:
                 break
             if cfg.max_per_host:
@@ -404,8 +369,7 @@ async def crawl(cfg):
                 queue.put_nowait(item)
             for _ in range(cfg.tabs):
                 queue.put_nowait(None)     # one sentinel per worker
-            # cfg.tabs concurrent workers; each makes + closes its OWN tab per URL (slot arg unused now).
-            workers = [asyncio.create_task(_worker([None], b, queue, cfg, d, stats))
+            workers = [asyncio.create_task(_worker(b, queue, cfg, d, stats))
                        for _ in range(cfg.tabs)]
             if await _watch(workers, stats, no_progress):
                 strikes += 1
@@ -427,9 +391,7 @@ async def crawl(cfg):
         resolved = stats["ok"] + stats["fail"]
         print(f"\nDONE: {stats['ok']} ok, {stats['fail']} fail ({attempted} attempted), "
               f"{stats['chars']} text chars\n", flush=True)
-        # A run that claimed far more than it resolved did not finish the work — it drained the
-        # work-list. That used to print exactly like success: "17 ok, 5 fail (39203 attempted)" with
-        # 39,181 rows left in 'fetching' and nothing queued (#17).
+        # Claimed far more than resolved = the work-list drained, not finished: say so (#17).
         if resolved < attempted:
             counts = d.state_counts()
             print(f"WARNING: {attempted} urls were claimed but only {resolved} produced a result "
@@ -438,7 +400,7 @@ async def crawl(cfg):
                   f"{', '.join(f'{k}={v}' for k, v in sorted(counts.items()))}", flush=True)
             if counts.get("fetching"):
                 print(f"         {counts['fetching']} row(s) still claimed — the next run reclaims "
-                      f"them, or: python -m crawl.browser --sweep", flush=True)
+                      f"them.", flush=True)
             print("         This run did NOT complete the work-list; treat the numbers above as a "
                   "partial pass.", flush=True)
         if cfg.rl is not None:
@@ -448,9 +410,7 @@ async def crawl(cfg):
         print(graph.summary_text(d))
         return stats
     finally:
-        # Fresh-tab-per-URL means every tab already closed itself after its page — nothing to sweep here
-        # (and NO global sweep: other crawls may share this browser). Just release the DB.
-        d.close()
+        d.close()      # every tab closed itself; never a global sweep (the browser is shared)
 
 
 # Hard ceiling on concurrent tabs. Chrome is SHARED with other agents, and each worker holds a
@@ -484,7 +444,7 @@ class Config:
         self.tabs = tabs
         self.depth = depth
         self.nav_timeout = nav_timeout
-        self.stall_ceiling = stall_ceiling   # hard whole-fetch cap; 0 => auto (max(45, nav*4))
+        self.stall_ceiling = stall_ceiling   # hard whole-fetch cap; 0 => auto, see stall_ceiling_s
         self.port = port
         # default: stay on the seeds' own hosts (boundary match, see _same_site)
         self.hosts = hosts or sorted({urlsplit(s).netloc.lower().split(":")[0] for s in seeds})
@@ -499,6 +459,12 @@ class Config:
 
     def excluded(self, url):
         return any(p.search(url) for p in self.exclude)
+
+    @property
+    def stall_ceiling_s(self):
+        """Whole-fetch cap: --stall-ceiling, else 4x the nav budget with a 45 s floor (a slow but
+        healthy page finishes; a wedged one is abandoned)."""
+        return self.stall_ceiling or max(45.0, self.nav_timeout * 4)
 
 
 def _parse_args(argv):

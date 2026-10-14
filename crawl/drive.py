@@ -1,120 +1,111 @@
-"""crawl.drive — hand-drive the shared playwrong browser: click, scroll, screenshot, step through.
+"""crawl.drive — hand-drive a page on the shared engine: click, scroll, screenshot each step.
 
-Folds the former loose `helpers/click.py` + `helpers/scroll.py` into the engine as one reusable module.
-It talks to the running engine over HTTP (reusing crawl.browser._call — one HTTP path, no duplication)
-and — unlike the old helpers — **settles without a fixed `time.sleep`**: after an action it polls
-`document.readyState` + a paint tick until the page is quiet or a bounded number of polls elapse. This
-is the site-agnostic "drive the page and screenshot each step" tool for building/debugging a crawl.
+- Drives its own tab ("drive"), never the shared active tab; the tab persists across runs.
+- After an action it polls document.readyState until "complete", bounded by SETTLE.
 
-CLI:
+    python -m crawl.drive goto URL
     python -m crawl.drive click X Y [OUTNAME]
     python -m crawl.drive scroll [bottom|top|<px>] [OUTNAME]
     python -m crawl.drive shot [OUTNAME]
-Env:
-    PH_PORT      engine port (default 8731)
-    PH_OUT_DIR   screenshot dir (default ./tmp)
+Env: PH_PORT (engine port), PH_OUT_DIR (screenshot dir, default ./tmp)
 
-Library:
     from crawl import drive
-    drive.click(1643, 115, "step2")          # click, settle, screenshot -> tmp/step2.png
-    drive.scroll("bottom", "step1")          # scroll, settle, screenshot
-    info = drive.where()                      # {'title':…, 'url':…}
+    drive.goto("https://awto.au"); drive.click(640, 120, "step2"); drive.where()
 """
 import base64
 import os
 import pathlib
 import sys
+import time
 
-from .browser import _call
+from engine import connect
 
-
-def _port():
-    return int(os.environ.get("PH_PORT", "8731"))
-
-
-def _out_dir():
-    return pathlib.Path(os.environ.get("PH_OUT_DIR", "tmp"))
+TAG, OWNER = "drive", "drive@cli"     # no pid in the owner: closeextra never sweeps it
+# After a click/scroll: a page that reacts with a load reaches "complete" within seconds; past
+# SETTLE we screenshot whatever is there.
+SETTLE, SETTLE_POLL = 5.0, 0.1
 
 
-# ── settle (no fixed sleep) ─────────────────────────────────────────────────────────────────────
-# Poll readyState + one rAF paint tick until 'complete'. Each /js call is itself a round-trip to the
-# browser, so N polls ≈ N paint frames of settle — bounded, condition-based, no wall-clock sleep.
-_READY_JS = "document.readyState"
-_PAINT_JS = "(()=>{return document.readyState;})()"
+def _op(name, **body):
+    """An engine op on the drive tab, opening it on first use."""
+    try:
+        return connect.op(name, tab=TAG, **body)
+    except connect.EngineError as e:
+        if "no such tab" not in str(e):
+            raise
+        connect.op("newtab", url="about:blank", tag=TAG, owner=OWNER)
+        return connect.op(name, tab=TAG, **body)
 
 
-def settle(max_polls=12):
-    """Wait for the page to go quiet after an action: poll readyState until 'complete' (or max_polls).
-    Returns the final readyState. Condition-based — no fixed delay (project rule: never sleep)."""
-    state = "loading"
-    for _ in range(max_polls):
-        try:
-            state = (_call("js", _port(), {"expr": _READY_JS}) or {}).get("result") or "loading"
-        except Exception:
-            state = "loading"
+def settle():
+    """Poll readyState until "complete" or SETTLE elapses; returns the last state."""
+    state, t0 = "loading", time.monotonic()
+    while time.monotonic() - t0 < SETTLE:
+        state = _op("js", expr="document.readyState").get("result") or "loading"
         if state == "complete":
-            return state
+            break
+        time.sleep(SETTLE_POLL)
     return state
 
 
 def where():
-    """Current page {'title','url'} from the engine's /text op."""
-    try:
-        t = _call("text", _port(), {})
-        return {"title": (t.get("title") or "")[:120], "url": (t.get("url") or "")[:200]}
-    except Exception:
-        return {"title": "", "url": ""}
+    """The drive tab's {'title', 'url'}."""
+    t = _op("text")
+    return {"title": (t.get("title") or "")[:120], "url": (t.get("url") or "")[:200]}
 
 
 def shot(name="shot"):
-    """Screenshot the current page to <PH_OUT_DIR>/<name>.png. Returns the path."""
-    out = _out_dir()
+    """Screenshot the drive tab to <PH_OUT_DIR>/<name>.png; returns the path."""
+    out = pathlib.Path(os.environ.get("PH_OUT_DIR", "tmp"))
     out.mkdir(parents=True, exist_ok=True)
     png = out / f"{name}.png"
-    png.write_bytes(base64.b64decode(_call("shot", _port(), {})["b64"]))
+    png.write_bytes(base64.b64decode(_op("shot", timeout=connect.GOTO_TIMEOUT)["b64"]))
     return png
 
 
+def goto(url):
+    """Navigate the drive tab; returns where()."""
+    _op("goto", url=url, timeout=connect.GOTO_TIMEOUT)
+    return where()
+
+
 def click(x, y, name="click"):
-    """Click at (x,y), settle (no sleep), screenshot. Returns (where_info, png_path)."""
-    _call("click", _port(), {"x": int(x), "y": int(y)})
+    """Click at viewport (x, y), settle, screenshot. Returns (where(), png path)."""
+    _op("click", x=int(x), y=int(y))
     settle()
-    info = where()
-    return info, shot(name)
+    return where(), shot(name)
 
 
 def scroll(to="bottom", name="scroll"):
-    """Scroll the page ('bottom' | 'top' | <pixels> relative), settle, screenshot. Returns png path.
-    A pixel scroll reveals lazy content; settle() lets it paint before the shot."""
+    """Scroll to 'bottom', 'top', or by <px>; settle; screenshot. Returns the png path."""
     if to == "bottom":
         expr = "window.scrollTo(0, document.body.scrollHeight); document.body.scrollHeight"
     elif to == "top":
         expr = "window.scrollTo(0,0); 0"
     else:
         expr = f"window.scrollBy(0,{int(to)}); window.scrollY"
-    _call("js", _port(), {"expr": expr})
+    _op("js", expr=expr)
     settle()
     return shot(name)
 
 
 def _main(argv):
+    usage = "usage: python -m crawl.drive {goto URL|click X Y|scroll [to]|shot} [OUTNAME]"
     if not argv:
-        sys.exit("usage: python -m crawl.drive {click X Y|scroll [to]|shot} [OUTNAME]")
-    cmd = argv[0]
-    if cmd == "click":
-        if len(argv) < 3:
-            sys.exit("usage: python -m crawl.drive click X Y [OUTNAME]")
-        info, png = click(argv[1], argv[2], argv[3] if len(argv) > 3 else "click")
+        sys.exit(usage)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "goto" and args:
+        print(goto(args[0]))
+    elif cmd == "click" and len(args) >= 2:
+        info, png = click(args[0], args[1], args[2] if len(args) > 2 else "click")
         print("title:", info["title"], "| url:", info["url"])
         print("shot ->", png)
     elif cmd == "scroll":
-        to = argv[1] if len(argv) > 1 else "bottom"
-        png = scroll(to, argv[2] if len(argv) > 2 else "scroll")
-        print("shot ->", png)
+        print("shot ->", scroll(args[0] if args else "bottom", args[1] if len(args) > 1 else "scroll"))
     elif cmd == "shot":
-        print("shot ->", shot(argv[1] if len(argv) > 1 else "shot"))
+        print("shot ->", shot(args[0] if args else "shot"))
     else:
-        sys.exit(f"unknown command: {cmd}")
+        sys.exit(usage)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ hrefs linked but never captured (gaps/off-site/404).
 """
 from sqlalchemy import func, select
 
-from .db import asset, frontier, page, page_asset, page_link, unhandled  # noqa: F401
+from .db import frontier, page, page_asset, page_link, unhandled
 
 
 def _rows(dbobj, stmt):
