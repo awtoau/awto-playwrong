@@ -236,6 +236,7 @@ resolves. A real Chrome over raw CDP passes. See [docs/lessons.md](docs/lessons.
 | `PH_HEADLESS` | off | `1`: headless. DuckDuckGo and Turnstile block it (#34). |
 | `PLAYWRONG_AGENT` | guessed | the owner label on your tabs |
 | `PH_TAB_LABEL` | off | `1`: also write the owner into the tab title. The page can read it (#55). |
+| `PH_BLOCK_ANALYTICS` | on | `0`: stop blocking Google Analytics / Tag Manager requests on every tab (`engine/cdp.py` `BLOCK_URLS`). Agent page loads otherwise count as visitors in the site owner's GA4. Scripts and beacons only, not iframe documents. |
 | `PH_MEMORY_MAX`, `PH_MEMORY_HIGH_WATER`, `PH_RSS_LIMIT`, `PH_CHROME_MAX_TABS`, `PH_CHROME_MAX_FETCHES`, `PH_CRAWL_MEMORY_MAX` | see [Memory](#memory) | |
 | `PH_RIGHTMON_BOUNDS` | `0,0,1280,720` | `client.py rightmon` window placement, `x,y,w,h` |
 | `PH_OUT_DIR` | `./tmp` | `crawl.drive` screenshots |

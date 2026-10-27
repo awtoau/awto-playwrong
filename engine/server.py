@@ -873,7 +873,11 @@ class ND:
         check_headroom("a new tab")
         await self._maybe_recycle()
         self.fetches += 1
-        t = await self._open_target(url)
+        # Open blank and navigate once attached: the block must be in place before the first request.
+        late = bool(cdp.BLOCK_URLS) and url != "about:blank"
+        t = await self._open_target("about:blank" if late else url)
+        if late:
+            await t.navigate(url)
         if not tag:
             self.tab = t                # only untagged tabs become active (#22)
         tid = t.target_id

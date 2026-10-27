@@ -31,7 +31,9 @@ failures = []
 class Site(http.server.BaseHTTPRequestHandler):
     """/img: a page with an image; /alert: a page that raises a dialog."""
     PAGES = {"/img": b"<title>img</title><img src=/x.png>", "/alert": b"<script>alert(1)</script>",
-             "/x.png": b"\x89PNG\r\n\x1a\n"}
+             "/x.png": b"\x89PNG\r\n\x1a\n", "/ga-collect": b"x", "/ok": b"x",
+             "/beacon": b"<title>beacon</title><script>Promise.allSettled([fetch('/ga-collect'),fetch('/ok')])"
+                        b".then(r=>document.title=r.map(x=>x.status).join())</script>"}
 
     def log_message(self, *a):
         pass
@@ -73,6 +75,23 @@ async def enables_survive_navigation(b, base):
     check("dialog handling survives navigation (#43)", dialogs == ["1"], str(dialogs))
     check("one session for the tab's life", len([s for s in b._sessions.values() if s is t]) == 1)
     await t.close()
+
+
+async def blocks_analytics(b, base):
+    """BLOCK_URLS stops a request matching a pattern on a fresh tab, and lets others through."""
+    saved, cdp.BLOCK_URLS = cdp.BLOCK_URLS, ["*/ga-collect*"]
+    try:
+        t = await b.new_tab("about:blank")
+        await t.navigate(f"{base}/beacon")
+        for _ in range(50):
+            if await t.evaluate("document.title") != "beacon":
+                break
+            await asyncio.sleep(0.05)
+        title = await t.evaluate("document.title")
+        check("analytics beacon blocked, control request not", title == "rejected,fulfilled", title)
+        await t.close()
+    finally:
+        cdp.BLOCK_URLS = saved
 
 
 def log(msg):
@@ -163,6 +182,7 @@ async def main():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             await enables_survive_navigation(b, f"http://127.0.0.1:{srv.server_address[1]}")
+            await blocks_analytics(b, f"http://127.0.0.1:{srv.server_address[1]}")
         finally:
             srv.shutdown()
         b2 = await cdp.attach(b.host, b.port)

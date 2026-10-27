@@ -38,6 +38,14 @@ STOP_TIMEOUT = 2.0
 NEWTAB_TIMEOUT = 0.5
 CLOSE_TIMEOUT = 0.3
 
+# Analytics beacons blocked on every tab (Network.setBlockedURLs): an agent is never a visitor, and
+# its hits otherwise land in the site owner's GA4 as "Page Not Found" views and Direct sessions.
+# PH_BLOCK_ANALYTICS=0 turns it off. Scripts and beacons only; iframe documents are not blocked.
+BLOCK_URLS = [] if os.environ.get("PH_BLOCK_ANALYTICS") == "0" else [
+    "*google-analytics.com/*", "*googletagmanager.com/*", "*analytics.google.com/*",
+    "*stats.g.doubleclick.net/*",
+]
+
 # First hit wins. Names are looked up on PATH; absolute paths are checked as they are.
 CHROME_CANDIDATES = {
     "Linux": ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
@@ -486,6 +494,10 @@ class Tab:
                                             {"targetId": self.target_id, "flatten": True})
                 self.session_id = r["sessionId"]
                 self.browser._sessions[self.session_id] = self
+                if BLOCK_URLS and self.type in ("", "page"):
+                    await self.browser.send("Network.enable", session_id=self.session_id)
+                    await self.browser.send("Network.setBlockedURLs", {"urls": BLOCK_URLS},
+                                            session_id=self.session_id)
             a = self._attaching = asyncio.ensure_future(go())
         await asyncio.shield(a)
 
